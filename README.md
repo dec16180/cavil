@@ -43,3 +43,19 @@
 
   The `morbo` development web server will make the web application available under `http://127.0.0.1:3000`. And
   `script/cavil minion worker` will start the job queue for processing background jobs.
+
+## Using Docker Compose 
+
+  Frist run to set up staging:
+  docker-compose run cavil /opt/cavil/staging.sh 
+
+  Normal run:
+  docker-compose up -d  
+  
+  Close:
+  docker-compose down 
+
+  Reset (deletes all data!) for fresh start:
+  rm -rf ./staging/do_not_commit ./postgres-data 
+ 
+  
