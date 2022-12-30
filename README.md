@@ -45,7 +45,7 @@
   `script/cavil minion worker` will start the job queue for processing background jobs.
 
 ## Using Docker Compose 
-
+  ```
   Frist run to set up staging:
   docker-compose run cavil /opt/cavil/staging.sh 
 
@@ -57,5 +57,6 @@
 
   Reset (deletes all data!) for fresh start:
   rm -rf ./staging/do_not_commit ./postgres-data 
+  ```
  
   
