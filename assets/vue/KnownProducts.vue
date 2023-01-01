@@ -31,30 +31,22 @@
           <table class="table table-striped table-bordered">
             <thead>
               <tr>
-                <th class="created">Created</th>
-                <th class="state">State</th>
-                <th class="comment">Comment</th>
-                <th class="user">Reviewing User</th>
-                <th class="report">Report</th>
+                <th class="link">Product</th>
               </tr>
             </thead>
-            <tbody v-if="reviews === null">
+            <tbody v-if="products === null">
               <tr>
-                <td id="all-done" colspan="5"><i class="fas fa-sync fa-spin"></i> Loading reviews...</td>
+                <td id="all-done" colspan="4"><i class="fas fa-sync fa-spin"></i> Loading products...</td>
               </tr>
             </tbody>
-            <tbody v-else-if="reviews.length > 0">
-              <tr v-for="review in reviews" :key="review.id">
-                <td class="timeago">{{ review.created }}</td>
-                <td v-html="review.state"></td>
-                <td v-html="review.comment"></td>
-                <td v-html="review.user"></td>
-                <td v-html="review.report"></td>
+            <tbody v-else-if="products.length > 0">
+              <tr v-for="product in products" :key="product.link">
+                <td v-html="product.link"></td>
               </tr>
             </tbody>
             <tbody v-else>
               <tr>
-                <td id="all-done" colspan="5">No reviews found.</td>
+                <td id="all-done" colspan="4">No products found.</td>
               </tr>
             </tbody>
           </table>
@@ -82,20 +74,19 @@
 <script>
 import PaginationLinks from './components/PaginationLinks.vue';
 import ShownEntries from './components/ShownEntries.vue';
-import {reportLink} from './helpers/links.js';
+import {productLink} from './helpers/links.js';
 import Refresh from './mixins/refresh.js';
-import moment from 'moment';
 
 export default {
-  name: 'ReviewSearch',
+  name: 'KnownProducts',
   mixins: [Refresh],
   components: {PaginationLinks, ShownEntries},
   data() {
     return {
       end: 0,
+      products: null,
       params: {limit: 10, offset: 0, search: ''},
-      reviews: null,
-      refreshUrl: `/pagination/search/${this.currentPackage}`,
+      refreshUrl: '/pagination/products/known',
       search: '',
       start: 0,
       total: 0
@@ -114,7 +105,7 @@ export default {
       this.cancelApiRefresh();
       const limit = this.params.limit;
       this.params.offset = num * limit - limit;
-      this.reviews = null;
+      this.products = null;
       this.doApiRefresh();
     },
     refreshData(data) {
@@ -122,21 +113,17 @@ export default {
       this.end = data.end;
       this.total = data.total;
 
-      const reviews = [];
-      for (const review of data.page) {
-        reviews.push({
-          comment: review.comment,
-          created: moment(review.created_epoch * 1000).fromNow(),
-          report: reportLink(review),
-          state: review.state,
-          user: review.user
+      const products = [];
+      for (const product of data.page) {
+        products.push({
+          link: productLink(product)
         });
       }
-      this.reviews = reviews;
+      this.products = products;
     },
     searchNow() {
       this.cancelApiRefresh();
-      this.reviews = null;
+      this.products = null;
       this.doApiRefresh();
     }
   },

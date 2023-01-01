@@ -16,6 +16,8 @@
 package Cavil::Model::Products;
 use Mojo::Base -base, -signatures;
 
+use Cavil::Util qw(paginate);
+
 has 'pg';
 
 sub all ($self) { $self->pg->db->select('bot_products')->hashes->to_array }
@@ -34,18 +36,26 @@ sub for_package ($self, $id) {
     'name', {'bot_package_products.package' => $id})->arrays->flatten->to_array;
 }
 
-sub list ($self, $name) {
+sub paginate_known_products ($self, $options) {
   my $db = $self->pg->db;
-  return [] unless my $product = $db->select('bot_products', 'id', {name => $name})->hash;
 
-  return $db->query(
-    'select bot_packages.name, bot_packages.id,
-       extract(epoch from bot_packages.created) as created_epoch, state,
-       checksum
-     from bot_package_products
-       join bot_packages on (bot_packages.id = bot_package_products.package)
-     where bot_package_products.product = ?', $product->{id}
+  my $search = '';
+  if (length($options->{search}) > 0) {
+    my $quoted = $db->dbh->quote("\%$options->{search}\%");
+    $search = "WHERE name ILIKE $quoted";
+  }
+
+  my $results = $db->query(
+    qq{
+      SELECT *, COUNT(*) OVER() AS total
+      FROM bot_products
+      $search
+      ORDER BY id DESC
+      LIMIT ? OFFSET ?
+    }, $options->{limit}, $options->{offset}
   )->hashes->to_array;
+
+  return paginate($results, $options);
 }
 
 sub update ($self, $product, $packages) {
