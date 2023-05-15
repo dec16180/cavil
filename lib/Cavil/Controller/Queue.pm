@@ -71,7 +71,11 @@ sub create_package ($self) {
     );
     $obj = $pkgs->find($id);
   }
+
+  # Product imports are low priority, and we want real requests if possible
   $obj->{external_link} //= $link;
+  $obj->{external_link} = $link if $link && $prio >= $obj->{priority};
+
   $obj->{obsolete} = 0;
   $pkgs->update($obj);
   $pkgs->obs_import(
