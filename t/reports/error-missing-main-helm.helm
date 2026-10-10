@@ -1,21 +1,24 @@
 {
   "errors" => ["Main Helm chart contains no license: Chart.yaml (expected \"# SPDX-License-Identifier: ...\" comment)"],
-  "main"   => {
-    "file"     => "Chart.yaml",
-    "licenses" => [],
-    "summary"  => "Just a test",
-    "type"     => "helm",
-    "url"      => "https://goharbor.io",
-    "version"  => "1.2.4"
+  "incomplete_checkout" => 0,
+  "main"                => {
+    "file"                 => "Chart.yaml",
+    "legal_review_notices" => [],
+    "licenses"             => [],
+    "summary"              => "Just a test",
+    "type"                 => "helm",
+    "url"                  => "https://goharbor.io",
+    "version"              => "1.2.4"
   },
   "sub" => [
     {
-      "file"     => "Chart.yaml",
-      "licenses" => [],
-      "summary"  => "Just a test",
-      "type"     => "helm",
-      "url"      => "https://goharbor.io",
-      "version"  => "1.2.4"
+      "file"                 => "Chart.yaml",
+      "legal_review_notices" => [],
+      "licenses"             => [],
+      "summary"              => "Just a test",
+      "type"                 => "helm",
+      "url"                  => "https://goharbor.io",
+      "version"              => "1.2.4"
     }
   ],
   "warnings" => []

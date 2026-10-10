@@ -1,82 +1,9 @@
 % layout 'default', title => "Edit snippet";
 
+<div id="edit-snippet"></div>
+
 % content_for ready_function => begin
-  cavil.setupCodeMirrorForSnippet(<%= $example->{sline} + $example->{delta} %>);
+  % my $has_contributor_role = current_user_has_role('contributor') ? 'true' : 'false';
+  % my $has_admin_role = current_user_can('curate') ? 'true' : 'false';
+  cavil.setupEditSnippet(<%= $id %>, <%= $has_contributor_role %> ,<%= $has_admin_role %>);
 % end
-
-% for my $line (keys %$patterns) {
-  % my $cm_line = $line - $example->{delta};
-  % content_for ready_function => "cavil.myCodeMirror.addLineClass($cm_line, 'background', 'found-pattern pattern-$patterns->{$line}{pattern} found-keyword-$patterns->{$line}{keyword}');";
-% }
-<h3>Edit Snippet</h3>
-
-% if ($file_count) {
-  <p>
-  The following snippet was found in <%= $file_count %> files within <%= $package_count %> packages.
-  The example shown here is from <%= link_to $package->{name} => url_for('package_details', id => $package->{id}) %>
-  </p>
-% }
-
-%= form_for url_for('snippet_decision', {id => $snippet->{id}}) => (method => 'POST') => begin
-
-  <div class="form-group">
-    <label for="pattern"><strong>Snippet</strong></label>
-    <em>(The found patterns are highlighted and you can reach them by clicking on the line number)</em>
-    <%= text_area pattern => $snippet->{text},
-      class => 'mono-textarea form-control', id => 'file', rows => 20 %>
-  </div>
-
-
-  <div class="form-group">
-    <label for="license">License</label>
-    %= text_field license => $best->{license}, class => 'form-control'
-  </div>
-
-  <div class="row form-inline">
-    <div class="form-group col-sm-3">
-        <label for="risk" class="mr-2">Risk</label>
-        % my @risks;
-        % for my $r (0..6) {
-            % if ($r == ($best->{risk} // -1)) { push(@risks, [ $r => $r, selected => 'selected' ]) } else { push(@risks, $r); }
-        % }
-        %= select_field risk => \@risks, class => 'form-control'
-    </div>
-
-    <div class="col-sm-3">
-      <div class="checkbox-inline">
-        <label>
-          <%= check_box patent => 1,
-            $best->{patent} ? (checked => undef) : () %>
-          Patent
-        </label>
-      </div>
-    </div>
-    <div class="col-sm-3">
-      <div class="checkbox-inline">
-        <label>
-          <%= check_box trademark => 1,
-            $best->{trademark} ? (checked => undef) : () %> Trademark
-        </label>
-      </div>
-    </div>
-    <div class="col-sm-3">
-      <div class="checkbox-inline">
-        <label>
-          <%= check_box opinion => 1,
-            $best->{opinion} ? (checked => undef) : () %> Opinion
-        </label>
-      </div>
-    </div>
-  </div>
-
-  <div>
-    <button name="create-pattern" type="submit" value="1" class="btn btn-primary">Create Pattern</button>
-    <button name="mark-non-license" type="submit" value="1" class="btn btn-danger">Mark as Non-License</button>
-  </div>
-
-%end
-
-Closest <%= link_to "pattern ($similarity%)" => url_for('edit_pattern', id => $best->{id}) %>:
-<p>
-  <pre class='license license-1'><%= $best->{pattern} %></pre>
-</p>

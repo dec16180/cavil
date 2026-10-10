@@ -1,0 +1,179 @@
+
+% my $MAX_FILES_PER_LICENSE = 2;
+%
+# Legal Report
+
+Package: <%== $summary->{package_name} %>
+Id: <%== $summary->{id} %>
+State: <%== $summary->{state} %>
+External-Link: <%== $summary->{external_link} %>
+% if (my $version = $summary->{package_version}) {
+Version: <%== $version %>
+% }
+% if (my $declared = $summary->{package_license}{name}) {
+Declared-License: <%== $declared %><%== $summary->{package_license}{spdx} ? '' : ' (not a valid SPDX expression)' %>
+% }
+% if (my $sum = $summary->{package_summary}) {
+Summary: <%== $sum %>
+% }
+% if (my $group = $summary->{package_group}) {
+Group: <%== $group %>
+% }
+% if (my $url = $summary->{package_url}) {
+URL: <%== $url %>
+% }
+Shortname: <%== $summary->{package_shortname} %>
+Checkout: <%== $summary->{package_checksum} %>
+% my $num_files = $summary->{unpacked_files};
+Unpacked: <%== $num_files %> <%== $num_files == 1 ? 'file' : 'files' %> (<%== $summary->{unpacked_size} %>)
+Priority: <%== $summary->{package_priority} %>
+Created: <%== Mojo::Date->new($summary->{created})->to_datetime %>
+
+
+
+% if (my $notice = $summary->{notice}) {
+## System Notice
+
+%== $notice
+
+
+
+% }
+% if (@{$summary->{legal_review_notices}}) {
+## Legal Review Notices from Packagers
+
+%   for my $notice (@{$summary->{legal_review_notices}}) {
+* <%== $notice %>
+%   }
+
+
+
+% }
+% if (@{$summary->{errors}}) {
+## Package File Warnings for Packagers
+
+%   for my $error (@{$summary->{errors}}) {
+* <%== $error %>
+%   }
+
+
+
+% }
+% if (@{$summary->{warnings}}) {
+## Package File Warnings for Reviewers
+
+%   for my $warning (@{$summary->{warnings}}) {
+* <%== $warning %>
+%   }
+
+
+
+% }
+## Licenses
+% use Cavil::ReportUtil qw(hard_incompatibilities);
+% my $hard = hard_incompatibilities($report->{license_compatibility} // {});
+% if (@$hard) {
+
+### Incompatible Licenses
+
+%   for my $pair (@$hard) {
+* <%== $pair->[0] %> and <%== $pair->[1] %>
+%   }
+
+OSADL flags these pairs as incompatible in both directions. That only matters if the code is really
+combined into one work; vendored or merely aggregated components usually are not. The web report has
+the full directional matrix and OSADL's explanations.
+
+% }
+% if (@{$report->{missed_files}}) {
+
+Note: Report is incomplete, reviewers need to create new license patterns for unmatched keywords or ignore false
+positives. Each file's estimated risk comes from its highest risk snippet, rising above the predicted license as
+similarity drops.
+
+
+### Risk 9 (Unknown)
+
+%   for my $file (@{$report->{missed_files}}) {
+%     my $license = $file->{spdx} || $file->{license};
+* `<%== $file->{name} %>`: <%== $file->{match} %>% similarity to "<%== $license %>", estimated risk <%== $file->{max_risk} %>
+%   }
+
+% }
+% my $risks = $report->{risks};
+% for my $risk (reverse sort keys %$risks) {
+%   my $current = $risks->{$risk};
+
+### Risk <%== $risk %>
+
+%   for my $lic (sort keys %$current) {
+%     my $matches = $current->{$lic};
+%     my $files = [sort @{$matches->{files}}];
+%     my $num = scalar @$files;
+%     my $max_files = $MAX_FILES_PER_LICENSE > $num ? $num : $MAX_FILES_PER_LICENSE;
+%     my @flag_labels = (['patent', 'Patent'], ['trademark', 'Trademark'], ['export_restricted', 'Export restricted'], ['cla', 'CLA'], ['eula', 'EULA']);
+%     my %has_flag = map { $_ => 1 } @{$matches->{flags} || []};
+%     my $flags = join(', ', map { $_->[1] } grep { $has_flag{$_->[0]} } @flag_labels);
+* <%== $matches->{spdx} || $matches->{name} %>: <%== $num %> <%== $num == 1 ? 'file' : 'files' %><%== $flags ? " [flags: $flags]" : '' %>
+%     for (my $i = $max_files - 1; $i >= 0; $i--) {
+  - `<%== $files->[$i][1] %>`
+%     }
+%     my $diff = $num - $max_files;
+%     if ($diff > 0) {
+  - ...
+% }
+%   }
+
+% }
+% if (!(keys %{$report->{risks}}) && !@{$report->{missed_files}}) {
+
+No files matched known license patterns or keywords.
+
+% }
+
+% if ($unmatched->{total}) {
+
+## Unmatched Snippets
+
+<%= $unmatched->{total} %> unresolved snippet<%= $unmatched->{total} == 1 ? '' : 's' %> need review. Highest impact first (one pattern or ignore clears every identical occurrence):
+
+%   for my $s (@{$unmatched->{rows}}) {
+%     my $preview = substr(($s->{text} // '') =~ s/\s+/ /gr, 0, 120);
+* <%= $s->{occurrences} %>x snippet <%= $s->{snippet_id} %> (~<%= $s->{closest_license} // 'unknown-license' %> <%= $s->{similarity} %>%): <%== $preview %>
+%   }
+
+For the full list and per-snippet detail (verbatim text, overlaps, keywords, covered-by): cavil_search_snippets(package_id=<%= $summary->{id} %>).
+
+% }
+% my @emails = @{$report->{emails} // []};
+% if ($email_limit && @emails) {
+
+## Email Addresses
+
+Ordered by occurrences<%= @emails > $email_limit ? ", top $email_limit of " . scalar(@emails) : '' %>.
+
+%   for my $email (@emails[0 .. ($email_limit < @emails ? $email_limit - 1 : $#emails)]) {
+* `<%== $email->[0] %>`: <%== $email->[1] %>
+%   }
+% }
+
+% my @urls = @{$report->{urls} // []};
+% if ($url_limit && @urls) {
+
+## URLs
+
+Ordered by occurrences<%= @urls > $url_limit ? ", top $url_limit of " . scalar(@urls) : '' %>.
+
+%   for my $url (@urls[0 .. ($url_limit < @urls ? $url_limit - 1 : $#urls)]) {
+* `<%== $url->[0] %>`: <%== $url->[1] %>
+%   }
+% }
+
+% if (@{$report->{components} // []}) {
+
+## Vendored Components
+
+%   for my $c (@{$report->{components}}) {
+* `<%== $c->{name} %><%== length($c->{version} // '') ? '@' . $c->{version} : '' %>` (<%== $c->{type} %>)<%== length($c->{license} // '') ? ': ' . $c->{license} : '' %>
+%   }
+% }

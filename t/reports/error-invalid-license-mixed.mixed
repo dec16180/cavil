@@ -1,22 +1,27 @@
 {
-  "errors" => ["Invalid SPDX license: Whatever", "Invalid SPDX license: BSD"],
-  "main"   => {
-    "%doc"     => [],
-    "%license" => [],
-    "file"     => "error-invalid-license-mixed.spec",
-    "license"  => "MIT AND BSD-3-Clause",
-    "licenses" => ["MIT AND BSD-3-Clause"],
-    "summary"  => "Just a test",
-    "type"     => "spec"
+  "errors"              => ["Invalid SPDX license: Whatever", "Invalid SPDX license: BSD"],
+  "incomplete_checkout" => 0,
+  "main"                => {
+    "%doc"                 => [],
+    "%license"             => [],
+    "file"                 => "error-invalid-license-mixed.spec",
+    "legal_review_notices" => [],
+    "license"              => "MIT AND BSD-3-Clause",
+    "licenses"             => ["MIT AND BSD-3-Clause"],
+    "sources"              => [],
+    "summary"              => "Just a test",
+    "type"                 => "spec"
   },
   "sub" => [
     {
-      "%doc"     => [],
-      "%license" => [],
-      "file"     => "error-invalid-license-mixed.spec",
-      "licenses" => ["MIT AND BSD-3-Clause"],
-      "summary"  => "Just a test",
-      "type"     => "spec"
+      "%doc"                 => [],
+      "%license"             => [],
+      "file"                 => "error-invalid-license-mixed.spec",
+      "legal_review_notices" => [],
+      "licenses"             => ["MIT AND BSD-3-Clause"],
+      "sources"              => [],
+      "summary"              => "Just a test",
+      "type"                 => "spec"
     },
     {
       "file"     => "mixed-more.kiwi",
@@ -27,11 +32,12 @@
       "version"  => "1.0.0"
     },
     {
-      "file"     => "mixed-more.Dockerfile",
-      "licenses" => ["BSD"],
-      "summary"  => "Mixed Test",
-      "type"     => "dockerfile",
-      "version"  => 5
+      "file"                 => "mixed-more.Dockerfile",
+      "legal_review_notices" => [],
+      "licenses"             => ["BSD"],
+      "summary"              => "Mixed Test",
+      "type"                 => "dockerfile",
+      "version"              => 5
     }
   ],
   "warnings" => []

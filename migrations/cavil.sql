@@ -1,276 +1,486 @@
--- 1 up
-create type bot_state as enum (
-  'new', 'waiting', 'unacceptable', 'acceptable', 'correct', 'obsolete');
-create table if not exists bot_sources (
-  id      serial primary key,
-  api_url text not null,
-  project text not null,
-  package text not null,
-  srcmd5  text not null
+-- 17 up
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE TYPE bot_state AS ENUM (
+  'new',
+  'waiting',
+  'unacceptable',
+  'acceptable',
+  'correct',
+  'obsolete'
 );
-create table if not exists bot_users (
-  id        serial primary key,
-  login     text not null,
-  email     text,
-  fullname  text,
-  roles     text[] not null default '{user}',
-  comment   text
+CREATE TABLE bot_sources (
+  id serial PRIMARY KEY,
+  api_url text NOT NULL,
+  project text NOT NULL,
+  package text NOT NULL,
+  srcmd5 text NOT NULL
 );
-create table if not exists bot_products (
-  id   serial primary key,
-  name text not null constraint name_unique unique
+CREATE TABLE bot_users (
+  id serial PRIMARY KEY,
+  login text NOT NULL,
+  comment text,
+  email text,
+  fullname text,
+  roles text[] DEFAULT '{user}'::text[] NOT NULL
 );
-create index on bot_products(name);
-create table if not exists bot_packages (
-  id              serial primary key,
-  name            text not null,
-  checkout_dir    text not null,
-  checksum        text,
-  source          int not null references bot_sources(id),
-  requesting_user int not null references bot_users(id),
-  external_link   text,
-  created         timestamp with time zone not null default now(),
-  reviewed        timestamp with time zone,
-  priority        int not null check(priority >= 1 and priority <= 10),
-  reviewing_user  int references bot_users(id),
-  state           bot_state not null,
-  obsolete        boolean not null default false,
-  result          text,
-  imported        timestamp with time zone,
-  unpacked        timestamp with time zone,
-  indexed         timestamp with time zone
-);
-create index on bot_packages(requesting_user);
-create index on bot_packages(reviewing_user);
-create index on bot_packages(source);
-create index on bot_packages(reviewed);
-create index on bot_packages(external_link);
-create table if not exists bot_package_products (
-  package int not null references bot_packages(id),
-  product int not null references bot_products(id)
-);
-create unique index on bot_package_products(package, product);
-create index on bot_package_products(product);
-create table if not exists bot_requests (
-  id            serial primary key,
+CREATE TABLE bot_packages (
+  id serial PRIMARY KEY,
+  name text NOT NULL,
+  checkout_dir text NOT NULL,
+  source int REFERENCES bot_sources(id) NOT NULL,
+  requesting_user int REFERENCES bot_users(id) NOT NULL,
   external_link text,
-  package       int references bot_packages(id)
+  created timestamp with time zone DEFAULT now() NOT NULL,
+  priority int NOT NULL,
+  reviewing_user int REFERENCES bot_users(id),
+  state bot_state NOT NULL,
+  result text,
+  unpacked timestamp with time zone,
+  indexed timestamp with time zone,
+  reviewed timestamp with time zone,
+  obsolete boolean DEFAULT false NOT NULL,
+  checksum text,
+  imported timestamp with time zone,
+  patent boolean DEFAULT false NOT NULL,
+  trademark boolean DEFAULT false NOT NULL,
+  export_restricted boolean DEFAULT false NOT NULL,
+  CONSTRAINT bot_packages_priority_check CHECK (((priority >= 1) AND (priority <= 10)))
 );
-create index on bot_requests (package);
-create table if not exists bot_reports (
-  id              serial primary key,
-  package         int not null references bot_packages(id),
-  specfile_report text not null,
-  ldig_report     text,
-  rolemodel       boolean
+CREATE INDEX ON bot_packages(requesting_user);
+CREATE INDEX ON bot_packages(reviewing_user);
+CREATE INDEX ON bot_packages(source);
+CREATE INDEX ON bot_packages(reviewed);
+CREATE INDEX ON bot_packages(external_link);
+CREATE TABLE emails (
+  id bigserial PRIMARY KEY,
+  package int REFERENCES bot_packages(id) NOT NULL,
+  email text NOT NULL,
+  hits int DEFAULT 0 NOT NULL,
+  name text
 );
-create index on bot_reports (package);
-create table report_checksums (
-  id        bigserial primary key,
-  checksum  text not null,
-  shortname text not null constraint shortname_unique unique
+CREATE UNIQUE INDEX ON emails(package, md5(email));
+CREATE INDEX ON emails(package);
+CREATE TABLE urls (
+  id bigserial PRIMARY KEY,
+  package int REFERENCES bot_packages(id) NOT NULL,
+  url text NOT NULL,
+  hits int DEFAULT 0 NOT NULL
 );
-create unique index on report_checksums(checksum);
-create table if not exists emails (
-  id      bigserial primary key,
-  package int not null references bot_packages(id),
-  name    text,
-  email   text not null,
-  hits    int not null default 0
+CREATE UNIQUE INDEX ON urls(package, md5(url));
+CREATE TABLE bot_products (
+  id serial PRIMARY KEY,
+  name text NOT NULL CONSTRAINT name_unique UNIQUE
 );
-create unique index on emails (package, md5(email));
-create index on emails (package);
-create table if not exists urls (
-  id      bigserial primary key,
-  package int not null references bot_packages(id),
-  url     text not null,
-  hits    int not null default 0
+CREATE INDEX ON bot_products(name);
+CREATE TABLE bot_package_products (
+  package int REFERENCES bot_packages(id) NOT NULL,
+  product int REFERENCES bot_products(id) ON DELETE CASCADE NOT NULL
 );
-create unique index on urls (package, md5(url));
-create index on urls (package);
-create table if not exists matched_files (
-  id       bigserial primary key,
-  package  int not null references bot_packages(id),
-  filename text not null,
-  mimetype text not null
+CREATE UNIQUE INDEX ON bot_package_products(package, product);
+CREATE INDEX ON bot_package_products(product);
+CREATE TABLE bot_reports (
+  id serial PRIMARY KEY,
+  package int REFERENCES bot_packages(id) NOT NULL,
+  ldig_report text,
+  specfile_report text NOT NULL,
+  rolemodel boolean
 );
-create index on matched_files (package);
-create table licenses (
-  id           serial primary key,
-  name         text not null,
-  url          text,
-  description  text,
-  created      timestamp with time zone not null default now(),
-  risk         int not null default 5,
-  eula         boolean not null default false,
-  nonfree      boolean not null default false
+CREATE INDEX ON bot_reports(package);
+CREATE TABLE bot_requests (
+  id serial PRIMARY KEY,
+  external_link text,
+  package int REFERENCES bot_packages(id)
 );
-create unique index on licenses (name);
-create table license_patterns (
-  id           serial primary key,
-  pattern      text not null,
-  token_hexsum char(32) not null,
-  license      int not null references licenses (id),
-  created      timestamp with time zone not null default now(),
-  packname     text not null default '',
-  patent       boolean not null default false,
-  trademark    boolean not null default false,
-  opinion      boolean not null default false
+CREATE INDEX ON bot_requests(package);
+CREATE TABLE matched_files (
+  id bigserial PRIMARY KEY,
+  package int REFERENCES bot_packages(id) NOT NULL,
+  filename text NOT NULL,
+  mimetype text NOT NULL
 );
-create index on license_patterns (license);
-create index on license_patterns (packname);
-create unique index on license_patterns (token_hexsum);
-create table pattern_matches (
-  id           bigserial primary key,
-  package      int not null references bot_packages(id) on delete cascade,
-  file         bigint not null references matched_files(id)
-               on delete cascade,
-  pattern      int not null references license_patterns(id) on delete cascade,
-  sline        int not null,
-  eline        int not null,
-  created      timestamp with time zone not null default now(),
-  ignored      boolean not null default false
+CREATE INDEX ON matched_files(package);
+CREATE TABLE license_patterns (
+  id serial PRIMARY KEY,
+  pattern text NOT NULL,
+  created timestamp with time zone DEFAULT now() NOT NULL,
+  packname text DEFAULT ''::text NOT NULL,
+  patent boolean DEFAULT false NOT NULL,
+  trademark boolean DEFAULT false NOT NULL,
+  token_hexsum character(32) NOT NULL,
+  license text DEFAULT ''::text NOT NULL,
+  risk int DEFAULT 5 NOT NULL,
+  unique_id uuid DEFAULT gen_random_uuid() NOT NULL CONSTRAINT unique_id_unique UNIQUE,
+  spdx text DEFAULT ''::text NOT NULL,
+  export_restricted boolean DEFAULT false NOT NULL
 );
-create index on pattern_matches (file);
-create index on pattern_matches (package);
-create index on pattern_matches (pattern);
-create table ignored_lines (
-  id           bigserial primary key,
-  packname     text not null,
-  hash         text not null,
-  created      timestamp with time zone not null default now()
+CREATE INDEX ON license_patterns(packname);
+CREATE UNIQUE INDEX ON license_patterns(token_hexsum);
+CREATE INDEX ON license_patterns(license);
+CREATE INDEX ON license_patterns(unique_id);
+CREATE INDEX ON license_patterns(spdx);
+CREATE TABLE snippets (
+  id bigserial PRIMARY KEY,
+  hash text NOT NULL,
+  text text NOT NULL,
+  license boolean DEFAULT false NOT NULL,
+  classified boolean DEFAULT false NOT NULL,
+  approved boolean DEFAULT false NOT NULL,
+  created timestamp with time zone DEFAULT now() NOT NULL,
+  confidence int DEFAULT 0 NOT NULL,
+  likelyness real DEFAULT 0 NOT NULL,
+  like_pattern int REFERENCES license_patterns(id) ON DELETE SET NULL
 );
-create index on ignored_lines(packname);
-create unique index on ignored_lines(packname,hash);
-
--- 1 down
-drop table if exists ignored_lines cascade;
-drop table if exists pattern_matches;
-drop table if exists license_patterns;
-drop table if exists licenes;
-drop table if exists bot_requests;
-drop table if exists bot_reports;
-drop table if exists bot_packages;
-drop table if exists bot_sources;
-drop table if exists bot_users;
-drop table if exists report_checksums;
-drop table if exists emails;
-drop table if exists urls;
-drop table if exists matched_files;
-drop type if exists bot_state;
-
--- 2 up
-alter table license_patterns add column license_string text;
-
--- 2 down
-alter table license_patterns drop column license_string;
-
--- 3 up
-create table snippets (
-  id         bigserial primary key,
-  hash       text not null,
-  text       text not null,
-  license    boolean not null default false,
-  classified boolean not null default false,
-  approved   boolean not null default false,
-  created    timestamp with time zone not null default now()
+CREATE INDEX ON snippets(classified);
+CREATE UNIQUE INDEX ON snippets(hash);
+CREATE INDEX ON snippets(approved);
+CREATE TABLE file_snippets (
+  id bigserial PRIMARY KEY,
+  created timestamp with time zone DEFAULT now() NOT NULL,
+  package int REFERENCES bot_packages(id) ON DELETE CASCADE NOT NULL,
+  file bigint REFERENCES matched_files(id) ON DELETE CASCADE NOT NULL,
+  snippet int REFERENCES snippets(id) ON DELETE CASCADE NOT NULL,
+  sline int NOT NULL,
+  eline int NOT NULL
 );
-create index on snippets(classified);
-create unique index on snippets(hash);
+CREATE INDEX ON file_snippets(snippet);
+CREATE TABLE ignored_files (
+  id serial PRIMARY KEY,
+  glob text NOT NULL,
+  owner int REFERENCES bot_users(id) NOT NULL,
+  created timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE TABLE ignored_lines (
+  id bigserial PRIMARY KEY,
+  packname text NOT NULL,
+  hash text NOT NULL,
+  created timestamp with time zone DEFAULT now() NOT NULL
+);
+CREATE INDEX ON ignored_lines(packname);
+CREATE UNIQUE INDEX ON ignored_lines(packname, hash);
+CREATE TABLE pattern_matches (
+  id bigserial PRIMARY KEY,
+  file bigint REFERENCES matched_files(id) ON DELETE CASCADE NOT NULL,
+  pattern int REFERENCES license_patterns(id) ON DELETE CASCADE NOT NULL,
+  sline int NOT NULL,
+  eline int NOT NULL,
+  created timestamp with time zone DEFAULT now() NOT NULL,
+  ignored boolean DEFAULT false NOT NULL,
+  package int REFERENCES bot_packages(id) ON DELETE CASCADE NOT NULL
+);
+CREATE INDEX ON pattern_matches(file);
+CREATE INDEX ON pattern_matches(package);
+CREATE INDEX ON pattern_matches(pattern);
+CREATE TABLE report_checksums (
+  id bigserial PRIMARY KEY,
+  checksum text NOT NULL,
+  shortname text NOT NULL CONSTRAINT shortname_unique UNIQUE
+);
+CREATE UNIQUE INDEX ON report_checksums(checksum);
 
-create table file_snippets (
-  id         bigserial primary key,
-  snippet    int not null references snippets(id),
-  created    timestamp with time zone not null default now()
+-- 17 down
+DROP TABLE IF EXISTS report_checksums;
+DROP TABLE IF EXISTS pattern_matches;
+DROP TABLE IF EXISTS ignored_lines;
+DROP TABLE IF EXISTS ignored_files;
+DROP TABLE IF EXISTS file_snippets;
+DROP TABLE IF EXISTS snippets;
+DROP TABLE IF EXISTS license_patterns;
+DROP TABLE IF EXISTS bot_requests;
+DROP TABLE IF EXISTS matched_files;
+DROP TABLE IF EXISTS bot_reports;
+DROP TABLE IF EXISTS bot_package_products;
+DROP TABLE IF EXISTS bot_products;
+DROP TABLE IF EXISTS urls;
+DROP TABLE IF EXISTS emails;
+DROP TABLE IF EXISTS bot_packages;
+DROP TABLE IF EXISTS bot_users;
+DROP TABLE IF EXISTS bot_sources;
+DROP TYPE IF EXISTS bot_state;
+
+-- 18 up
+CREATE TABLE proposed_changes (
+  id serial PRIMARY KEY,
+  action text NOT NULL,
+  token_hexsum text NOT NULL,
+  data jsonb NOT NULL,
+  created timestamp with time zone DEFAULT now() NOT NULL,
+  owner int REFERENCES bot_users(id) NOT NULL
+);
+CREATE UNIQUE INDEX ON proposed_changes(token_hexsum);
+
+--18 down
+DROP TABLE IF EXISTS proposed_changes;
+
+-- 19 up
+ALTER TABLE bot_packages ADD COLUMN unresolved_matches int DEFAULT 0 NOT NULL;
+
+-- 20 up
+CREATE UNIQUE INDEX ON ignored_files(glob);
+ALTER TABLE license_patterns ADD COLUMN owner int REFERENCES bot_users(id);
+ALTER TABLE license_patterns ADD COLUMN contributor int REFERENCES bot_users(id);
+
+-- 21 up
+ALTER TABLE ignored_lines ADD COLUMN owner int REFERENCES bot_users(id);
+ALTER TABLE ignored_lines ADD COLUMN contributor int REFERENCES bot_users(id);
+
+-- 22 up
+ALTER TABLE pattern_matches ADD COLUMN ignored_line int REFERENCES ignored_lines(id) ON DELETE SET NULL;
+CREATE INDEX ON pattern_matches(ignored_line);
+
+-- 23 up
+ALTER TYPE bot_state RENAME VALUE 'correct' TO 'acceptable_by_lawyer';
+ALTER TABLE bot_packages ADD COLUMN notice text;
+
+-- 24 up
+ALTER TABLE bot_packages ADD COLUMN embargoed boolean DEFAULT false NOT NULL;
+CREATE INDEX ON bot_packages(embargoed);
+ALTER TABLE snippets ADD COLUMN package int REFERENCES bot_packages(id) ON DELETE SET NULL;
+
+-- 25 up
+ALTER TABLE bot_sources ADD COLUMN type text DEFAULT 'obs' NOT NULL;
+
+-- 26 up
+CREATE UNIQUE INDEX ON bot_requests(external_link, package);
+
+-- 27 up
+ALTER TABLE bot_packages ADD COLUMN cleaned timestamp with time zone;
+
+-- 28 up
+CREATE INDEX ON bot_packages(cleaned);
+
+-- 29 up
+CREATE INDEX ON pattern_matches (ignored);
+CREATE INDEX ON bot_packages (name);
+CREATE INDEX ON bot_packages (obsolete);
+
+--30 up
+ALTER TABLE bot_packages ADD COLUMN unpacked_files bigint;
+ALTER TABLE bot_packages ADD COLUMN unpacked_size bigint;
+
+--31 up
+ALTER TABLE bot_products ADD COLUMN updated timestamp with time zone DEFAULT now() NOT NULL;
+CREATE INDEX ON bot_products (updated);
+
+-- 32 up
+CREATE TABLE api_keys (
+    id          bigserial PRIMARY KEY,
+    owner       int REFERENCES bot_users(id) NOT NULL,
+    api_key     uuid DEFAULT gen_random_uuid() NOT NULL CONSTRAINT api_key_unique UNIQUE,
+    description TEXT,
+    created     timestamp with time zone DEFAULT now() NOT NULL,
+    expires     timestamp with time zone NOT NULL
 );
 
--- 3 down
-drop table if exists snippets;
-drop table if exists file_snippets;
+-- 32 down
+DROP TABLE IF EXISTS api_keys CASCADE;
 
--- 4 up
-alter table snippets add column confidence int not null default 0;
+-- 33 up
+ALTER TABLE bot_packages ADD COLUMN ai_assisted boolean DEFAULT false NOT NULL;
+ALTER TABLE api_keys ADD COLUMN write_access boolean DEFAULT false NOT NULL;
+CREATE INDEX ON bot_packages (ai_assisted);
 
--- 4 down
-alter table snippets drop column confidence;
-
--- 5 up
-drop table if exists file_snippets;
-create table file_snippets (
-  id         bigserial primary key,
-  created    timestamp with time zone not null default now(),
-  package    int not null references bot_packages(id) on delete cascade,
-  file       bigint not null references matched_files(id)
-               on delete cascade,
-  snippet    int not null references snippets(id) on delete cascade,
-  sline      int not null,
-  eline      int not null
+-- 34 up
+CREATE TABLE package_notes (
+  id           bigserial PRIMARY KEY,
+  package_name text NOT NULL,
+  package      int REFERENCES bot_packages(id) ON DELETE SET NULL,
+  author       int REFERENCES bot_users(id) NOT NULL,
+  ai_assisted  boolean DEFAULT false NOT NULL,
+  body         text NOT NULL,
+  lawyer_only  boolean DEFAULT false NOT NULL,
+  created      timestamp with time zone DEFAULT now() NOT NULL,
+  edited       timestamp with time zone
 );
+CREATE INDEX ON package_notes (package_name, id DESC);
+CREATE INDEX ON package_notes (author);
 
--- 5 down
-drop table if exists file_snippets;
+-- 34 down
+DROP TABLE IF EXISTS package_notes;
 
--- 6 up
-create index on snippets(approved);
+-- 35 up
+CREATE INDEX bot_packages_open_reviews_idx ON bot_packages (priority DESC, external_link, unresolved_matches, name)
+WHERE state = 'new' AND obsolete = false;
 
--- 6 down
-drop index snippets_approved_idx if exists;
+-- 36 up
+ALTER TABLE package_notes ADD COLUMN tags text[] NOT NULL DEFAULT '{}';
+CREATE INDEX package_notes_tags_idx ON package_notes USING gin (tags);
 
--- 7 up
-alter table license_patterns add risk int not null default 5;
-alter table license_patterns add eula boolean not null default false;
-alter table license_patterns add nonfree boolean not null default false;
-update license_patterns set license_string = '' where license_string is null;
-alter table license_patterns alter column license_string set default '';
-alter table license_patterns alter column license_string set not null;
+-- 36 down
+DROP INDEX IF EXISTS package_notes_tags_idx;
+ALTER TABLE package_notes DROP COLUMN IF EXISTS tags;
 
--- 7 down
-alter table license_patterns drop column risk, drop column eula, drop column nonfree;
-alter table license_patterns alter column license_string drop default;
-alter table license_patterns alter column license_string set null;
+-- 37 up
+ALTER TABLE api_keys ADD COLUMN can_finalize_reviews boolean DEFAULT false NOT NULL;
 
--- 8 up
-alter table license_patterns drop column license;
-alter table license_patterns rename column license_string to license;
+-- 37 down
+ALTER TABLE api_keys DROP COLUMN IF EXISTS can_finalize_reviews;
 
--- 8 down
-alter table license_patterns rename column license to license_string;
-alter table license_patterns add column license int not null references licenses (id);
+-- 38 up
+ALTER TABLE bot_packages     ADD COLUMN cla  boolean DEFAULT false NOT NULL,
+                             ADD COLUMN eula boolean DEFAULT false NOT NULL;
+ALTER TABLE license_patterns ADD COLUMN cla  boolean DEFAULT false NOT NULL,
+                             ADD COLUMN eula boolean DEFAULT false NOT NULL;
 
--- 9 up
-create index on file_snippets(snippet);
+-- 38 down
+ALTER TABLE bot_packages     DROP COLUMN IF EXISTS cla,
+                             DROP COLUMN IF EXISTS eula;
+ALTER TABLE license_patterns DROP COLUMN IF EXISTS cla,
+                             DROP COLUMN IF EXISTS eula;
 
--- 9 down
-drop index snippets_snippet_idx if exists;
+-- 39 up
+CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA public;
 
--- 10 up
-create table ignored_files (
-  id         serial primary key,
-  glob       text not null,
-  owner      int references bot_users(id) not null,
-  created    timestamp with time zone not null default now()
+-- 40 up
+CREATE INDEX bot_packages_name_trgm_idx ON bot_packages USING gin (name gin_trgm_ops);
+
+-- 41 up
+ALTER TABLE ignored_files ADD COLUMN contributor int REFERENCES bot_users(id);
+
+-- 42 up
+ALTER TABLE snippets ADD COLUMN second_match real NOT NULL DEFAULT 0;
+ALTER TABLE snippets ADD COLUMN score_version int NOT NULL DEFAULT 0;
+
+-- 43 up
+CREATE INDEX snippets_fold_idx ON snippets (score_version, likelyness) WHERE classified AND license;
+CREATE INDEX snippets_text_fts_idx ON snippets USING gin (to_tsvector('english', text));
+
+-- 44 up
+ALTER TABLE file_snippets ADD COLUMN resolution text;
+CREATE INDEX file_snippets_resolution_idx ON file_snippets (resolution) WHERE resolution IS NOT NULL;
+
+-- 45 up
+CREATE INDEX file_snippets_resolution_snippet_idx ON file_snippets (resolution, snippet DESC) WHERE resolution IS NOT NULL;
+CREATE INDEX file_snippets_cleared_snippet_idx ON file_snippets (snippet DESC) WHERE resolution IN ('clear', 'overlap');
+
+-- 46 up
+CREATE INDEX bot_packages_imported_idx ON bot_packages (imported);
+
+-- 47 up
+CREATE TABLE package_components (
+  id       bigserial PRIMARY KEY,
+  package  int REFERENCES bot_packages(id) ON DELETE CASCADE NOT NULL,
+  purl     text NOT NULL,
+  type     text NOT NULL,
+  name     text NOT NULL,
+  version  text,
+  license  text,
+  source   text,
+  complete boolean DEFAULT false NOT NULL
 );
+CREATE UNIQUE INDEX ON package_components(package, md5(purl));
+CREATE INDEX ON package_components(package);
 
--- 10 down
-drop table if exists ignored_files;
+-- 47 down
+DROP TABLE IF EXISTS package_components;
 
--- 11 up
-alter table snippets add likelyness real not null default 0;
-alter table snippets add like_pattern int references license_patterns(id) on delete set null;
+-- 48 up
+CREATE INDEX ON file_snippets(file);
 
--- 11 down
-alter table drop column likelyness, drop column like_pattern;
+-- 49 up
+ALTER TABLE bot_packages ADD COLUMN diff_report text;
 
--- 12 up
-create extension if not exists "pgcrypto";
-alter table license_patterns drop column if exists eula;
-alter table license_patterns drop column if exists nonfree;
-alter table license_patterns add column if not exists unique_id uuid unique not null default gen_random_uuid();
-create index on license_patterns(license);
-create index on license_patterns(unique_id);
-drop table if exists licenses;
+-- 50 up
+ALTER TABLE license_patterns ADD COLUMN catch_all boolean DEFAULT false NOT NULL;
+DROP INDEX file_snippets_cleared_snippet_idx;
+CREATE INDEX file_snippets_cleared_snippet_idx ON file_snippets (snippet DESC)
+  WHERE resolution IN ('clear', 'overlap', 'covered');
 
--- 13 up
-ALTER TABLE bot_package_products DROP CONSTRAINT bot_package_products_product_fkey;
-ALTER TABLE bot_package_products ADD CONSTRAINT  bot_package_products_product_fkey FOREIGN KEY (product)
-  REFERENCES bot_products(id) ON DELETE CASCADE;
+-- 51 up
+CREATE INDEX file_snippets_unresolved_snippet_idx ON file_snippets (snippet) WHERE resolution IS NULL;
+CREATE INDEX file_snippets_unresolved_package_idx ON file_snippets (package, snippet) WHERE resolution IS NULL;
+
+-- 52 up
+CREATE TABLE pattern_shingles (
+  pattern_id bigint NOT NULL REFERENCES license_patterns(id) ON DELETE CASCADE,
+  license    text   NOT NULL,
+  shingle    bigint NOT NULL
+);
+CREATE INDEX pattern_shingles_pattern_idx ON pattern_shingles (pattern_id);
+CREATE INDEX pattern_shingles_license_shingle_idx ON pattern_shingles (license, shingle);
+CREATE TABLE shingle_license (
+  shingle bigint NOT NULL,
+  license text   NOT NULL,
+  PRIMARY KEY (shingle, license)
+);
+CREATE FUNCTION pattern_shingles_ins() RETURNS trigger AS $$
+  BEGIN
+    INSERT INTO shingle_license (shingle, license) VALUES (NEW.shingle, NEW.license) ON CONFLICT DO NOTHING;
+    RETURN NULL;
+  END;
+$$ LANGUAGE plpgsql;
+CREATE FUNCTION pattern_shingles_del() RETURNS trigger AS $$
+  BEGIN
+    DELETE FROM shingle_license sl
+     WHERE sl.shingle = OLD.shingle AND sl.license = OLD.license
+       AND NOT EXISTS (SELECT 1 FROM pattern_shingles ps WHERE ps.shingle = OLD.shingle AND ps.license = OLD.license);
+    RETURN NULL;
+  END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER pattern_shingles_ins_trg AFTER INSERT ON pattern_shingles
+  FOR EACH ROW EXECUTE FUNCTION pattern_shingles_ins();
+CREATE TRIGGER pattern_shingles_del_trg AFTER DELETE ON pattern_shingles
+  FOR EACH ROW EXECUTE FUNCTION pattern_shingles_del();
+
+-- 52 down
+DROP TABLE IF EXISTS shingle_license;
+DROP TABLE IF EXISTS pattern_shingles;
+DROP FUNCTION IF EXISTS pattern_shingles_ins;
+DROP FUNCTION IF EXISTS pattern_shingles_del;
+
+-- 53 up
+CREATE TABLE comment_templates (
+  id      bigserial PRIMARY KEY,
+  name    text NOT NULL,
+  body    text NOT NULL,
+  author  int REFERENCES bot_users(id),
+  created timestamp with time zone DEFAULT now() NOT NULL,
+  edited  timestamp with time zone
+);
+CREATE UNIQUE INDEX ON comment_templates (name);
+CREATE INDEX ON comment_templates (author);
+INSERT INTO comment_templates (name, body) VALUES ('Unacceptable-File',
+'This package cannot be accepted as is.
+
+The file [FILE] is licensed under [LICENSE], which we cannot ship.
+
+Please remove the file from the sources, or replace it with a version under an
+acceptable license, and then resubmit the package for review.');
+
+-- 53 down
+DROP TABLE IF EXISTS comment_templates;
+
+-- 54 up
+ALTER TABLE package_notes ADD COLUMN pinned boolean DEFAULT false NOT NULL;
+CREATE INDEX package_notes_pinned_idx ON package_notes (package_name, id DESC) WHERE pinned;
+
+-- 55 up
+ALTER TABLE matched_files      ADD COLUMN generation int NOT NULL DEFAULT 0;
+ALTER TABLE pattern_matches    ADD COLUMN generation int NOT NULL DEFAULT 0;
+ALTER TABLE file_snippets      ADD COLUMN generation int NOT NULL DEFAULT 0;
+ALTER TABLE urls               ADD COLUMN generation int NOT NULL DEFAULT 0;
+ALTER TABLE emails             ADD COLUMN generation int NOT NULL DEFAULT 0;
+ALTER TABLE package_components ADD COLUMN generation int NOT NULL DEFAULT 0;
+DROP INDEX urls_package_md5_idx;
+CREATE UNIQUE INDEX urls_package_md5_generation_idx ON urls (package, md5(url), generation);
+DROP INDEX emails_package_md5_idx;
+CREATE UNIQUE INDEX emails_package_md5_generation_idx ON emails (package, md5(email), generation);
+DROP INDEX package_components_package_md5_idx;
+CREATE UNIQUE INDEX package_components_package_md5_generation_idx
+  ON package_components (package, md5(purl), generation);
+CREATE INDEX matched_files_building_idx      ON matched_files (package)      WHERE generation <> 0;
+CREATE INDEX file_snippets_building_idx      ON file_snippets (package)      WHERE generation <> 0;
+CREATE INDEX urls_building_idx               ON urls (package)               WHERE generation <> 0;
+CREATE INDEX emails_building_idx             ON emails (package)             WHERE generation <> 0;
+CREATE INDEX package_components_building_idx ON package_components (package) WHERE generation <> 0;
+ALTER TABLE bot_packages ADD COLUMN processing_job int;
+ALTER TABLE bot_packages ADD COLUMN index_stage    text;
+ALTER TABLE bot_packages ADD COLUMN reindex_requested timestamp with time zone;
+CREATE INDEX bot_packages_unsettled_idx ON bot_packages (id)
+  WHERE processing_job IS NOT NULL OR index_stage IS NOT NULL OR reindex_requested IS NOT NULL;
+
+-- 56 up
+CREATE INDEX license_patterns_created_idx ON license_patterns (created);
+ALTER TABLE bot_packages ADD COLUMN reindex_priority int;
+
+-- TODO: Include in next migration
+-- ALTER TABLE bot_users DROP COLUMN fullname;

@@ -18,51 +18,71 @@ use Mojo::Base 'Mojolicious::Plugin', -signatures;
 
 use Cavil::Checkout;
 use Mojo::File 'path';
+use Mojo::Util qw(dumper);
+use Cavil::PatternEngine;
 
 sub register ($self, $app, $config) {
   $app->minion->add_task(classify => \&_classify);
 }
 
 sub _classify ($job) {
+  my $minion = $job->minion;
+
+  # One classify job can handle all snippets
+  return $job->finish('Classifier is already running')
+    unless my $guard = $minion->guard('classify_in_progress', 172800);
+
   my $app        = $job->app;
-  my $log        = $app->log;
   my $db         = $app->pg->db;
   my $classifier = $app->classifier;
-  my $cache      = $app->home->child('cache', 'cavil.pattern.bag');
-  my $bag        = Spooky::Patterns::XS::init_bag_of_patterns;
+
+  my $patterns = $app->patterns;
+  my $cache    = $patterns->bag_cache_file;
+  my $bag      = Cavil::PatternEngine::init_bag_of_patterns;
   $bag->load($cache);
 
-  my $results = $db->select('snippets', ['id', 'text'], {classified => 0});
+  # Classify in batches to allow for a complete re-evaluation with newer ML models
   my %packages_affected;
-  while (my $next = $results->hash) {
-    my $res          = $classifier->classify($next->{text});
-    my $best_pattern = $bag->best_for($next->{text}, 1);
-    if (@$best_pattern) {
-      $best_pattern = $best_pattern->[0];
+  while (1) {
+
+    # Embargoed snippets should be reviewed by humans
+    my $results = $db->query(
+      'SELECT s.id, s.text FROM snippets s LEFT JOIN bot_packages bp ON (s.package = bp.id)
+       WHERE classified = FALSE AND approved = FALSE AND (bp.embargoed = FALSE OR s.package IS NULL)
+       ORDER BY s.id DESC LIMIT 100'
+    )->hashes->to_array;
+    last unless @$results;
+
+    # Score the whole batch at once against the similarity tables (one working-set load, not one query
+    # per snippet); undef means the tables are not populated yet, so fall back to the plain bag per row.
+    my $scores = $patterns->score_snippets($results);
+
+    for my $next (@$results) {
+
+      # A pre-cap snippet already in the database may carry an ultra-long line (minified machine code, not
+      # license text) that is too large for the classifier to ingest. Resolve it as non-license here rather
+      # than sending it; new snippets are capped at read time so this only clears older ones, and a genuine
+      # undef from the classifier below still fails loudly.
+      my $machine = grep { length > Cavil::PatternEngine::MAX_LINE_SIZE } split /\n/, $next->{text};
+      my $res     = $machine ? {license => 0, confidence => 0} : $classifier->classify($next->{text});
+      die "Unexpected result from classifier: @{[dumper($res)]}"
+        unless ref $res eq 'HASH' && defined($res->{license}) && defined($res->{confidence});
+
+      my $score = $scores ? $scores->{$next->{id}} : $patterns->bag_score($bag, $next->{text});
+      $db->update(
+        'snippets',
+        {%$score, classified => 1, license => $res->{license}, confidence => int($res->{confidence} + 0.5)},
+        {id => $next->{id}, approved => 0}
+      );
+
+      my $packages = $db->query('SELECT DISTINCT(package) FROM file_snippets WHERE snippet = ?', $next->{id});
+      $packages_affected{$_->{package}} = 1 for $packages->hashes->each;
     }
-    else {
-      $best_pattern = {match => 0, pattern => undef};
-    }
-    $db->update(
-      'snippets',
-      {
-        likelyness   => $best_pattern->{match},
-        like_pattern => $best_pattern->{pattern},
-        classified   => 1,
-        license      => $res->{license},
-        confidence   => int($res->{confidence} + 0.5)
-      },
-      {id => $next->{id}}
-    );
-    my $packages = $db->select('file_snippets', 'package', {snippet => $next->{id}});
-    while (my $package = $packages->hash) {
-      $packages_affected{$package->{package}} = 1;
-    }
+
   }
-  $results->finish();
-  for my $package (keys %packages_affected) {
-    $app->packages->analyze($package);
-  }
+
+  my $pkgs = $app->packages;
+  $pkgs->analyze($_) for keys %packages_affected;
 }
 
 1;

@@ -29,24 +29,25 @@ plan skip_all => 'set TEST_ONLINE to enable this test' unless $ENV{TEST_ONLINE};
 
 my $cavil_test = Cavil::Test->new(online => $ENV{TEST_ONLINE}, schema => 'sync_test');
 my $config     = $cavil_test->default_config;
-$config->{classifier} = 'http://127.0.0.1:5000';
+$config->{classifier} = {url => 'http://127.0.0.1:5000', token => 'TEST:TOKEN:12345'};
 my $t = Test::Mojo->new(Cavil => $config);
 $cavil_test->mojo_fixtures($t->app);
 
 my $sync     = $t->app->sync->silent(1);
 my $patterns = $t->app->patterns;
 my $tempdir  = tempdir;
-my $dir      = $tempdir->child('license_patterns')->make_path;
+my $path     = $tempdir->child('license_patterns.jsonl');
 
 subtest 'Export license patterns' => sub {
-  ok $sync->store($dir) > 0, 'multuple license patterns stored';
+  ok $sync->store($path) > 0, 'multiple license patterns stored';
+  my $licenses = [map { length $_ ? decode_json($_) : () } split "\n", $path->slurp];
+
   my $apache = $patterns->find(1);
   is $apache->{license},  'Apache-2.0', 'right license';
   is $apache->{packname}, '',           'no packname';
   ok $apache->{pattern}, 'has pattern';
   ok my $uuid = $apache->{unique_id}, 'has UUID';
-  my $target = $dir->child(substr($uuid, 0, 1), substr($uuid, 1, 1), $uuid);
-  my $hash   = decode_json $target->slurp;
+  my $hash = $licenses->[0];
   is $hash->{license},   'Apache-2.0', 'right license';
   is $hash->{packname},  '',           'no packname';
   is $hash->{unique_id}, $uuid,        'same UUID';
@@ -55,8 +56,7 @@ subtest 'Export license patterns' => sub {
   is $apache->{license},  'Apache-2.0',       'right license';
   is $apache->{packname}, 'perl-Mojolicious', 'right packname';
   ok $uuid = $apache->{unique_id}, 'has UUID';
-  $target = $dir->child(substr($uuid, 0, 1), substr($uuid, 1, 1), $uuid);
-  $hash   = decode_json $target->slurp;
+  $hash = $licenses->[1];
   is $hash->{license},   'Apache-2.0',       'right license';
   is $hash->{packname},  'perl-Mojolicious', 'right packname';
   is $hash->{unique_id}, $uuid,              'same UUID';
@@ -65,14 +65,13 @@ subtest 'Export license patterns' => sub {
   is $artistic->{license}, 'Artistic-2.0', 'right license';
   ok $artistic->{pattern}, 'has pattern';
   ok $uuid = $artistic->{unique_id}, 'has UUID';
-  $target = $dir->child(substr($uuid, 0, 1), substr($uuid, 1, 1), $uuid);
-  $hash   = decode_json $target->slurp;
+  $hash = $licenses->[2];
   is $hash->{license},   'Artistic-2.0', 'right license';
   is $hash->{unique_id}, $uuid,          'same UUID';
 };
 
 subtest 'Import license patterns' => sub {
-  is $sync->load($dir), 0, 'no new patterns to import yet';
+  is $sync->load($path), 0, 'no new patterns to import yet';
   my $apache = $patterns->find(1);
   ok my $apache_uuid = $apache->{unique_id}, 'has UUID';
   my $artistic = $patterns->find(3);
@@ -84,9 +83,33 @@ subtest 'Import license patterns' => sub {
   $db->delete('license_patterns', {id => $artistic->{id}});
   is $db->select('license_patterns', '*', {unique_id => $artistic_uuid})->rows, 0, 'pattern with UUID deleted';
 
-  is $sync->load($dir), 2, 'two new patterns imported';
+  is $sync->load($path), 2, 'two new patterns imported';
   is $db->select('license_patterns', '*', {unique_id => $apache_uuid})->rows,   1, 'pattern with UUID exists again';
   is $db->select('license_patterns', '*', {unique_id => $artistic_uuid})->rows, 1, 'pattern with UUID exists again';
+};
+
+subtest 'catch_all round-trips through export/import' => sub {
+  my $db = $t->app->pg->db;
+
+  # create() derives catch_all from the license name for a brand-new license
+  my $any = $patterns->create(pattern => 'a distinct sync any permissive marker', license => 'Any Permissive');
+  is $any->{catch_all}, 1, 'a grab-bag "Any ..." license is flagged catch_all on create';
+  is $db->query("SELECT catch_all FROM license_patterns WHERE license = 'Apache-2.0' LIMIT 1")->hash->{catch_all}, 0,
+    'a concrete license (Apache-2.0) is not catch_all';
+
+  my $tmp = $tempdir->child('roundtrip.jsonl');
+  $sync->store($tmp);
+  my ($exported) = grep { $_->{license} eq 'Any Permissive' } map { length $_ ? decode_json($_) : () } split "\n",
+    $tmp->slurp;
+  ok $exported,              'the catch_all license is exported';
+  ok $exported->{catch_all}, 'catch_all is present and true in the export';
+
+  # Deleting and re-importing restores the flag from the JSONL
+  my $uuid = $any->{unique_id};
+  $db->delete('license_patterns', {id => $any->{id}});
+  is $sync->load($tmp), 1, 'the catch_all pattern is re-imported';
+  is $db->select('license_patterns', 'catch_all', {unique_id => $uuid})->hash->{catch_all}, 1,
+    'catch_all survived the export/import round-trip';
 };
 
 done_testing;

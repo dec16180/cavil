@@ -1,24 +1,13 @@
-# Copyright (C) 2018,2019 SUSE Linux GmbH
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Task::Index;
 use Mojo::Base 'Mojolicious::Plugin', -signatures;
 
+use Cavil::Bom::Registry;
 use Cavil::Checkout;
 use Cavil::FileIndexer;
-use Spooky::Patterns::XS;
+use Cavil::PatternEngine;
 use Time::HiRes 'time';
 
 sub register ($self, $app, $config) {
@@ -36,57 +25,112 @@ sub _index ($job, $id) {
   my $pkgs   = $app->packages;
   my $log    = $app->log;
 
-  # Protect from race conditions
-  return $job->fail("Package $id is not unpacked yet")          unless $pkgs->is_unpacked($id);
-  return $job->finish("Package $id is already being processed") unless $minion->lock("processing_pkg_$id", 172800);
+  # Protect from race conditions: an orphan reindex job can race a concurrent
+  # re-import that has reset "unpacked" to NULL; back off and let the unpack
+  # chain finish instead of failing (which would queue duplicate work on retry)
+  unless ($pkgs->is_unpacked($id)) {
+    my $retries = $job->retries;
+    return $job->fail("Package $id is not unpacked yet (gave up after $retries retries)") if $retries >= 10;
+    return $job->retry({delay => 60});
+  }
 
-  # Clean up (make sure not to leak a Postgres connection)
+  # This build gets its own report generation and writes every row under it, leaving the live report
+  # (generation 0) untouched and readable until Cavil::Task::Analyze promotes the new one in a single
+  # transaction. A reviewer who creates a license pattern therefore keeps the report they were reading
+  # instead of being dropped onto a progress bar for the length of the rebuild. Using the job id as the
+  # generation means the cleanup task can ask Minion whether stranded rows still have a live owner.
+  my $generation = $job->id;
+
+  # Claiming the package is what protects the build from race conditions, and the claim is the generation:
+  # the analyze job at the end of the chain hands it back as it promotes. Losing the race must not lose the
+  # rebuild with it. Cavil::Model::Packages::reindex checks before enqueuing, but somebody else can still
+  # claim in between - an spdx report, the analyzed job of the build that just promoted - and this job
+  # writes nothing, so there would be no stranded rows for the cleanup sweep to notice and nothing to say a
+  # rebuild was ever due. Record it the same way a request that arrives during a build is recorded, and
+  # whoever frees the package up runs it - at the priority this build would have run at, so losing the
+  # race does not also cost a reviewer their place in the queue.
+  unless ($pkgs->claim($id, $generation)) {
+    $pkgs->request_reindex($id, $job->info->{priority});
+    return $job->finish("Package $id is already being processed, remembered the reindex for later");
+  }
+
+  # Make sure not to leak a Postgres connection
   {
     my $db = $app->pg->db;
-    $db->update('bot_packages', {indexed => undef, checksum => undef}, {id => $id});
-    $db->delete('matched_files', {package => $id});
-    $db->delete('urls',          {package => $id});
-    $db->delete('emails',        {package => $id});
-    $db->delete('bot_reports',   {package => $id});
+    my $tx = $db->begin;
+
+    # Only our own leftovers, from an earlier attempt of this same job. Other non-zero generations are
+    # left alone on purpose: "script/cavil unpack" force-releases the package, so a second build can
+    # legitimately be running, and wiping its rows would corrupt it. The cleanup task sweeps those.
+    $db->delete($_, {package => $id, generation => $generation}) for qw(package_components urls emails matched_files);
+
+    $db->update('bot_packages', {index_stage => 'indexing'}, {id => $id});
+    $tx->commit;
+
+    # The SPDX report lives in the checkout directory, where a stale copy left behind for the duration of
+    # the rebuild would be picked up by the next unpack and indexed as if it were a file of the package.
+    # Being briefly unavailable is the lesser problem, so it goes now and is regenerated on demand.
+    $pkgs->remove_spdx_report($id);
+  }
+
+  my $dir      = $pkgs->pkg_checkout_dir($id);
+  my $checkout = Cavil::Checkout->new($dir);
+
+  # Update file stats
+  unless ($pkgs->has_file_stats($id)) {
+    my $stats = $checkout->unpacked_file_stats;
+    $pkgs->update_file_stats($id, $stats);
   }
 
   # Split up files into batches
-  my $dir       = $app->package_checkout_dir($id);
-  my $batches   = Cavil::Checkout->new($dir)->unpacked_files($app->config->{index_bucket_average});
+  my $batches   = $checkout->unpacked_files($app->config->{index_bucket_average});
   my $parent_id = $job->id;
   my $prio      = $job->info->{priority};
-  my @children
-    = map { $minion->enqueue(index_batch => [$id, $_] => {parents => [$parent_id], priority => $prio + 1}) } @$batches;
-  $minion->enqueue(indexed => [$id] => {parents => \@children, priority => $prio + 2});
+  my @children  = map {
+    $minion->enqueue(index_batch => [$id, $_, $generation] =>
+        {parents => [$parent_id], priority => $prio + 1, notes => {"pkg_$id" => 1}})
+  } @$batches;
+  $minion->enqueue(
+    indexed => [$id, $generation] => {parents => \@children, priority => $prio + 2, notes => {"pkg_$id" => 1}});
 
   $log->info("[$id] Made @{[scalar @$batches]} batches for $dir");
 }
 
-sub _index_batch ($job, $id, $batch) {
+sub _index_batch ($job, $id, $batch, $generation) {
   my $app = $job->app;
   my $log = $app->log;
   $app->plugins->emit_hook('before_task_index_batch');
 
   my $start = time;
 
-  my $fi       = Cavil::FileIndexer->new($app, $id);
+  my $db       = $app->pg->db;
+  my $fi       = Cavil::FileIndexer->new($app, $id, $db, $generation);
   my $preptime = time - $start;
 
-  my %meta = (emails => {}, urls => {});
+  my $registry    = Cavil::Bom::Registry->new;
+  my $single_root = _single_unpacked_root($fi->dir);
+  my %meta        = (emails => {}, urls => {}, components => {});
+
+  # Wrap the whole batch in one transaction: the per-file inserts (matched_files,
+  # pattern_matches, file_snippets) plus the URL/email/component upserts below would otherwise
+  # each autocommit separately, one round-trip per row. Committing once also makes the batch
+  # atomic, so a mid-batch failure and Minion retry cannot leave half-inserted rows behind.
+  my $tx = $db->begin;
+
   for my $file (@$batch) {
     my ($path, $mime) = @$file;
     $fi->file(\%meta, $path, $mime);
+    _detect_components($fi, $registry, \%meta, $path, $single_root);
   }
 
   # URLs
-  my $db  = $app->pg->db;
   my $max = $app->config->{max_email_url_size};
   for my $url (sort keys %{$meta{urls}}) {
     next if length($url) > $max;
     $db->query(
-      'insert into urls (package, url, hits) values ($1, $2, $3)
-         on conflict (package, md5(url))
-         do update set hits = urls.hits + $3', $id, $url, $meta{urls}{$url}
+      'insert into urls (package, url, hits, generation) values ($1, $2, $3, $4)
+         on conflict (package, md5(url), generation)
+         do update set hits = urls.hits + $3', $id, $url, $meta{urls}{$url}, $generation
     );
   }
 
@@ -95,35 +139,99 @@ sub _index_batch ($job, $id, $batch) {
     next if length($email) > $max;
     my $e = $meta{emails}{$email};
     $db->query(
-      'insert into emails (package, email, name, hits)
-           values ($1, $2, $3, $4)
-         on conflict (package, md5(email))
-         do update set hits = emails.hits + $4', $id, $email, $e->{name}, $e->{count}
+      'insert into emails (package, email, name, hits, generation)
+           values ($1, $2, $3, $4, $5)
+         on conflict (package, md5(email), generation)
+         do update set hits = emails.hits + $4', $id, $email, $e->{name}, $e->{count}, $generation
     );
   }
+
+  # Vendored subcomponents (identity from the embedded metadata file's content, deduped by purl across
+  # the parallel batches via the upsert)
+  for my $purl (sort keys %{$meta{components}}) {
+    my $c = $meta{components}{$purl};
+    $db->query(
+      'insert into package_components (package, purl, type, name, version, license, source, complete, generation)
+           values ($1, $2, $3, $4, $5, $6, $7, true, $8)
+         on conflict (package, md5(purl), generation)
+         do update set license = coalesce(package_components.license, excluded.license)', $id, $purl, $c->{type},
+      $c->{name}, $c->{version}, $c->{license}, $c->{source}, $generation
+    );
+  }
+
+  $tx->commit;
+
   my $total = time - $start;
   my $dir   = $fi->dir;
   $log->info(
     sprintf("[$id] Indexed batch of @{[scalar @$batch]} files from $dir (%.02f prep, %.02f total)", $preptime, $total));
 }
 
+# The unpacked tree is a "single wrapper" when it has exactly one top-level directory (a conventional
+# name-version/ source tarball). Multiple top-level directories mean several archives were unpacked side
+# by side (a common OBS shape, since archive_name_as_dir is off and archives land directly under
+# .unpacked), so a manifest one level down is a separate archive, not the primary root.
+sub _single_unpacked_root ($dir) {
+  my $unpacked = $dir->child('.unpacked');
+  return 0 unless -d $unpacked;
+  my $dirs = grep { -d $_ } $unpacked->list({dir => 1})->each;
+  return $dirs == 1 ? 1 : 0;
+}
+
+# Recognise a vendored component from its embedded metadata file (e.g. package.json, Cargo.toml). Identity
+# comes from the file content, so obscured/renamed/deep directory names do not matter.
+sub _detect_components ($fi, $registry, $meta, $path, $single_root) {
+
+  # The scanner re-emits any over-long-lined text file as "<name>.processed.<ext>" and lists only that
+  # variant to the indexer (Cavil::PostProcess), so a metadata file with one long line (common in a
+  # composer installed.json) would otherwise be invisible here. Detect on the canonical name and read the
+  # original file (kept on disk) - never the processed copy, whose injected line breaks corrupt structured
+  # metadata such as JSON.
+  (my $orig = $path) =~ s{\.processed(\.[^./]+)$}{$1};
+  $orig =~ s{\.processed$}{};
+
+  return unless $registry->matches($orig);
+
+  # A package manifest (package.json, Cargo.toml, ...) that describes the primary artifact under review
+  # must not be reported as a vendored subcomponent, or the SBOM lists the package as a dependency of
+  # itself. Such a manifest sits at the top of the source tree: at the unpacked root (depth 0), or one
+  # level in when the tree is a single wrapper directory (a conventional name-version/ tarball). But when
+  # several archives are unpacked side by side (multiple top-level directories), a depth-1 manifest is a
+  # *separate* vendored archive (e.g. serde-1.0.197/Cargo.toml) and must be kept. Listing files (Go's
+  # vendor/modules.txt) never describe the primary and are never skipped.
+  #
+  # Depth is measured against the package-root directory the manifest identifies. Python ships its
+  # metadata inside a <name>.egg-info/ or <name>.dist-info/ directory, so the package root is one level
+  # up from the metadata file - otherwise a project's own PKG-INFO/METADATA would sit at depth 2 and
+  # self-list. For every other ecosystem the package root is simply the manifest's own directory.
+  my $root = $orig =~ s{/[^/]*$}{}r;
+  $root =~ s{(?:^|/)[^/]+\.(?:egg-info|dist-info)$}{};
+  my $depth = $root eq '' ? 0 : ($root =~ tr{/}{}) + 1;
+  return if $registry->is_self_manifest($orig) && ($depth == 0 || ($depth == 1 && $single_root));
+
+  my $file = $fi->dir->child('.unpacked', $orig);
+  return unless -f $file && -s $file < 4_000_000;
+  return unless defined(my $content = eval { $file->slurp });
+
+  $meta->{components}{$_->{purl}} //= $_ for @{$registry->detect_file($orig, \$content)};
+}
+
 sub _index_later ($job, $id) {
   $job->app->packages->reindex($id, $job->info->{priority} + 1);
 }
 
-sub _indexed ($job, $id) {
-  my $app    = $job->app;
-  my $minion = $job->minion;
-  my $pkgs   = $job->app->packages;
+sub _indexed ($job, $id, $generation) {
+  my $pkgs = $job->app->packages;
 
-  # Protect from race conditions
-  $minion->unlock("processing_pkg_$id");
+  # The package is deliberately *not* handed back here: analyze still has to promote this build into the
+  # live report, and that swap needs the same protection the indexing did. The promote releases it as part
+  # of the same transaction. "indexed" is bumped by the promote too, so the package only counts as
+  # reindexed once the new report is actually the one being served.
+  $pkgs->index_stage($id, 'analyzing');
 
-  $pkgs->indexed($id);
-
-  # Next step - always high prio because the renderer
-  # relies on it
-  return $pkgs->analyze($id, 9, [$job->id]);
+  # Next step, one above this one. Every job of a build outranks the job before it, so a package that has
+  # started is carried all the way to its report before the next package at the same band is picked up.
+  return $pkgs->analyze($id, $job->info->{priority} + 1, [$job->id], $generation);
 }
 
 sub _reindex_all ($job) {
@@ -131,7 +239,7 @@ sub _reindex_all ($job) {
 }
 
 sub _reindex_matched_later ($job, $pid) {
-  $job->app->packages->reindex_matched_packages($pid, $job->info->{priority});
+  $job->app->packages->reindex_matched_packages($pid, $job->info->{priority} + 1);
 }
 
 1;

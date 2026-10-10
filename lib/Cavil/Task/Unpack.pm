@@ -24,15 +24,20 @@ sub register ($self, $app, $config) {
 }
 
 sub _unpack ($job, $id) {
-  my $app    = $job->app;
-  my $minion = $app->minion;
-  my $log    = $app->log;
-  my $pkgs   = $app->packages;
+  my $app  = $job->app;
+  my $log  = $app->log;
+  my $pkgs = $app->packages;
 
   # Protect from race conditions
-  return $job->finish("Package $id is already being processed")
-    unless my $guard = $minion->guard("processing_pkg_$id", 172800);
-  return $job->fail("Package $id is not imported yet") unless $pkgs->is_imported($id);
+  return $job->finish("Package $id is already being processed") unless my $guard = $pkgs->claim_guard($id, $job->id);
+  return $job->fail("Package $id is not imported yet")          unless $pkgs->is_imported($id);
+
+  # "unpacked" has to go: it is what stops an orphan index job from running against a tree that is being
+  # torn down and rebuilt right now. "indexed" deliberately stays, so a package that already has a report
+  # keeps serving it while the sources are re-unpacked and reindexed - an admin running "script/cavil
+  # unpack" no longer drops everyone reading that report onto a progress bar. The stage is recorded for
+  # the rebuild indicator on the report page; Cavil::Task::Index takes it from here.
+  $app->pg->db->update('bot_packages', {unpacked => undef, index_stage => 'unpacking'}, {id => $id});
 
   # Exclude file
   my $exclude = [];
@@ -42,7 +47,7 @@ sub _unpack ($job, $id) {
   }
 
   # Unpack the package
-  my $dir = $app->package_checkout_dir($id);
+  my $dir = $pkgs->pkg_checkout_dir($id);
   Cavil::Checkout->new($dir)->unpack({exclude => $exclude});
   $pkgs->unpacked($id);
   $log->info("[$id] Unpacked $dir");

@@ -1,0 +1,829 @@
+#!/usr/bin/env node
+import {
+  assertNoUnexpectedConsoleErrors,
+  expandFileDetails,
+  launchUi,
+  openCreatePatternEditor,
+  skipUnlessOnline,
+  waitForInlineSnippetEditor,
+  waitForInlineSnippetEditorClosed
+} from './lib/ui_helpers.js';
+import t from 'tap';
+
+// Report view interactions: everything that a logged-in admin does on a
+// single report page without committing pattern/note changes. Browsing into
+// the checkout file viewer, expanding file previews, keyboard navigation
+// between unresolved matches, deep-linking via URL hash, hovering pattern
+// tooltips.
+t.test('Cavil UI - report view', skipUnlessOnline, async t => {
+  const ui = await launchUi('js_ui_report');
+  const {page, context, url, performJobs, errorLogs} = ui;
+
+  try {
+    // Make sure we're logged in (the wrapper's dummy auth creates the admin
+    // "tester" on first login). Subsequent goto()s in the file then keep
+    // the admin session cookie.
+    await page.goto(url);
+    await page.click('text=Login');
+
+    await t.test('Checkout file browser renders directories, full files, and match tooltips', async t => {
+      await page.goto(url);
+      await page.click('text=Artistic');
+      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
+      await page.waitForSelector('#license-chart');
+      await page.waitForSelector('#checkout-url a');
+
+      // The size is a quiet aside next to the count, not a parenthesis after it
+      t.match(await page.innerText('#unpacked-files'), /^[\d.]+ files \d[\d.]*\s?\w+$/, 'unpacked count and size');
+
+      const [browserPage] = await Promise.all([context.waitForEvent('page'), page.locator('#checkout-url a').click()]);
+      await browserPage.waitForLoadState('load');
+      await browserPage.waitForSelector('.file-browser-table');
+      t.equal(await browserPage.innerText('title'), 'Directory listing of /');
+      t.match(await browserPage.innerText('.file-browser-breadcrumb'), /perl-Mojolicious/);
+      t.match(
+        await browserPage.innerText('.file-browser-count'),
+        /\d+ items?/,
+        'directory count is shown in breadcrumb row'
+      );
+      t.equal(await browserPage.locator('.file-browser-panel-header').count(), 0, 'directory summary header is hidden');
+
+      const rootRows = await browserPage.innerText('.file-browser-table');
+      t.match(rootRows, /Mojolicious-7\.25/, 'root directory lists unpacked source directory');
+      t.ok(
+        (await browserPage.locator('.file-browser-table tr.has-match').count()) > 0,
+        'directory tree marks entries containing matched files'
+      );
+
+      await browserPage
+        .locator('.file-browser-table tr')
+        .filter({has: browserPage.locator('.file-browser-name a', {hasText: 'Mojolicious-7.25'})})
+        .locator('.file-browser-name a')
+        .click();
+      await browserPage.waitForURL(/\/reviews\/file_view\/1\/Mojolicious-7\.25$/);
+      await browserPage.waitForSelector('.file-browser-table');
+      t.match(browserPage.url(), /\/reviews\/file_view\/1\/Mojolicious-7\.25$/);
+      await browserPage
+        .locator('.file-browser-table tr')
+        .filter({has: browserPage.locator('.file-browser-name a', {hasText: 'lib'})})
+        .locator('.file-browser-name a')
+        .click();
+      await browserPage.waitForURL(/\/reviews\/file_view\/1\/Mojolicious-7\.25\/lib$/);
+      await browserPage.waitForSelector('.file-browser-table');
+      await browserPage
+        .locator('.file-browser-table tr')
+        .filter({has: browserPage.locator('.file-browser-name a', {hasText: 'Mojolicious.pm'})})
+        .locator('.file-browser-name a')
+        .click();
+      await browserPage.waitForURL(/\/reviews\/file_view\/1\/Mojolicious-7\.25\/lib\/Mojolicious\.pm$/);
+      await browserPage.waitForSelector('.file-browser-source table.snippet');
+      t.match(browserPage.url(), /\/reviews\/file_view\/1\/Mojolicious-7\.25\/lib\/Mojolicious\.pm$/);
+      t.equal(await browserPage.innerText('title'), 'Content of Mojolicious-7.25/lib/Mojolicious.pm');
+      t.match(
+        await browserPage.innerText('.file-browser-count'),
+        /\d+ lines?/,
+        'file line count is shown in breadcrumb row'
+      );
+      t.equal(await browserPage.locator('.file-browser-panel-header').count(), 0, 'file source header is hidden');
+
+      const sourceText = await browserPage.innerText('.file-browser-source');
+      t.match(sourceText, /package Mojolicious;/, 'full source includes file beginning');
+      t.match(sourceText, /sub new \{/, 'full source includes later file content');
+      t.ok(
+        (await browserPage.locator('.file-browser-source tr.has-pattern-tooltip').count()) > 0,
+        'source rows expose pattern tooltip markers'
+      );
+
+      const highlighted = browserPage.locator('.file-browser-source tr.has-pattern-tooltip').first();
+      await highlighted.scrollIntoViewIfNeeded();
+      t.equal(await highlighted.getAttribute('title'), null, 'matched source row has no native title tooltip');
+      await highlighted.hover();
+      const card = browserPage.locator('.cavil-pattern-tip-floating .cavil-pattern-tip-card').first();
+      await card.waitFor({timeout: 5000});
+      const fileTooltipClear = await browserPage.evaluate(() => {
+        const row = document.querySelector('.file-browser-source tr.has-pattern-tooltip');
+        const tip = document.querySelector('.cavil-pattern-tip-floating');
+        const rowRect = row.getBoundingClientRect();
+        const tipRect = tip.getBoundingClientRect();
+        return tipRect.bottom <= rowRect.top || tipRect.top >= rowRect.bottom;
+      });
+      t.ok(fileTooltipClear, 'file browser tooltip does not cover the active source row');
+      t.match(await card.innerText(), /risk \d/i, 'file browser tooltip shows pattern risk');
+      t.equal(await card.locator('a').count(), 0, 'file browser tooltip is informational only');
+
+      await browserPage.mouse.wheel(0, 200);
+      await browserPage.waitForSelector('.cavil-pattern-tip-floating', {state: 'detached'});
+      await highlighted.scrollIntoViewIfNeeded();
+      await highlighted.hover();
+      await card.waitFor({timeout: 5000});
+
+      await browserPage.mouse.move(0, 0);
+      await browserPage.goBack();
+      await browserPage.waitForSelector('.file-browser-table');
+      t.match(browserPage.url(), /\/reviews\/file_view\/1\/Mojolicious-7\.25\/lib$/);
+      await browserPage.close();
+    });
+
+    await t.test('Checkout file browser renders oversized file notice', async t => {
+      const browserPage = await context.newPage();
+      const metadataUrl = `${url}/reviews/file_view_meta/1/Mojolicious-7.25/lib/Mojolicious.pm`;
+      await browserPage.route(metadataUrl, route => {
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json;charset=UTF-8',
+          body: JSON.stringify({
+            package: {
+              id: 1,
+              name: 'perl-Mojolicious',
+              detailsUrl: '/reviews/details/1'
+            },
+            checkoutDir: 'Mojolicious-7.25',
+            currentPath: 'Mojolicious-7.25/lib/Mojolicious.pm',
+            breadcrumbs: [
+              {name: 'perl-Mojolicious', path: '', url: '/reviews/file_view/1/'},
+              {name: 'Mojolicious-7.25', path: 'Mojolicious-7.25', url: '/reviews/file_view/1/Mojolicious-7.25'},
+              {
+                name: 'lib',
+                path: 'Mojolicious-7.25/lib',
+                url: '/reviews/file_view/1/Mojolicious-7.25/lib'
+              },
+              {
+                name: 'Mojolicious.pm',
+                path: 'Mojolicious-7.25/lib/Mojolicious.pm',
+                url: '/reviews/file_view/1/Mojolicious-7.25/lib/Mojolicious.pm'
+              }
+            ],
+            kind: 'file',
+            source: {
+              id: 1,
+              name: 'perl-Mojolicious',
+              filename: 'Mojolicious-7.25/lib/Mojolicious.pm',
+              oversized: 1,
+              size: 1500000,
+              maxSize: 1000000,
+              sizeLabel: '1.43 MiB',
+              maxSizeLabel: '976.56 KiB'
+            }
+          })
+        });
+      });
+
+      await browserPage.goto(`${url}/reviews/file_view/1/Mojolicious-7.25/lib/Mojolicious.pm`);
+      await browserPage.waitForSelector('.file-browser-too-large');
+      t.equal(await browserPage.innerText('title'), 'Content of Mojolicious-7.25/lib/Mojolicious.pm');
+      t.match(await browserPage.innerText('.file-browser-count'), /1\.43 MiB file/);
+      t.match(await browserPage.innerText('.file-browser-too-large'), /This file is too large to display/);
+      t.match(await browserPage.innerText('.file-browser-too-large'), /The display limit is 976\.56 KiB/);
+      t.equal(
+        await browserPage.locator('.file-browser-source table.snippet').count(),
+        0,
+        'source table is not mounted'
+      );
+      await browserPage.close();
+    });
+
+    await t.test('Expand hidden file (and open it in a new tab)', async t => {
+      await page.goto(url);
+      await page.click('text=Artistic');
+      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
+      await page.waitForSelector('#license-chart');
+
+      // File 6 lives in the Apache-2.0 risk-5 bucket. With the inflated
+      // fixture the bucket holds many files so its file list starts collapsed -
+      // expand it first to reveal the in-bucket file-link.
+      const apache = page.locator('#risk-5 > li').filter({hasText: 'Apache-2.0'}).first();
+      await apache.locator('a[data-bs-toggle="collapse"]').click();
+      await apache.locator('a[href="#file-6"]').waitFor();
+
+      t.same(await page.isVisible('#file-details-6'), false);
+      await apache.locator('a[href="#file-6"]').click();
+      await page.waitForSelector('#file-details-6');
+      t.match(await page.innerText('#expand-link-6'), /Mojolicious.+js/);
+      t.same(await page.isVisible('#file-details-6'), true);
+
+      // The preview title opens the whole file in a new tab.
+      const [page2] = await Promise.all([context.waitForEvent('page'), page.locator('#expand-link-6').click()]);
+      await page2.waitForLoadState();
+      t.match(await page2.innerText('title'), /Content of Mojolicious.+js/);
+      await page2.waitForSelector('.file-browser-source table.snippet');
+      t.match(await page2.innerText('.file-browser-source'), /Apache.+indexOf/s);
+      await page2.close();
+
+      await page.locator('#expand-link-6 ~ div .file-preview-close').click();
+      t.same(await page.isVisible('#file-details-6'), false, 'close button collapses the file preview');
+    });
+
+    await t.test('Report sections (chart, risks, missed files, emails, urls)', async t => {
+      await page.goto(url);
+      await page.click('text=Artistic');
+      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
+      await page.waitForSelector('#license-chart');
+      t.equal(await page.locator('[data-tab="components"]').count(), 0, 'components tab is hidden without components');
+
+      // Chart canvas is rendered
+      t.same(await page.isVisible('#license-chart'), true);
+
+      // Risk 5 bucket lists Apache-2.0 and SUSE-NotALicense
+      await page.waitForSelector('#risk-5');
+      const risk5 = await page.innerText('#risk-5');
+      t.match(risk5, /Apache-2\.0/);
+      t.match(risk5, /SUSE-NotALicense/);
+
+      // Unresolved matches block shows file count and license/match info
+      const unmatched = await page.innerText('#unmatched-files');
+      t.match(unmatched, /unresolved match/);
+      t.match(unmatched, /4 files/);
+
+      // Click a missed-file link (file 7 is auto-expanded as a risk-9 file) -
+      // verifies the click handler runs and the preview stays visible.
+      await page.locator('#filelist-snippets a[href="#file-7"]').click();
+      await page.waitForSelector('#file-details-7');
+      t.same(await page.isVisible('#file-details-7'), true);
+
+      // Emails section: 14 entries, collapsed by default, click to expand
+      await page.click('text=14 Emails');
+      await page.waitForSelector('#emails.show');
+      t.match(await page.innerText('#emails'), /coolo@suse\.com/);
+
+      // URLs section: 53 entries
+      await page.click('text=53 URLs');
+      await page.waitForSelector('#urls.show');
+      t.match(await page.innerText('#urls'), /https?:\/\//);
+    });
+
+    await t.test('Embargoed metadata is visually distinct', async t => {
+      await page.route('**/reviews/meta/1', async route => {
+        const response = await route.fetch();
+        const data = await response.json();
+        data.embargoed = true;
+        await route.fulfill({response, json: data});
+      });
+
+      await page.goto(url);
+      await page.click('text=Artistic');
+      const badge = page.locator('#pkg-embargoed .embargo-status-badge');
+      await badge.waitFor();
+      t.equal(await badge.innerText(), 'Yes');
+      t.equal(await badge.getAttribute('title'), 'Package is embargoed');
+      t.equal(await badge.locator('.fa-lock').count(), 1, 'embargoed yes includes a lock icon');
+
+      await page.unroute('**/reviews/meta/1');
+    });
+
+    await t.test('Components render in their own tab with capped license chart', async t => {
+      await page.route('**/reviews/report_details/1', async route => {
+        const response = await route.fetch();
+        const data = await response.json();
+        const licenses = [
+          'Apache-2.0',
+          'MIT',
+          'BSD-3-Clause',
+          'ISC',
+          'MPL-2.0',
+          'Zlib',
+          '0BSD',
+          'CC0-1.0',
+          'EPL-2.0',
+          'LGPL-2.1-only',
+          'Unlicense',
+          'WTFPL'
+        ];
+        data.components = licenses.map((license, index) => ({
+          type: 'npm',
+          name: `component-${index + 1}`,
+          version: '1.0.0',
+          purl: `pkg:npm/component-${index + 1}@1.0.0`,
+          license,
+          license_html: `<a href="/licenses/${license}">${license}</a>`,
+          file_url: `/reviews/file_view/1/component-${index + 1}/package.json`,
+          search_url: `/search?component=pkg:npm/component-${index + 1}%401.0.0`
+        }));
+        data.components.push({
+          type: 'cargo',
+          name: 'unlicensed-component',
+          version: '0.1.0',
+          purl: 'pkg:cargo/unlicensed-component@0.1.0',
+          license: null,
+          license_html: null,
+          file_url: null,
+          search_url: '/search?component=pkg:cargo/unlicensed-component%400.1.0'
+        });
+        data.components.push({
+          type: 'cargo',
+          name: 'missing-license-component',
+          version: '0.2.0',
+          purl: 'pkg:cargo/missing-license-component@0.2.0',
+          license: null,
+          license_html: null,
+          file_url: null,
+          search_url: '/search?component=pkg:cargo/missing-license-component%400.2.0'
+        });
+        await route.fulfill({response, json: data});
+      });
+
+      await page.goto(url);
+      await page.click('text=Artistic');
+      await page.waitForSelector('[data-tab="components"]');
+      t.match(await page.innerText('[data-tab="components"]'), /Components\s+14/);
+
+      await page.click('[data-tab="components"]');
+      await page.waitForSelector('#component-license-chart');
+      t.same(await page.isVisible('#license-chart'), false, 'report chart is hidden while components tab is active');
+      t.match(await page.innerText('#report-components-pane'), /Component license composition/);
+      t.match(await page.innerText('#report-components-pane'), /14\s+components/);
+      t.match(await page.innerText('#report-components-pane'), /Apache-2\.0/);
+      t.match(await page.innerText('#report-components-pane'), /Misc/);
+      t.match(await page.innerText('#component-license-chart'), /No license detected/);
+      t.equal(await page.locator('#component-license-chart .license-composition-slice').count(), 8);
+      t.equal(
+        await page.locator('#component-license-chart .license-composition-item').first().innerText(),
+        'Misc\n43%',
+        'misc bucket is sorted by combined percentage'
+      );
+      t.equal(await page.locator('.report-component-item').count(), 14);
+      t.equal(
+        await page
+          .locator('.report-component-item', {hasText: 'unlicensed-component'})
+          .locator('.report-component-license')
+          .innerText(),
+        '',
+        'component listing leaves missing license blank'
+      );
+
+      await page.locator('#report-component-filter-input').fill('Apache');
+      t.equal(await page.locator('.report-component-item').count(), 1, 'component list filters by license');
+      t.match(await page.innerText('.report-component-item'), /component-1/);
+
+      await page.locator('#report-component-filter-input').fill('cargo');
+      t.equal(await page.locator('.report-component-item').count(), 2, 'component list filters by component type');
+      t.match(await page.innerText('.report-component-item'), /unlicensed-component/);
+
+      await page.locator('#report-component-filter-input').fill('missing 0.2');
+      t.equal(await page.locator('.report-component-item').count(), 1, 'component list filters by name and version');
+      t.match(await page.innerText('.report-component-item'), /missing-license-component@0\.2\.0/);
+
+      await page.locator('#report-component-filter-input').fill('does-not-exist');
+      t.equal(await page.locator('.report-component-item').count(), 0, 'component list can filter to empty');
+      t.match(await page.innerText('.report-component-empty'), /No components match this filter/);
+      t.equal(await page.locator('.report-component-list').count(), 0, 'empty filter hides component list shell');
+
+      await page.unroute('**/reviews/report_details/1');
+    });
+
+    await t.test('Click file in license list expands hidden preview', async t => {
+      await page.goto(url);
+      await page.click('text=Artistic');
+      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
+      await page.waitForSelector('#license-chart');
+
+      // File 6 lives in the Apache-2.0 risk-5 bucket. With the inflated
+      // fixture the bucket holds many files so its file list starts collapsed -
+      // expand it first, then click the in-bucket file-link and verify the
+      // preview expands and loads source (FileSource renders a table.snippet
+      // inside the details div).
+      const apache = page.locator('#risk-5 > li').filter({hasText: 'Apache-2.0'}).first();
+      await apache.locator('a[data-bs-toggle="collapse"]').click();
+      await apache.locator('a[href="#file-6"]').waitFor();
+      t.same(await page.isVisible('#file-details-6'), false);
+      await apache.locator('a[href="#file-6"]').click();
+      await page.waitForSelector('#file-details-6');
+      t.same(await page.isVisible('#file-details-6'), true);
+      await page.waitForSelector('#file-details-6 table.snippet');
+    });
+
+    await t.test('Keyboard shortcuts for unresolved match navigation', async t => {
+      await page.route('**/reviews/report_details/1', async route => {
+        const response = await route.fetch();
+        const data = await response.json();
+        data.components = [
+          {
+            type: 'npm',
+            name: 'shortcut-component',
+            version: '1.0.0',
+            purl: 'pkg:npm/shortcut-component@1.0.0',
+            license: 'MIT',
+            license_html: '<a href="/licenses/MIT">MIT</a>',
+            file_url: '/reviews/file_view/1/shortcut-component/package.json',
+            search_url: '/search?component=pkg:npm/shortcut-component%401.0.0'
+          }
+        ];
+        await route.fulfill({response, json: data});
+      });
+
+      await page.goto(url);
+      await page.click('text=Artistic');
+      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
+      await page.waitForSelector('#license-chart');
+      await page.waitForSelector('#filelist-snippets a.file-link');
+      await page.waitForSelector('[data-tab="components"]');
+      t.same(
+        await page.locator('#report-tabs [data-tab]').evaluateAll(tabs => tabs.map(tab => tab.dataset.tab)),
+        ['review', 'notes', 'components'],
+        'optional components tab is third in tab order'
+      );
+
+      // Wait for every previewed file's source to finish loading. Navigation
+      // walks the DOM, so a snippet only becomes a target once its row is
+      // rendered.
+      await page.waitForFunction(() => {
+        const containers = document.querySelectorAll('.file-container:not(.d-none) .source');
+        if (containers.length === 0) return false;
+        for (const c of containers) {
+          if (!c.querySelector('table.snippet')) return false;
+        }
+        return true;
+      });
+
+      // Collect the ordered list of match-start anchors the page actually
+      // rendered. Pressing 'n' must visit each in document order, including
+      // siblings inside the same file, and including files that contain
+      // license-pattern matches alongside unresolved snippets.
+      const matchIds = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('.match-start')).map(el => el.id)
+      );
+      t.ok(matchIds.length >= 4, 'have at least four unresolved match anchors');
+      const perFile = matchIds.reduce((acc, id) => {
+        const fileId = id.split('-')[1];
+        acc[fileId] = (acc[fileId] || 0) + 1;
+        return acc;
+      }, {});
+      t.ok(
+        Object.values(perFile).some(n => n > 1),
+        'at least one file has multiple match anchors'
+      );
+      const firstId = matchIds[0].split('-')[1];
+      const secondId = matchIds[matchIds.findIndex(id => id.split('-')[1] !== firstId)].split('-')[1];
+
+      const inViewport = id => async () => {
+        return await page.evaluate(elId => {
+          const el = document.getElementById(elId);
+          if (!el) return false;
+          const r = el.getBoundingClientRect();
+          return r.top >= -50 && r.top <= window.innerHeight;
+        }, id);
+      };
+      const waitForMatchInView = async id => {
+        const check = inViewport(id);
+        const start = Date.now();
+        while (Date.now() - start < 5000) {
+          if (await check()) return;
+          await new Promise(r => setTimeout(r, 50));
+        }
+        throw new Error(`Timed out waiting for ${id} to enter viewport`);
+      };
+
+      for (const [i, id] of matchIds.entries()) {
+        await page.keyboard.press('n');
+        await waitForMatchInView(id);
+        t.pass(`'n' #${i + 1} landed on ${id}`);
+      }
+
+      for (let i = matchIds.length - 2; i >= 0; i--) {
+        await page.keyboard.press('p');
+        await waitForMatchInView(matchIds[i]);
+      }
+      t.pass(`'p' walked back to ${matchIds[0]}`);
+
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.keyboard.press('u');
+      await waitForMatchInView('unmatched-files');
+      t.pass("'u' jumped to the Risk 9 unresolved matches list");
+
+      await page.keyboard.press('3');
+      await page.waitForSelector('#report-components-pane.is-active');
+      t.match(await page.innerText('#report-components-pane'), /shortcut-component/, "'3' opened the Components tab");
+
+      await page.locator('#report-component-filter-input').fill('');
+      await page.locator('#report-component-filter-input').click();
+      await page.keyboard.type('23');
+      t.equal(
+        await page.locator('#report-component-filter-input').inputValue(),
+        '23',
+        'tab shortcut keys are typed normally inside the component filter'
+      );
+
+      await page.locator('#report-component-filter-input').blur();
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.keyboard.press('2');
+      await page.waitForSelector('#report-notes-pane.is-active');
+      await waitForMatchInView('report-tabs');
+      t.same(await page.locator('#report-notes-pane .report-notes').count(), 1, "'2' mounted the Notes tab");
+      t.pass("'2' scrolled back to the report tab position");
+
+      await page.keyboard.press('1');
+      await page.waitForSelector('.report-tab-pane.is-active #license-chart');
+      t.pass("'1' returned to the Report tab");
+
+      // Sanity-check the original assertion that both files end up visible.
+      t.same(await page.isVisible(`#file-details-${firstId}`), true, 'first missed file visible');
+      t.same(await page.isVisible(`#file-details-${secondId}`), true, 'second missed file visible');
+
+      // '?' opens the shortcuts help modal
+      await page.keyboard.press('Shift+/');
+      await page.waitForSelector('#shortcutsModal.show');
+      const modalText = await page.innerText('#shortcutsModal');
+      t.match(modalText, /Keyboard shortcuts/);
+      t.match(modalText, /Jump to next unresolved match/);
+      t.match(modalText, /Jump to previous unresolved match/);
+      t.match(modalText, /Jump to Risk 9 unresolved matches list/);
+      t.match(modalText, /Open Report tab/);
+      t.match(modalText, /Open Components tab/);
+      t.match(modalText, /Open Notes tab/);
+
+      await page.locator('#shortcutsModal .btn-close').click();
+      await page.waitForFunction(() => {
+        const m = document.getElementById('shortcutsModal');
+        return !m || !m.classList.contains('show');
+      });
+
+      // Shortcut must not fire while typing into an editor input - open the
+      // inline editor on file 1 and confirm pressing shortcut keys inside the license
+      // field inserts the letter instead of jumping to the next match.
+      await page.locator('#file-details-1 .quick-actions a').first().click();
+      await waitForInlineSnippetEditor(page);
+      await page.locator('#inline-snippet-editor input[name=license]').click();
+      await page.keyboard.type('npu');
+      t.equal(
+        await page.locator('#inline-snippet-editor input[name=license]').inputValue(),
+        'npu',
+        'shortcut keys are typed normally inside the license input'
+      );
+      await page.locator('#inline-snippet-editor [data-action="cancel"]').click();
+      await waitForInlineSnippetEditorClosed(page);
+      await page.unroute('**/reviews/report_details/1');
+    });
+
+    await t.test('Initial URL hash auto-expands hidden file', async t => {
+      // First navigate via the UI to learn the real report URL plus a
+      // file id that is in data.files but normally collapsed on initial
+      // load (i.e. not auto-expanded as risk-9).
+      await page.goto(url);
+      await page.click('text=Artistic');
+      await page.waitForSelector('#license-chart');
+      const reportUrl = page.url().split('#')[0];
+
+      // Pick any rendered file-container whose details div is missing (i.e.
+      // file.expanded is false) so the test exercises the auto-expand path.
+      const targetFileId = await page.evaluate(() => {
+        const containers = document.querySelectorAll('.file-container');
+        for (const c of containers) {
+          const a = c.querySelector('a[name^="file-"]');
+          if (!a) continue;
+          const id = a.name.replace('file-', '');
+          if (!document.getElementById(`file-details-${id}`)) return id;
+        }
+        return null;
+      });
+      t.ok(targetFileId, 'found a collapsed file to deep-link to');
+
+      // Visit a different URL first so the next goto triggers a real reload
+      // (page.goto to the same URL with only a hash change does NOT remount Vue).
+      await page.goto(url);
+      await page.goto(`${reportUrl}#file-${targetFileId}`);
+      await page.waitForSelector('#license-chart');
+      await page.waitForSelector(`#file-details-${targetFileId} table.snippet`, {timeout: 10000});
+      t.same(
+        await page.isVisible(`#file-details-${targetFileId}`),
+        true,
+        `file-${targetFileId} auto-expanded from URL hash`
+      );
+
+      // Auto-scroll-into-view used to be asserted here too, but it races with
+      // the source fetches of *other* auto-expanded files (handleInitialHash ->
+      // scrollToFile in ReportDetails.vue only awaits the target file's source)
+      // and there's no re-scroll once the rest of the page settles. The test's
+      // stated purpose is auto-expand, which the assertion above already covers.
+    });
+
+    await t.test('Pattern tooltip links are reachable in reports and inline editor', async t => {
+      await page.goto(url);
+      await page.click('text=Artistic');
+      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
+      await page.waitForSelector('#license-chart');
+
+      const reportFileId = await page.evaluate(() => {
+        for (const toggle of document.querySelectorAll('[id^="risk-"] a[data-bs-toggle="collapse"]')) toggle.click();
+        const link = document.querySelector('[id^="risk-"] a.file-link[href^="#file-"]');
+        if (!link) throw new Error('No license-match file link found in risk buckets');
+        link.click();
+        return link.getAttribute('href').replace('#file-', '');
+      });
+      const reportFileIds = await page.evaluate(() => {
+        return [
+          ...new Set(
+            [...document.querySelectorAll('[id^="risk-"] a.file-link[href^="#file-"]')].map(link => {
+              return link.getAttribute('href').replace('#file-', '');
+            })
+          )
+        ];
+      });
+      await page.waitForSelector(`#file-details-${reportFileId} table.snippet`);
+      const reportRows = page.locator(`#file-details-${reportFileId} tr.has-pattern-tooltip`);
+      await reportRows.first().waitFor();
+      const reportCard = page.locator('.cavil-pattern-tip-floating .cavil-pattern-tip-card').first();
+      for (let i = 0; i < (await reportRows.count()); i++) {
+        const row = reportRows.nth(i);
+        await row.scrollIntoViewIfNeeded();
+        await row.locator('td.code').hover({position: {x: 24, y: 8}});
+        try {
+          await reportCard.waitFor({timeout: 1000});
+          break;
+        } catch (_error) {
+          await page.mouse.move(0, 0);
+        }
+      }
+      await reportCard.waitFor({timeout: 5000});
+      const reportTooltipClear = await page.evaluate(fileId => {
+        const row = document.querySelector(`#file-details-${fileId} tr.has-pattern-tooltip`);
+        const tip = document.querySelector('.cavil-pattern-tip-floating');
+        const rowRect = row.getBoundingClientRect();
+        const tipRect = tip.getBoundingClientRect();
+        return tipRect.bottom <= rowRect.top || tipRect.top >= rowRect.bottom;
+      }, reportFileId);
+      t.ok(reportTooltipClear, 'report tooltip does not cover the active source row');
+      t.match(await reportCard.innerText(), /risk \d/i, 'report tooltip shows pattern risk');
+      t.equal(await reportCard.locator('a').count(), 0, 'report tooltip is informational only');
+
+      const secondReportFileId = reportFileIds.find(id => id !== reportFileId);
+      t.ok(secondReportFileId, 'report fixture has another matched file for tooltip handoff');
+      if (secondReportFileId) {
+        // Matched files live in the risk buckets, not in #filelist-snippets, so
+        // expand the second file via its risk-bucket link (expandFileDetails
+        // only knows about the unresolved snippet list).
+        await page.locator(`[id^="risk-"] a.file-link[href="#file-${secondReportFileId}"]`).click();
+        await page.waitForSelector(`#file-details-${secondReportFileId} table.snippet`);
+        // With a tooltip already open over the first file, hover a matched row in
+        // the second file: the pointer moving between previews must hand the
+        // transient tooltip over so only one stays alive.
+        const secondRow = page.locator(`#file-details-${secondReportFileId} tr.has-pattern-tooltip`).first();
+        await secondRow.waitFor();
+        await secondRow.scrollIntoViewIfNeeded();
+        await secondRow.locator('td.code').hover({position: {x: 24, y: 8}});
+        await page.waitForFunction(() => document.querySelectorAll('.cavil-pattern-tip-floating').length === 1);
+        t.equal(
+          await page.locator('.cavil-pattern-tip-floating').count(),
+          1,
+          'moving between report file previews keeps only one pattern tooltip active'
+        );
+      }
+      await page.mouse.move(0, 0);
+      await page.waitForSelector('.cavil-pattern-tip-floating', {state: 'detached'});
+
+      const fileId = (await page.locator('#filelist-snippets a.file-link').first().getAttribute('href')).replace(
+        '#file-',
+        ''
+      );
+      await expandFileDetails(page, fileId);
+      const unresolved = page.locator(`#file-details-${fileId} tr.match-start`).first();
+      await unresolved.waitFor();
+      await openCreatePatternEditor(page, fileId);
+
+      // Make sure at least one match-decorated line is in the editor.
+      const highlighted = page.locator('#inline-snippet-editor .cm-line.found-pattern').first();
+      await highlighted.waitFor();
+      await highlighted.scrollIntoViewIfNeeded();
+
+      // CM6's hoverTooltip requires a mousemove event within the editor over
+      // actual text. Use a manual mouse.move sequence into the line's box so
+      // the source callback fires reliably regardless of which character index
+      // the line happens to start at.
+      const box = await highlighted.boundingBox();
+      await page.mouse.move(box.x + 5, box.y + box.height / 2);
+      await page.mouse.move(box.x + 20, box.y + box.height / 2);
+
+      const tip = page.locator('.cavil-pattern-tip').first();
+      await tip.waitFor({timeout: 5000});
+
+      // The tooltip starts in a loading state; wait for the card to render
+      // after /licenses/pattern/<id>.json returns.
+      const card = page.locator('.cavil-pattern-tip .cavil-pattern-tip-card').first();
+      await card.waitFor({timeout: 5000});
+      const tipText = await card.innerText();
+      t.match(tipText, /risk \d/i, 'tooltip shows risk indicator');
+      t.ok(tipText.length > 0, 'tooltip shows pattern info');
+
+      // The "Open pattern" link in the tooltip targets the pattern editor.
+      const href = await card.locator('a').first().getAttribute('href');
+      t.match(href, /\/licenses\/edit_pattern\/\d+/, 'tooltip link points to pattern editor');
+
+      const [inlinePatternPage] = await Promise.all([context.waitForEvent('page'), card.locator('a').first().click()]);
+      await inlinePatternPage.waitForLoadState('load');
+      t.match(inlinePatternPage.url(), /\/licenses\/edit_pattern\/\d+/, 'inline editor tooltip link can be clicked');
+      await inlinePatternPage.close();
+
+      // Tidy up: move the mouse away so the tooltip closes, then close the editor.
+      await page.mouse.move(0, 0);
+      await page.keyboard.press('Escape');
+      await page.locator('#inline-snippet-editor button[data-action="cancel"]').click();
+      await waitForInlineSnippetEditorClosed(page);
+    });
+
+    await t.test('Propose ignore glob: reject, redo, accept, confirm', async t => {
+      // Drive the whole human lifecycle: propose a glob from a file header, reject it on the
+      // Change Proposals page, propose it again, accept it, and confirm it lands on the admin
+      // Ignored Files page with the proposer credited as contributor.
+      const proposeGlobFromFile6 = async () => {
+        await page.goto(url);
+        await page.click('text=Artistic');
+        await page.waitForSelector('#license-chart');
+
+        // Expand file 6 (Apache-2.0 risk-5 bucket) so its file header - and the file-actions
+        // dropdown that lives in it - becomes visible.
+        const apache = page.locator('#risk-5 > li').filter({hasText: 'Apache-2.0'}).first();
+        await apache.locator('a[data-bs-toggle="collapse"]').click();
+        await apache.locator('a[href="#file-6"]').click();
+        await page.waitForSelector('#file-details-6');
+
+        // Open the file-actions pulldown and choose "Propose ignore glob". Scope to file 6's own
+        // menu - every expanded file renders its own dropdown, so a global selector would match a
+        // closed menu from another file.
+        await page.locator('#file-menu-6').click();
+        const fileMenu = page.locator('[aria-labelledby="file-menu-6"]');
+        await fileMenu.waitFor({state: 'visible'});
+        await fileMenu.locator('.dropdown-item', {hasText: 'Propose ignore glob'}).click();
+
+        // The modal opens pre-filled with a glob derived from the file path, with the versioned
+        // top-level directory turned into a wildcard.
+        await page.waitForSelector('#globProposalModal.show');
+        const value = await page.locator('#glob-proposal-input').inputValue();
+        await page.locator('#glob-proposal-reason').fill('Bundled jQuery, not part of the package license');
+        await page.locator('#glob-proposal-submit').click();
+        await page.waitForSelector('#globProposalModal', {state: 'hidden'});
+
+        // The proposal is queued in the floating pending-changes widget; submitting posts it and
+        // reloads the report.
+        await page.locator('#pending-actions-widget .pending-actions-toggle').click();
+        const item = page.locator('.pending-actions-item').filter({hasText: 'Propose ignore glob'}).first();
+        await item.waitFor();
+        t.match(await item.innerText(), /Mojolicious-\*\//, 'queued action is labelled with the glob');
+        await Promise.all([page.waitForNavigation(), page.locator('#pending-actions-submit').click()]);
+
+        return value;
+      };
+
+      const globCard = () => page.locator('.change-file-container').filter({hasText: 'ignore glob'}).first();
+
+      // Propose, then reject it on the Change Proposals page.
+      const suggested = await proposeGlobFromFile6();
+      t.match(suggested, /^Mojolicious-\*\//, 'suggested glob wildcards the versioned top-level directory');
+
+      await page.goto(new URL('licenses/proposed', url).toString());
+      await page.waitForSelector('#proposed-patterns');
+      await globCard().waitFor();
+      t.equal(
+        await globCard().locator('.change-glob-input').inputValue(),
+        suggested,
+        'proposed glob is shown for the reviewer'
+      );
+      await globCard().locator('button.btn-danger', {hasText: 'Reject'}).click();
+      await page.locator('.change-file-container').filter({hasText: 'ignore glob'}).waitFor({state: 'detached'});
+      t.equal(
+        await page.locator('.change-file-container').filter({hasText: 'ignore glob'}).count(),
+        0,
+        'rejected glob proposal is gone'
+      );
+
+      // Propose the same glob again and this time accept it.
+      const suggestedAgain = await proposeGlobFromFile6();
+      t.equal(suggestedAgain, suggested, 'same glob is suggested on the second proposal');
+
+      await page.goto(new URL('licenses/proposed', url).toString());
+      await page.waitForSelector('#proposed-patterns');
+      await globCard().waitFor();
+      await globCard().locator('button.btn-success', {hasText: 'Accept'}).click();
+      await page.locator('.change-file-container').filter({hasText: 'ignore glob'}).waitFor({state: 'detached'});
+
+      // The accepted glob now appears on the admin Ignored Files page, crediting the proposer.
+      await page.goto(new URL('ignored-files', url).toString());
+      await page.waitForSelector('#ignored-files tbody tr');
+      const row = page.locator('#ignored-files tbody tr').filter({hasText: suggested}).first();
+      await row.waitFor();
+      t.equal(await row.locator('td').nth(0).innerText(), suggested, 'accepted glob is listed');
+      t.equal(await row.locator('td').nth(3).innerText(), 'tester', 'proposer is credited as contributor');
+
+      // Accepting enqueued a reindex of the originating package; run it, then confirm the report
+      // now reports the file as suppressed by the new glob.
+      const jobs = await context.newPage();
+      await jobs.goto(performJobs, {timeout: 120000});
+      t.match(await jobs.innerText('div'), /done/);
+      await jobs.close();
+
+      await page.goto(url);
+      await page.click('text=Artistic');
+      await page.waitForSelector('#license-chart');
+      const globList = page.locator('.report-glob-list');
+      await globList.waitFor();
+      t.ok(
+        (await globList.innerText()).includes(suggested),
+        'report lists the accepted glob as matching after reindexing'
+      );
+    });
+
+    t.test('Console errors', t => {
+      assertNoUnexpectedConsoleErrors(t, errorLogs);
+      t.end();
+    });
+  } finally {
+    await ui.teardown();
+  }
+});

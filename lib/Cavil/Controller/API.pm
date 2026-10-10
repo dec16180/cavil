@@ -16,8 +16,77 @@
 package Cavil::Controller::API;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
 
-sub source ($self) {
+use List::Util qw(uniq);
+use Mojo::JSON qw(true false);
 
+sub identify ($self) {
+  my $name     = $self->stash('name');
+  my $checksum = $self->stash('checksum');
+  my $pkg      = $self->packages->find_by_name_and_md5($name, $checksum);
+  return $self->render(json => {error => 'Package not found'}, status => 404) unless $pkg;
+  $self->render(json => {id => $pkg->{id}});
+}
+
+sub reports ($self) {
+  my $validation = $self->validation;
+  $validation->required('external_link');
+  return $self->reply->json_validation_error if $validation->has_error;
+
+  my $external_link = $validation->param('external_link');
+  my $request_ids   = $self->requests->find_by_link($external_link);
+  my $package_ids   = $self->packages->find_by_link($external_link);
+  my @ids           = sort { $a <=> $b } uniq(@$request_ids, @$package_ids);
+
+  $self->render(json => {reports => [map { {id => $_} } @ids]});
+}
+
+sub package_search ($self) {
+  my $v = $self->validation;
+  $v->optional('name');         # exact package name
+  $v->optional('component');    # vendored component name or purl
+  $v->optional('limit')->num;
+  $v->optional('offset')->num;
+  return $self->reply->json_validation_error if $v->has_error;
+
+  my $limit  = $v->param('limit')  // 25;
+  my $offset = $v->param('offset') // 0;
+  $limit  = 100 if $limit > 100;
+  $limit  = 1   if $limit < 1;
+  $offset = 0   if $offset < 0;
+
+  # Same package search as the web UI, but the API never exposes embargoed or obsolete packages
+  my $component = $v->param('component');
+  my $page      = $self->packages->paginate_review_search(
+    scalar $v->param('name'),
+    {
+      search        => '',
+      component     => $component,
+      limit         => $limit,
+      offset        => $offset,
+      not_obsolete  => 'true',
+      not_embargoed => 'true'
+    }
+  );
+
+  # When searching by component, attach the matching components so a caller sees the exact version shipped
+  my @ids        = map { $_->{id} } @{$page->{page}};
+  my $components = length($component // '') ? $self->packages->matching_components(\@ids, $component) : {};
+
+  my @packages = map {
+    {
+      id         => $_->{id},
+      name       => $_->{package},
+      state      => $_->{state},
+      checksum   => $_->{checksum},
+      components => $components->{$_->{id}} // []
+    }
+  } @{$page->{page}};
+
+  $self->render(
+    json => {packages => \@packages, total => $page->{total}, start => $page->{start}, end => $page->{end}});
+}
+
+sub source ($self) {
   my $validation = $self->validation;
   $validation->required('api')->like(qr!^https?://.+!i);
   $validation->required('project');
@@ -51,6 +120,19 @@ sub source ($self) {
 sub status ($self) {
   my $name = $self->stash('name');
   $self->render(json => {package => $name, requests => $self->packages->states($name)});
+}
+
+sub whoami ($self) {
+  my $user = $self->current_user;
+  my $id   = $self->users->id_for_login($user);
+  $self->render(
+    json => {
+      id           => $id,
+      user         => $user,
+      roles        => $self->current_user_roles,
+      write_access => $self->current_user_has_write_access ? true : false
+    }
+  );
 }
 
 1;

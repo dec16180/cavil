@@ -1,56 +1,64 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Controller::Queue;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
 
-use Mojo::File 'path';
+use Cavil::Util qw(PRIORITY_INCOMING);
+use Mojo::File  qw(path);
 
 sub create_package ($self) {
   my $validation = $self->validation;
-  $validation->required('api')->like(qr!^https?://.+!i);
-  $validation->required('project');
+
+  $validation->optional('type')->in('obs', 'git');
+  my $type = $validation->param('type') || 'obs';
+
+  if ($type eq 'git') {
+    $validation->required('rev')->like(qr/^[a-f0-9]+$/i);
+    $validation->optional('project');
+  }
+  else {
+    $validation->optional('rev')->like(qr/^[a-f0-9]+$/i);
+    $validation->required('project');
+  }
+
+  $validation->required('api');
   $validation->required('package');
-  $validation->optional('rev')->like(qr/^[a-f0-9]+$/i);
   $validation->optional('created');
   $validation->optional('external_link');
   $validation->optional('priority')->like(qr/^\d+$/);
+
   return $self->reply->json_validation_error if $validation->has_error;
 
   my $api     = $validation->param('api');
-  my $project = $validation->param('project');
+  my $project = $validation->param('project') // '';
   my $pkg     = $validation->param('package');
   my $rev     = $validation->param('rev');
   my $created = $validation->param('created');
   my $link    = $validation->param('external_link');
-  my $prio    = $validation->param('priority') || 5;
+  my $prio    = $validation->param('priority') || PRIORITY_INCOMING;
 
   my $app    = $self->app;
   my $config = $app->config;
-  my $obs    = $app->obs;
+
+  my ($srcpkg, $srcmd5, $verifymd5);
+  if ($type eq 'git') {
+    ($srcpkg, $srcmd5, $verifymd5) = ($pkg, $rev, $rev);
+  }
 
   # Get package infomation, rev may be pointing to link, so we need the
   # canonical srcmd5
-  my $info = eval { $obs->package_info($api, $project, $pkg, {rev => $rev}) };
-  unless ($info && $info->{verifymd5}) {
-    $self->_log("Couldn't get package info", $api, $project, $pkg, $rev, $@);
-    return $self->render(json => {error => 'Package not found'}, status => 404);
+  else {
+    my $obs  = $app->obs;
+    my $info = eval { $obs->package_info($api, $project, $pkg, {rev => $rev}) };
+    unless ($info && $info->{verifymd5}) {
+      $self->_log("Couldn't get package info", $api, $project, $pkg, $rev, $@);
+      return $self->render(json => {error => 'Package not found'}, status => 404);
+    }
+    ($srcpkg, $srcmd5, $verifymd5) = @{$info}{qw(package srcmd5 verifymd5)};
   }
-  my ($srcpkg, $srcmd5, $verifymd5) = @{$info}{qw(package srcmd5 verifymd5)};
 
-  # Check if we need to import from OBS
+  # Check if we need to import
   my $dir    = path($config->{checkout_dir}, $srcpkg, $verifymd5);
   my $create = !-e $dir;
 
@@ -68,6 +76,7 @@ sub create_package ($self) {
       package         => $pkg,
       created         => $created,
       srcmd5          => $srcmd5,
+      type            => $type
     );
     $obj = $pkgs->find($id);
   }
@@ -78,20 +87,33 @@ sub create_package ($self) {
 
   $obj->{obsolete} = 0;
   $pkgs->update($obj);
-  $pkgs->obs_import(
-    $obj->{id},
-    {
-      api       => $api,
-      project   => $project,
-      pkg       => $pkg,
-      srcpkg    => $srcpkg,
-      rev       => $rev,
-      srcmd5    => $srcmd5,
-      verifymd5 => $verifymd5,
-      priority  => $prio
-    },
-    $prio + 10
-  ) if $create;
+  if ($create) {
+
+    # The import runs at the review priority the request carries, and the whole chain down to the report
+    # follows from there (see Cavil::Util): an ordinary incoming package does not overtake a reviewer
+    # waiting on a rebuild, and a request marked urgent still does.
+    if ($type eq 'git') {
+      $pkgs->git_import($obj->{id},
+        {url => $api, pkg => $pkg, hash => $rev, external_link => $obj->{external_link}, priority => $prio}, $prio);
+    }
+    else {
+      $pkgs->obs_import(
+        $obj->{id},
+        {
+          api           => $api,
+          project       => $project,
+          pkg           => $pkg,
+          srcpkg        => $srcpkg,
+          rev           => $rev,
+          srcmd5        => $srcmd5,
+          verifymd5     => $verifymd5,
+          external_link => $obj->{external_link},
+          priority      => $prio
+        },
+        $prio
+      );
+    }
+  }
 
   $self->render(json => {saved => $obj});
 }
@@ -113,9 +135,7 @@ sub create_request ($self) {
 
 sub import_package ($self) {
   my $validation = $self->validation;
-  $validation->required('result');
-  $validation->optional('approved_by');
-  $validation->optional('state');
+  $validation->optional('state')->in('new');
   $validation->optional('priority');
   $validation->optional('external_link');
   return $self->reply->json_validation_error if $validation->has_error;
@@ -131,17 +151,15 @@ sub import_package ($self) {
   if (my $priority = $validation->param('priority')) {
     $obj->{priority} = $priority;
   }
-  $obj->{result} = $validation->param('result');
   if (my $state = $validation->param('state')) {
     $obj->{state} = $state;
     if ($state eq 'new') {
-      $obj->{obsolete} = 0;
-      $reindex = 1;
+      $obj->{result}         = undef;
+      $obj->{reviewed}       = undef;
+      $obj->{reviewing_user} = undef;
+      $obj->{obsolete}       = 0;
+      $reindex               = 1;
     }
-  }
-  if (my $approved = $validation->param('approved_by')) {
-    my $user = $self->users->find_or_create(login => $approved);
-    $obj->{reviewing_user} = $user->{id};
   }
   $pkgs->update($obj);
   $pkgs->reindex($id) if $reindex;
@@ -181,6 +199,15 @@ sub remove_request ($self) {
   $self->render(json => {removed => $removed});
 }
 
+sub remove_product ($self) {
+  my $validation = $self->validation;
+  $validation->required('name');
+  return $self->reply->json_validation_error if $validation->has_error;
+
+  my $removed = $self->products->remove($validation->param('name'));
+  $self->render(json => {removed => $removed ? 1 : 0});
+}
+
 sub update_package ($self) {
   my $validation = $self->validation;
   $validation->required('priority')->like(qr/^\d+$/);
@@ -199,8 +226,10 @@ sub update_product ($self) {
   $validation->required('id')->like(qr/^\d+$/);
   return $self->reply->json_validation_error if $validation->has_error;
 
+  my $name = $self->stash('name');
+  $self->log->info("Updating product $name");
   my $products = $self->products;
-  my $obj      = $products->find_or_create($self->stash('name'));
+  my $obj      = $products->find_or_create($name);
 
   # This might take some time for big products
   $self->inactivity_timeout(600);

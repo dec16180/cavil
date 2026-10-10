@@ -1,40 +1,60 @@
 {
-  "errors" => [],
-  "main"   => {
-    "%doc"     => [],
-    "%license" => [],
-    "file"     => "timezone.spec",
-    "group"    => "System/Base",
-    "license"  => "BSD-3-Clause and SUSE-Public-Domain",
-    "licenses" => ["BSD-3-Clause and SUSE-Public-Domain"],
-    "summary"  => "Timezone Descriptions",
-    "type"     => "spec",
-    "url"      => "http://www.gnu.org/software/libc/libc.html",
-    "version"  => "2012f"
+  "errors"              => [],
+  "incomplete_checkout" => 0,
+  "main"                => {
+    "%doc"                 => [],
+    "%license"             => [],
+    "file"                 => "timezone.spec",
+    "group"                => "System/Base",
+    "legal_review_notices" => [],
+    "license"              => "BSD-3-Clause and SUSE-Public-Domain",
+    "licenses"             => ["BSD-3-Clause and SUSE-Public-Domain"],
+    "sources"              => [
+      "ftp://ftp.iana.org/tz/releases/tzdata2012f.tar.gz",
+      "ftp://ftp.iana.org/tz/releases/tzcode2012f.tar.gz"
+    ],
+    "summary" => "Timezone Descriptions",
+    "type"    => "spec",
+    "url"     => "http://www.gnu.org/software/libc/libc.html",
+    "version" => "2012f"
   },
   "sub" => [
     {
-      "%doc"     => [],
-      "%license" => [],
-      "file"     => "timezone-java.spec",
-      "group"    => "System/Base",
-      "licenses" => ["BSD-3-Clause and SUSE-Public-Domain"],
-      "summary"  => "Timezone Descriptions",
-      "type"     => "spec",
-      "url"      => "http://www.gnu.org/software/libc/libc.html",
-      "version"  => "2012f"
+      "%doc"                 => [],
+      "%license"             => [],
+      "file"                 => "timezone-java.spec",
+      "group"                => "System/Base",
+      "legal_review_notices" => [],
+      "licenses"             => ["BSD-3-Clause and SUSE-Public-Domain"],
+      "sources"              => [
+        "ftp://ftp.iana.org/tz/releases/tzdata2012f.tar.gz",
+        "ftp://ftp.iana.org/tz/releases/tzcode2012f.tar.gz"
+      ],
+      "summary" => "Timezone Descriptions",
+      "type"    => "spec",
+      "url"     => "http://www.gnu.org/software/libc/libc.html",
+      "version" => "2012f"
     },
     {
-      "%doc"     => [],
-      "%license" => [],
-      "file"     => "timezone.spec",
-      "group"    => "System/Base",
-      "licenses" => ["BSD-3-Clause and SUSE-Public-Domain"],
-      "summary"  => "Timezone Descriptions",
-      "type"     => "spec",
-      "url"      => "http://www.gnu.org/software/libc/libc.html",
-      "version"  => "2012f"
+      "%doc"                 => [],
+      "%license"             => [],
+      "file"                 => "timezone.spec",
+      "group"                => "System/Base",
+      "legal_review_notices" => [],
+      "licenses"             => ["BSD-3-Clause and SUSE-Public-Domain"],
+      "sources"              => [
+        "ftp://ftp.iana.org/tz/releases/tzdata2012f.tar.gz",
+        "ftp://ftp.iana.org/tz/releases/tzcode2012f.tar.gz"
+      ],
+      "summary" => "Timezone Descriptions",
+      "type"    => "spec",
+      "url"     => "http://www.gnu.org/software/libc/libc.html",
+      "version" => "2012f"
     }
   ],
-  "warnings" => []
+  "warnings" => [
+    "Main license had to be normalized: BSD-3-Clause and SUSE-Public-Domain -> BSD-3-Clause AND LicenseRef-SUSE-Public-Domain",
+    "License from timezone-java.spec had to be normalized: BSD-3-Clause and SUSE-Public-Domain -> BSD-3-Clause AND LicenseRef-SUSE-Public-Domain",
+    "License from timezone.spec had to be normalized: BSD-3-Clause and SUSE-Public-Domain -> BSD-3-Clause AND LicenseRef-SUSE-Public-Domain"
+  ]
 }

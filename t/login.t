@@ -34,18 +34,70 @@ $config->{openid} = {
 my $t = Test::Mojo->new(Cavil => $config);
 $cavil_test->no_fixtures($t->app);
 
+subtest 'Unknown resource' => sub {
+  $t->get_ok('/does_not_exist')->status_is(404)->content_like(qr/The requested resource does not exist/);
+};
+
+subtest 'Public (main menu)' => sub {
+  $t->get_ok('/')->status_is(200);
+  $t->get_ok('/reviews/recent')->status_is(200);
+  $t->get_ok('/licenses')->status_is(200);
+  $t->get_ok('/products')->status_is(200);
+  $t->get_ok('/products/openSUSE:Factory')->status_is(200);
+};
+
+subtest 'Login required' => sub {
+  $t->get_ok('/api_keys')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/api_keys/meta')->status_is(401)->content_like(qr/Login Required/);
+  $t->post_ok('/api_keys')->status_is(401)->content_like(qr/Login Required/);
+  $t->delete_ok('/api_keys/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/details/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/meta/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/report/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/report_details/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/fetch_source/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/file_view/1/LICENSE')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/file_view_meta/1/LICENSE')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/notes/recent')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/notes/recent.json')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/notes/tags')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/notes/tags.json')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/notes/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->post_ok('/reviews/notes/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->patch_ok('/reviews/notes/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->patch_ok('/reviews/notes/1/pin')->status_is(401)->content_like(qr/Login Required/);
+  $t->delete_ok('/reviews/notes/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->post_ok('/reviews/notes/preview')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/snippets')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/snippets/meta')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/snippet/edit/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/snippet/meta/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/licenses/pattern/1.json')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/licenses/pattern/1/match_count.json')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/licenses/missing')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/licenses/proposed')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/licenses/proposed/meta')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/licenses/recent')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/licenses/recent/meta')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/spdx/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/stats')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/stats/meta')->status_is(401)->content_like(qr/Login Required/);
+};
+
 subtest 'Not authenticated' => sub {
   $t->post_ok('/reviews/review_package/1')->status_is(403)->content_like(qr/Permission/);
   $t->post_ok('/reviews/fasttrack_package/1')->status_is(403)->content_like(qr/Permission/);
-  $t->post_ok('/reviews/add_ignore')->status_is(403)->content_like(qr/Permission/);
+  $t->post_ok('/ignored-files')->status_is(403)->content_like(qr/Permission/);
   $t->post_ok('/reviews/reindex/1')->status_is(403)->content_like(qr/Permission/);
-  $t->get_ok('/licenses')->status_is(403)->content_like(qr/Permission/);
   $t->get_ok('/licenses/new_pattern')->status_is(403)->content_like(qr/Permission/);
   $t->post_ok('/licenses/create_pattern')->status_is(403)->content_like(qr/Permission/);
-  $t->get_ok('/licenses/Apache-2.0')->status_is(403)->content_like(qr/Permission/);
   $t->get_ok('/licenses/edit_pattern/1')->status_is(403)->content_like(qr/Permission/);
+  $t->post_ok('/licenses/pattern/1.json')->status_is(403)->content_like(qr/Permission/);
   $t->post_ok('/licenses/update_pattern/1')->status_is(403)->content_like(qr/Permission/);
+  $t->post_ok('/licenses/meta/Apache-2.0')->status_is(403)->content_like(qr/Permission/);
+  $t->post_ok('/licenses/update_patterns')->status_is(403)->content_like(qr/Permission/);
   $t->delete_ok('/licenses/remove_pattern/1')->status_is(403)->content_like(qr/Permission/);
+  $t->get_ok('/upload')->status_is(403)->content_like(qr/Permission/);
 };
 
 subtest 'OpenID' => sub {
@@ -55,12 +107,11 @@ subtest 'OpenID' => sub {
 subtest 'Dummy' => sub {
   delete $config->{openid};
   $t = Test::Mojo->new(Cavil => $config);
-  $t->get_ok('/licenses')->status_is(403)->content_like(qr/Permission/);
+  $t->get_ok('/upload')->status_is(403)->content_like(qr/Permission/);
   $t->get_ok('/login')->status_is(302)->header_is(Location => '/');
-  $t->get_ok('/licenses')->status_is(200)->content_like(qr/Licenses/);
-  $t->get_ok('/licenses/Apache-2.0')->status_is(200)->content_like(qr/Apache-2.0/);
+  $t->get_ok('/upload')->status_is(200)->content_like(qr/Upload/);
   $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
-  $t->get_ok('/licenses')->status_is(403)->content_like(qr/Permission/);
+  $t->get_ok('/upload')->status_is(403)->content_like(qr/Permission/);
 };
 
 done_testing;

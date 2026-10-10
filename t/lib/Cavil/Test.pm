@@ -16,7 +16,9 @@
 package Cavil::Test;
 use Mojo::Base -base, -signatures;
 
-use Mojo::File qw(path tempdir);
+use Cavil::Util qw(SNIPPET_SCORE_VERSION);
+use Mojo::File  qw(path tempdir);
+use Mojo::JSON  qw(from_json to_json);
 use Mojo::Pg;
 use Mojo::URL;
 use Mojo::Util qw(scope_guard);
@@ -25,7 +27,8 @@ sub new ($class, %options) {
 
   # Database
   my $self = $class->SUPER::new(options => \%options);
-  $self->{pg}       = Mojo::Pg->new($options{online});
+  $self->{pg} = Mojo::Pg->new($options{online});
+  $self->_ensure_extensions;
   $self->{db_guard} = $self->_prepare_schema($options{schema});
 
   # Temporary directories
@@ -40,20 +43,49 @@ sub checkout_dir ($self) { $self->{checkout_dir} }
 
 sub default_config ($self) {
   return {
-    secrets                => ['just_a_test'],
-    checkout_dir           => $self->checkout_dir,
-    cache_dir              => $self->cache_dir,
-    tokens                 => ['test_token'],
-    pg                     => $self->postgres_url,
-    acceptable_risk        => 3,
-    index_bucket_average   => 100,
-    cleanup_bucket_average => 50,
-    min_files_short_report => 20,
-    max_email_url_size     => 26,
-    max_task_memory        => 5_000_000_000,
-    max_worker_rss         => 100000,
-    max_expanded_files     => 100
+    secrets                                  => ['just_a_test'],
+    checkout_dir                             => $self->checkout_dir,
+    cache_dir                                => $self->cache_dir,
+    matcher                                  => $ENV{CAVIL_MATCHER} || 'cavil',
+    tokens                                   => ['test_token'],
+    pg                                       => $self->postgres_url,
+    acceptable_risk                          => 4,
+    auto_accept_risk                         => 0,
+    index_bucket_average                     => 100,
+    cleanup_bucket_average                   => 50,
+    days_to_keep_orphaned_packages           => 7,
+    days_to_keep_orphaned_duplicate_packages => 1,
+    min_files_short_report                   => 20,
+    max_email_url_size                       => 26,
+    max_task_memory                          => 5_000_000_000,
+    max_worker_rss                           => 100000,
+    max_expanded_files                       => 100,
+    max_file_browser_size                    => 1_000_000,
+    always_generate_spdx_reports             => 0,
+    spdx                                     => {
+      namespace             => 'http://legaldb.suse.de/spdx/',
+      creator               => {name => 'SUSE LLC', email => 'security@suse.de'},
+      license_ref_namespace => 'cavil'
+    },
+    snippet_fold => {
+      enabled         => 0,
+      threshold       => 0.95,
+      min_margin      => 0.15,
+      max_risk        => 5,
+      clear_threshold => 0,
+      overlap_clear   => 0,
+      overlap_guard   => 0.9,
+      cover_scope     => 'off'
+    }
   };
+}
+
+sub embargo_fixtures ($self, $app) {
+  $self->mojo_fixtures($app);
+  my $patterns = $app->patterns;
+
+  # A pattern that will create new snippets with embargo
+  $patterns->create(pattern => 'Added EXPERIMENTAL');
 }
 
 sub just_patterns_fixtures ($self, $app) {
@@ -66,6 +98,8 @@ sub just_patterns_fixtures ($self, $app) {
     license  => 'Apache-2.0'
   );
   $patterns->create(pattern => 'License: Artistic-2.0',            license => 'Artistic-2.0');
+  $patterns->create(pattern => 'License: MIT',                     license => 'MIT');
+  $patterns->create(pattern => 'License: MIT-CMU',                 license => 'MIT-CMU');
   $patterns->create(pattern => 'powerful web development toolkit', license => 'SUSE-NotALicense');
   $patterns->create(pattern => 'the terms');
   $patterns->create(pattern => 'copyright notice');
@@ -116,16 +150,121 @@ sub mojo_fixtures ($self, $app) {
   $pkgs->update($pkg2);
   $pkgs->imported($pkg2_id);
   my $patterns = $app->patterns;
-  $patterns->create(pattern => 'You may obtain a copy of the License at', license => 'Apache-2.0');
   $patterns->create(
-    packname => 'perl-Mojolicious',
-    pattern  => 'Licensed under the Apache License, Version 2.0',
-    license  => 'Apache-2.0'
+    pattern   => 'You may obtain a copy of the License at',
+    license   => 'Apache-2.0',
+    unique_id => '413430b9-8f04-49d8-93ef-953b68835d50'
   );
-  $patterns->create(pattern => 'License: Artistic-2.0',            license => 'Artistic-2.0');
-  $patterns->create(pattern => 'powerful web development toolkit', license => 'SUSE-NotALicense');
-  $patterns->create(pattern => 'the terms');
-  $patterns->create(pattern => 'copyright notice');
+  $patterns->create(
+    packname  => 'perl-Mojolicious',
+    pattern   => 'Licensed under the Apache License, Version 2.0',
+    license   => 'Apache-2.0',
+    unique_id => '413430b9-8f04-49d8-93ef-953b68835d51'
+  );
+  $patterns->create(
+    pattern   => 'License: Artistic-2.0',
+    license   => 'Artistic-2.0',
+    unique_id => '413430b9-8f04-49d8-93ef-953b68835d52'
+  );
+  $patterns->create(
+    pattern   => 'powerful web development toolkit',
+    license   => 'SUSE-NotALicense',
+    unique_id => '413430b9-8f04-49d8-93ef-953b68835d53'
+  );
+  $patterns->create(pattern => 'the terms',        unique_id => '413430b9-8f04-49d8-93ef-953b68835d54');
+  $patterns->create(pattern => 'copyright notice', unique_id => '413430b9-8f04-49d8-93ef-953b68835d55');
+
+  $app->pg->db->query('UPDATE license_patterns SET spdx = $1 WHERE license = $1', $_) for qw(Apache-2.0 Artistic-2.0);
+}
+
+sub components_fixtures ($self, $app) {
+  $self->no_fixtures($app);
+
+  # Checkout whose source archive vendors npm and cargo modules under obscured directory names
+  my @src       = ('vendored', 'da39a3ee5e6b4b0d3255bfef95601890');
+  my $checkout  = $self->checkout_dir->child(@src)->make_path;
+  my $legal_bot = path(__FILE__)->dirname->dirname->dirname->child('legal-bot');
+  $_->copy_to($checkout->child($_->basename)) for $legal_bot->child(@src)->list->each;
+
+  # A license pattern so Cavil can detect the license of the vendored module whose metadata omits one
+  my $patterns = $app->patterns;
+  $patterns->create(pattern => 'Permission is hereby granted to use this fixture component', license => 'MIT');
+  $app->pg->db->query('UPDATE license_patterns SET spdx = $1 WHERE license = $1', 'MIT');
+
+  my $usr_id = $app->pg->db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
+  my $pkgs   = $app->packages;
+  my $pkg_id = $pkgs->add(
+    name            => 'vendored',
+    checkout_dir    => 'da39a3ee5e6b4b0d3255bfef95601890',
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => 'vendored',
+    srcmd5          => 'da39a3ee5e6b4b0d3255bfef95601890',
+    priority        => 5
+  );
+  $pkgs->imported($pkg_id);
+
+  return $pkg_id;
+}
+
+sub go_vendor_fixtures ($self, $app) {
+
+  # A Go project that vendors its modules at the source root: the tarball's only top-level entry is
+  # vendor/, so vendor/modules.txt lands at the root of the unpacked tree. Reuses the schema/user set up
+  # by an earlier fixture in the same test (no migration here).
+  my @src       = ('go-vendor', 'b6d767d2f8ed5d21a44b0e5886680cb9');
+  my $checkout  = $self->checkout_dir->child(@src)->make_path;
+  my $legal_bot = path(__FILE__)->dirname->dirname->dirname->child('legal-bot');
+  $_->copy_to($checkout->child($_->basename)) for $legal_bot->child(@src)->list->each;
+
+  my $db     = $app->pg->db;
+  my $usr_id = $db->select('bot_users', 'id', {login => 'test_bot'})->hash->{id}
+    // $db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
+  my $pkgs   = $app->packages;
+  my $pkg_id = $pkgs->add(
+    name            => 'go-vendor',
+    checkout_dir    => 'b6d767d2f8ed5d21a44b0e5886680cb9',
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => 'go-vendor',
+    srcmd5          => 'b6d767d2f8ed5d21a44b0e5886680cb9',
+    priority        => 5
+  );
+  $pkgs->imported($pkg_id);
+
+  return $pkg_id;
+}
+
+sub multiarchive_fixtures ($self, $app) {
+
+  # A checkout that ships several archives side by side (the main source plus a separately-vendored
+  # crate). With archive_name_as_dir off they unpack directly under .unpacked, so it has multiple
+  # top-level directories and a vendored manifest (serde-1.0.197/Cargo.toml) lands at depth 1. Reuses the
+  # schema/user from an earlier fixture in the same test.
+  my @src       = ('multiarchive', 'c4ca4238a0b923820dcc509a6f75849b');
+  my $checkout  = $self->checkout_dir->child(@src)->make_path;
+  my $legal_bot = path(__FILE__)->dirname->dirname->dirname->child('legal-bot');
+  $_->copy_to($checkout->child($_->basename)) for $legal_bot->child(@src)->list->each;
+
+  my $db     = $app->pg->db;
+  my $usr_id = $db->select('bot_users', 'id', {login => 'test_bot'})->hash->{id}
+    // $db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
+  my $pkgs   = $app->packages;
+  my $pkg_id = $pkgs->add(
+    name            => 'multiarchive',
+    checkout_dir    => 'c4ca4238a0b923820dcc509a6f75849b',
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => 'multiarchive',
+    srcmd5          => 'c4ca4238a0b923820dcc509a6f75849b',
+    priority        => 5
+  );
+  $pkgs->imported($pkg_id);
+
+  return $pkg_id;
 }
 
 sub no_fixtures ($self, $app) {
@@ -183,9 +322,206 @@ sub package_with_snippets_fixtures ($self, $app) {
   );
 }
 
+# Synthetic fixture for the snippet fold-in UI test: index a package, make every snippet a
+# confident, current-version GPL match, and regenerate the report so it folds. Requires the app to
+# be built with snippet_fold enabled.
+sub snippet_fold_fixtures ($self, $app) {
+  $self->package_with_snippets_fixtures($app);
+  $app->minion->enqueue(unpack => [1]);
+  $app->minion->perform_jobs;
+
+  my $db  = $app->pg->db;
+  my $gpl = $db->query("SELECT id FROM license_patterns WHERE license = 'GPL' LIMIT 1")->hash;
+  $db->query(
+    'UPDATE snippets SET license = TRUE, classified = TRUE, likelyness = 0.99, second_match = 0,
+       score_version = ?, like_pattern = ?', SNIPPET_SCORE_VERSION, $gpl->{id}
+  );
+
+  # Regenerate the cached report so the fold is reflected in what the UI loads
+  $app->minion->enqueue(analyze => [1]);
+  $app->minion->perform_jobs;
+}
+
+# Synthetic fixture for the boilerplate-clear UI test: index a package, then make every snippet a
+# high-containment but zero-margin match of a synthetic license so it can only *clear* (never fold).
+# The synthetic license cannot appear from any real match, so its absence proves clearing asserts
+# nothing. Requires the app to be built with snippet_fold clear_threshold enabled.
+sub snippet_clear_fixtures ($self, $app) {
+  $self->package_with_snippets_fixtures($app);
+  $app->minion->enqueue(unpack => [1]);
+  $app->minion->perform_jobs;
+
+  my $db = $app->pg->db;
+  my $pattern
+    = $app->patterns->create(pattern => 'a unique clearable license marker for the ui', license => 'Clear-Test');
+  $db->query(
+    'UPDATE snippets SET license = TRUE, classified = TRUE, likelyness = 0.99, second_match = 0.99,
+       score_version = ?, like_pattern = ?', SNIPPET_SCORE_VERSION, $pattern->{id}
+  );
+
+  # Regenerate the cached report so the clearing is reflected in what the UI loads
+  $app->minion->enqueue(analyze => [1]);
+  $app->minion->perform_jobs;
+}
+
+# Synthetic fixture for the overlap-clear UI test: index a package, make every snippet classifier-legal
+# but unscored (so similarity can never resolve it), and add a real GPL match on each snippet's first
+# line so the snippet's region overlaps a curated license match. Requires snippet_fold overlap_clear on.
+sub snippet_overlap_fixtures ($self, $app) {
+  $self->package_with_snippets_fixtures($app);
+  $app->minion->enqueue(unpack => [1]);
+  $app->minion->perform_jobs;
+
+  my $db = $app->pg->db;
+  $db->query(
+    'UPDATE snippets SET license = TRUE, classified = TRUE, likelyness = 0, like_pattern = NULL, score_version = 0');
+  my $gpl = $db->query("SELECT id FROM license_patterns WHERE license = 'GPL' LIMIT 1")->hash->{id};
+  for my $fs ($db->query('SELECT file, sline FROM file_snippets WHERE package = 1')->hashes->each) {
+    $db->insert('pattern_matches',
+      {package => 1, file => $fs->{file}, pattern => $gpl, sline => $fs->{sline}, eline => $fs->{sline}, ignored => 0});
+  }
+
+  # Regenerate the cached report so the report view reflects the overlap-clear
+  $app->minion->enqueue(analyze => [1]);
+  $app->minion->perform_jobs;
+}
+
+# Synthetic fixture for the Classify Snippets triage UI test: a controlled mix of snippets with known
+# fold/clear status and distinct, searchable text - 12 would-fold (wide margin, one of them a
+# Non-Commercial stemming case), 1 would-clear (zero margin), 1 neither (low similarity). Requires the
+# app to be built with snippet_fold thresholds (and clear_threshold) set.
+sub snippet_triage_fixtures ($self, $app) {
+  $self->package_with_snippets_fixtures($app);
+  my $db    = $app->pg->db;
+  my $fold  = $app->patterns->create(pattern => 'a folded triage marker for ui', license => 'Triage-Fold', risk => 3);
+  my $risky = $app->patterns->create(pattern => 'a high risk folded triage marker for ui', license => 'Triage-Risky',
+    risk => 5);
+
+  # A file to anchor the occurrences; the triage filter reads file_snippets.resolution (one row per
+  # occurrence), so every snippet needs an occurrence whose resolution resolve_snippets computes below.
+  # Reserved characters in the path exercise URL encoding of file links on the Snippets page.
+  my $file = $db->insert(
+    'matched_files',
+    {package   => 1, filename => 'sub dir/ui triage#1.txt', mimetype => 'text/plain'},
+    {returning => 'id'}
+  )->hash->{id};
+
+  my $n      = 0;
+  my $line   = 0;
+  my $insert = sub (%o) {
+    $n++;
+    $line += 100;
+    my $sid = $db->insert(
+      'snippets',
+      {
+        hash          => "ui-triage-$n",
+        text          => $o{text},
+        package       => 1,
+        classified    => 1,
+        license       => 1,
+        approved      => 0,
+        confidence    => 100,
+        likelyness    => $o{likelyness},
+        second_match  => $o{second_match} // 0,
+        score_version => SNIPPET_SCORE_VERSION,
+        like_pattern  => $o{like_pattern} // $fold->{id}
+      },
+      {returning => 'id'}
+    )->hash->{id};
+    $db->insert('file_snippets', {package => 1, file => $file, snippet => $sid, sline => $line, eline => $line + 5});
+  };
+
+  $insert->(likelyness => 0.99, second_match => 0.5, text => "fold marker body number $_ with GPL terms") for 1 .. 11;
+  $insert->(
+    likelyness   => 0.99,
+    second_match => 0.5,
+    like_pattern => $risky->{id},
+    text         => 'high risk fold marker body'
+  );
+  $insert->(likelyness => 0.99, second_match => 0.5,  text => 'fold marker Non-Commercial use clause body');
+  $insert->(likelyness => 0.99, second_match => 0.99, text => 'cleared boilerplate definitions body');
+  $insert->(likelyness => 0.99, second_match => 0.99, text => 'overlap notice body');
+  $insert->(likelyness => 0.99, second_match => 0.99, text => 'covered fragment body');
+  $insert->(likelyness => 0.40, second_match => 0.0,  text => 'unresolved random noise body');
+
+  $app->snippets->resolve_snippets(1);
+  $db->query(
+    q{UPDATE file_snippets fs SET resolution = 'overlap' FROM snippets s WHERE s.id = fs.snippet AND s.text = ?},
+    'overlap notice body');
+  $db->query(
+    q{UPDATE file_snippets fs SET resolution = 'covered' FROM snippets s WHERE s.id = fs.snippet AND s.text = ?},
+    'covered fragment body');
+}
+
 sub postgres_url ($self) {
-  return Mojo::URL->new($self->{options}{online})->query([search_path => [$self->{options}{schema}, 'public']])
+  return Mojo::URL->new($self->{options}{online})
+    ->query([search_path => [$self->{options}{schema}, 'public']])
     ->to_unsafe_string;
+}
+
+sub spdx_fixtures ($self, $app) {
+  $self->mojo_fixtures($app);
+  my $patterns = $app->patterns;
+  $patterns->create(pattern => 'copyright');
+}
+
+# A package whose files the indexer has to post-process before it can scan them, with a license
+# declaration placed *after* the point where post-processing shifts the line numbering. The SPDX
+# report names the original files, so its line ranges have to be the originals' - the offsets here
+# are what distinguishes a translated report from one that just repeats what the indexer stored.
+sub spdx_line_shift_fixtures ($self, $app) {
+  my $md5 = 'f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0';
+  my $dir = $self->checkout_dir->child('line-shift', $md5)->make_path;
+
+  # Line 3 is a minified blob that the line-wrapper breaks in two, so the declaration on line 4
+  # is scanned as line 5
+  $dir->child('bundle.js')->spew(<<"JS");
+/* generated bundle, do not edit */
+var a = 1;
+@{['x' x 200]} @{['y' x 50]}
+/* Permission is hereby granted under the Cavil Fixture License */
+var b = 2;
+JS
+
+  # Markup is stripped to its text, so the declaration on line 6 is scanned as line 2
+  $dir->child('page.html')->spew(<<'HTML');
+<html>
+<head>
+<title>Fixture</title>
+</head>
+<body>
+<!-- Permission is hereby granted under the Cavil Fixture License -->
+<p>Nothing to see here.</p>
+</body>
+</html>
+HTML
+
+  my $db     = $app->pg->db;
+  my $usr_id = $db->select('bot_users', 'id', {login => 'test_bot'})->hash->{id}
+    // $db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
+  my $pkgs   = $app->packages;
+  my $pkg_id = $pkgs->add(
+    name            => 'line-shift',
+    checkout_dir    => $md5,
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => 'line-shift',
+    srcmd5          => $md5,
+    priority        => 5
+  );
+  $pkgs->imported($pkg_id);
+
+  # Deliberately a phrase no other fixture contains, so adding this package cannot change what any
+  # other report finds
+  $app->patterns->create(
+    pattern   => 'Permission is hereby granted under the Cavil Fixture License',
+    license   => 'MIT',
+    unique_id => '413430b9-8f04-49d8-93ef-953b68835d60'
+  );
+  $db->query('UPDATE license_patterns SET spdx = $1 WHERE license = $1', 'MIT');
+
+  return $pkg_id;
 }
 
 sub ui_fixtures ($self, $app) {
@@ -231,7 +567,384 @@ sub ui_fixtures ($self, $app) {
   $pkgs->update($harbor);
   $pkgs->unpack($pkg_id);
 
+  # Synthetic package with many unresolved keyword matches. Built from a real
+  # tarball and indexed by the regular unpack + analyze pipeline so the
+  # missed_files collection is genuine (no bot_reports surgery). Drives the
+  # "more previews hidden" indicator on the report UI and is a reusable
+  # fixture for any future test that needs a large unresolved set.
+  $self->_synthetic_many_unresolved_fixture($app, $usr_id);
+
   $app->minion->perform_jobs();
+
+  # Inflate the perl-Mojolicious Apache-2.0 risk-5 bucket with 100 fake files
+  # so the UI test can verify the per-license file-list cap
+  # (min_files_short_report) keeps the in-bucket file list manageable.
+  my $db     = $app->pg->db;
+  my $row    = $db->select('bot_reports', 'ldig_report', {package => 1})->hash;
+  my $report = from_json($row->{ldig_report});
+
+  my $fake_pid = 999999;
+  my @fake_ids = 9000 .. 9099;
+  $report->{files}{$_} = "fake/lots-of-files/file$_.txt" for @fake_ids;
+  $report->{risks}{5}{'Apache-2.0'}{$fake_pid} = [@fake_ids];
+
+  $db->update('bot_reports', {ldig_report => to_json($report)}, {package => 1});
+
+  # Seed notes on perl-Mojolicious so the Notes tab has data the moment
+  # the UI test opens either review #1 (mojo#1) or review #2 (mojo#2). The two
+  # bot_packages rows share the package name and the notes are stored under
+  # the name, so both reports should show the same list. The dummy auth flow
+  # creates "tester" only on first login, so all seeds are authored by the
+  # existing test_bot user; tests verify admin-delete by logging in as tester
+  # and self-delete by writing a new note first.
+  my $bot_id = $app->users->find(login => 'test_bot')->{id};
+  my $notes  = $app->notes;
+
+  # 25 seeded notes so endless scroll must fetch a second page (default
+  # page size is 20). The oldest entry doubles as a lawyer-only fixture so
+  # the lawyer-only highlighting + tab-badge tinting always have data when
+  # an admin views the second page.
+  for my $i (1 .. 25) {
+    my $lawyer = $i == 1 ? 1 : 0;
+    my $body
+      = $i == 25
+      ? "Latest review notes.\n\n* check Apache-2.0 obligations\n* verify shipped LICENSE"
+      : "Seed note #$i for **perl-Mojolicious**.";
+    $notes->add(1, 'perl-Mojolicious', $bot_id, $body, $lawyer, $i == 25 ? 1 : 0);
+  }
+}
+
+# Builds a real, indexable test package whose files each contain one
+# distinctive keyword that matches a license-less pattern. The result is a
+# fully analyzed package with one unresolved snippet per file, comfortably
+# more than `max_expanded_files`. Generates the tarball + spec on disk so
+# the regular unpack pipeline can process it; no bot_reports surgery.
+sub _synthetic_many_unresolved_fixture ($self, $app, $usr_id) {
+  my $checkout_md5 = 'cafefeed00000000000000000000abcd';
+  my $synth_dir    = $self->checkout_dir->child('synthetic-many-unresolved', $checkout_md5)->make_path;
+
+  $synth_dir->child('synthetic-many-unresolved.spec')->spew(<<'SPEC');
+Name:           synthetic-many-unresolved
+Version:        1.0
+Release:        0
+Summary:        Synthetic package with many unresolved keyword matches
+License:        Artistic-2.0
+Group:          Development/Libraries/Perl
+Source0:        synthetic-many-unresolved-1.0.tar.gz
+BuildArch:      noarch
+
+%description
+Each generated source file contains the keyword
+"PUDDLE_OF_SYNTHETIC_KEYWORDS appears in this exact spot" which is
+registered as a keyword pattern with no license, so every file becomes
+an unresolved match after indexing.
+SPEC
+
+  # Each file gets a unique marker adjacent to the keyword so the snippet
+  # hash (which includes ~5 words of context around the keyword) is distinct
+  # per file. Without this, all 110 files would share one snippet and only
+  # one missed-file would be reported.
+  my $stage = tempdir;
+  my $src   = $stage->child('synthetic-many-unresolved-1.0')->make_path;
+  for my $i (1 .. 110) {
+    my $marker = sprintf('UNIQUE_FILE_MARKER_%03d', $i);
+    $src->child(sprintf('file_%03d.txt', $i))->spew(<<"FILE");
+Synthetic file $i for UI testing.
+
+$marker PUDDLE_OF_SYNTHETIC_KEYWORDS appears in this exact spot.
+
+Trailing padding so the snippet has surrounding context to render.
+FILE
+  }
+  my $tarball = $synth_dir->child('synthetic-many-unresolved-1.0.tar.gz')->to_string;
+  system('tar', '-czf', $tarball, '-C', $stage->to_string, 'synthetic-many-unresolved-1.0') == 0
+    or die "Failed to create synthetic tarball: $?";
+
+  # Low priority + "zzz_" external_link prefix sort the package to the very
+  # end of every open-reviews page so the existing row-index assertions
+  # (mojo#1 first, test#6 at row 10, etc.) keep passing.
+  my $pkgs   = $app->packages;
+  my $pkg_id = $pkgs->add(
+    name            => 'synthetic-many-unresolved',
+    checkout_dir    => $checkout_md5,
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => 'synthetic-many-unresolved',
+    srcmd5          => $checkout_md5,
+    priority        => 1
+  );
+  my $pkg = $pkgs->find($pkg_id);
+  $pkg->{external_link} = 'zzz_synth#1';
+  $pkgs->update($pkg);
+  $pkgs->imported($pkg_id);
+  $pkgs->unpack($pkg_id);
+
+  # License-less pattern → every match becomes an unresolved snippet
+  $app->patterns->create(
+    pattern   => 'PUDDLE_OF_SYNTHETIC_KEYWORDS appears in this exact spot',
+    unique_id => '00000000-0000-0000-0000-000000000001'
+  );
+}
+
+# Two synthetic versions of the same package, run through the regular unpack +
+# analyze pipeline, so version 2 gets a genuine "New unresolved matches in N
+# files" notice diffed against the accepted version 1. Drives the clickable
+# file list in the "why this needs review" box on the report UI. Version 2 (id
+# 2) has eight new unresolved files, exercising the five-file cap + "more".
+sub report_notice_fixtures ($self, $app) {
+  $app->pg->migrations->migrate;
+
+  my $pkgs   = $app->packages;
+  my $usr_id = $app->pg->db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
+
+  # License-less keyword pattern → every match becomes an unresolved snippet
+  $app->patterns->create(
+    pattern   => 'PUDDLE_OF_SYNTHETIC_KEYWORDS appears in this exact spot',
+    unique_id => '00000000-0000-0000-0000-000000000042'
+  );
+
+  # A licensed pattern so version 2 can gain a genuinely new license (Apache-2.0)
+  $app->patterns->create(
+    pattern   => 'report-notice distinctive apache license marker',
+    license   => 'Apache-2.0',
+    risk      => 5,
+    unique_id => '00000000-0000-0000-0000-000000000043'
+  );
+  $app->pg->db->query('UPDATE license_patterns SET spdx = $1 WHERE license = $1', 'Apache-2.0');
+
+  # Build a synthetic package version on disk and run it through the pipeline.
+  # Each numeric marker in @$files becomes one file with one unresolved match;
+  # distinct markers keep every snippet hash unique so they count as "new".
+  # $extra is an optional map of relative filename => literal content for files
+  # that should resolve to a license instead of being unresolved. $name picks
+  # the package the version belongs to; closest-match lookups are per name, so
+  # a second name is an independent history.
+  my $build = sub ($md5, $files, $extra = {}, $name = 'report-notice') {
+    my $dir = $self->checkout_dir->child($name, $md5)->make_path;
+    $dir->child("$name.spec")->spew(<<"SPEC");
+Name:           $name
+Version:        1.0
+Release:        0
+Summary:        Synthetic package for the new unresolved matches notice
+License:        Artistic-2.0
+Group:          Development/Libraries/Perl
+Source0:        $name-1.0.tar.gz
+BuildArch:      noarch
+
+%description
+Synthetic package with unresolved keyword matches for UI testing.
+SPEC
+
+    my $stage = tempdir;
+    my $src   = $stage->child("$name-1.0")->make_path;
+    for my $i (@$files) {
+      my $marker = sprintf 'UNIQUE_FILE_MARKER_%03d', $i;
+      $src->child(sprintf 'file_%03d.txt', $i)->spew(<<"FILE");
+Synthetic file $i for UI testing.
+
+$marker PUDDLE_OF_SYNTHETIC_KEYWORDS appears in this exact spot.
+
+Trailing padding so the snippet has surrounding context to render.
+FILE
+    }
+    $src->child($_)->spew($extra->{$_}) for sort keys %$extra;
+    my $tarball = $dir->child("$name-1.0.tar.gz")->to_string;
+    system('tar', '-czf', $tarball, '-C', $stage->to_string, "$name-1.0") == 0
+      or die "Failed to create synthetic tarball: $?";
+
+    my $pkg_id = $pkgs->add(
+      name            => $name,
+      checkout_dir    => $md5,
+      api_url         => 'https://api.opensuse.org',
+      requesting_user => $usr_id,
+      project         => 'devel:test',
+      package         => $name,
+      srcmd5          => $md5,
+      priority        => 5
+    );
+    $pkgs->imported($pkg_id);
+    $pkgs->unpack($pkg_id);
+    $app->minion->perform_jobs;
+    return $pkg_id;
+  };
+
+  # Version 1: the closest previous review, marked acceptable so it is a genuine
+  # "old review" for version 2 to diff against.
+  my $v1   = $build->('a0000000000000000000000000000001', [1, 2]);
+  my $pkg1 = $pkgs->find($v1);
+  $pkg1->{reviewing_user}   = $usr_id;
+  $pkg1->{result}           = 'Reviewed ok';
+  $pkg1->{state}            = 'acceptable';
+  $pkg1->{review_timestamp} = 1;
+  $pkgs->update($pkg1);
+
+  # Version 2: eight brand-new files → eight new unresolved matches, plus one
+  # file resolving to a brand-new Apache-2.0 license, so analyze writes a diff
+  # report with both new_unresolved and new_licenses.
+  $build->(
+    'b0000000000000000000000000000002',
+    [101 .. 108],
+    {'LICENSE-APACHE.txt' => "report-notice distinctive apache license marker\n"}
+  );
+
+  # A second package (ids 3 and 4) for the other notice shape that names an
+  # older review by id. Its own name keeps it out of the closest-match lookups
+  # above. Version 2 drops one of version 1's files: the report checksum
+  # changes (so no review is inherited) but the delta gains nothing, and
+  # analyze writes "Not found any significant difference against 3".
+  my $other = 'report-notice-same';
+  my $same1 = $build->('c0000000000000000000000000000003', [1, 2], {}, $other);
+  my $pkg3  = $pkgs->find($same1);
+  $pkg3->{reviewing_user}   = $usr_id;
+  $pkg3->{result}           = 'Reviewed ok';
+  $pkg3->{state}            = 'acceptable';
+  $pkg3->{review_timestamp} = 1;
+  $pkgs->update($pkg3);
+  $build->('d0000000000000000000000000000004', [1], {}, $other);
+}
+
+sub compatibility_fixtures ($self, $app) {
+  $app->pg->migrations->migrate;
+
+  my $pkgs   = $app->packages;
+  my $usr_id = $app->pg->db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
+
+  # SPDX-tag patterns for two licenses the OSADL matrix marks incompatible in both directions, so the
+  # report gains a real license compatibility sub-matrix with a hard ("No") conflict.
+  for my $license ('Apache-2.0', 'GPL-2.0-only') {
+    $app->patterns->create(pattern => "SPDX-License-Identifier: $license", license => $license);
+  }
+  $app->pg->db->query('UPDATE license_patterns SET spdx = license WHERE license IN (?, ?)',
+    'Apache-2.0', 'GPL-2.0-only');
+
+  my $name = 'license-compat';
+  my $md5  = 'c0000000000000000000000000000001';
+  my $dir  = $self->checkout_dir->child($name, $md5)->make_path;
+  $dir->child("$name.spec")->spew(<<"SPEC");
+Name:           $name
+Version:        1.0
+Release:        0
+Summary:        Synthetic package with incompatible licenses for UI testing
+License:        Artistic-2.0
+Group:          Development/Libraries/Perl
+Source0:        $name-1.0.tar.gz
+BuildArch:      noarch
+
+%description
+Synthetic package pairing Apache-2.0 with GPL-2.0-only for the compatibility matrix.
+SPEC
+
+  my $stage = tempdir;
+  my $src   = $stage->child("$name-1.0")->make_path;
+  $src->child('apache_file.txt')->spew("# SPDX-License-Identifier: Apache-2.0\n\nA permissively licensed helper.\n");
+  $src->child('gpl2_file.txt')->spew("# SPDX-License-Identifier: GPL-2.0-only\n\nA strong copyleft component.\n");
+  my $tarball = $dir->child("$name-1.0.tar.gz")->to_string;
+  system('tar', '-czf', $tarball, '-C', $stage->to_string, "$name-1.0") == 0
+    or die "Failed to create synthetic tarball: $?";
+
+  my $pkg_id = $pkgs->add(
+    name            => $name,
+    checkout_dir    => $md5,
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => $name,
+    srcmd5          => $md5,
+    priority        => 5
+  );
+  $pkgs->imported($pkg_id);
+  $pkgs->unpack($pkg_id);
+  $app->minion->perform_jobs;
+  return $pkg_id;
+}
+
+sub obligations_fixtures ($self, $app) {
+  $app->pg->migrations->migrate;
+
+  my $pkgs   = $app->packages;
+  my $usr_id = $app->pg->db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
+
+  # Apache-2.0 has a rich OSADL obligation checklist (two delivery use cases, YOU MUST / YOU MUST NOT,
+  # patent hints); the expression "MIT OR BSD-3-Clause" exercises per-constituent decomposition (two
+  # named sections); and "BSD-2-Clause AND Beerware" is an expression where only one constituent is
+  # OSADL-known (Beerware has no checklist, only SPDX flags), so the panel must still name BSD-2-Clause
+  # to attribute the obligations it does show.
+  $app->patterns->create(pattern => 'SPDX-License-Identifier: Apache-2.0',          license => 'Apache-2.0');
+  $app->patterns->create(pattern => 'SPDX-License-Identifier: MIT OR BSD-3-Clause', license => 'MIT OR BSD-3-Clause');
+  $app->patterns->create(
+    pattern => 'SPDX-License-Identifier: BSD-2-Clause AND Beerware',
+    license => 'BSD-2-Clause AND Beerware'
+  );
+
+  # A "WITH <exception>" license: obligations show the base license (GPL-2.0-or-later) and the panel flags
+  # the exception, since OSADL's checklist covers the base license only.
+  $app->patterns->create(
+    pattern => 'SPDX-License-Identifier: GPL-2.0-or-later WITH Classpath-exception-2.0',
+    license => 'GPL-2.0-or-later WITH Classpath-exception-2.0'
+  );
+
+  # Two licenses OSADL publishes no checklist for, where SPDX classification is all there is: the panel
+  # labels itself "Details" instead of "Obligations". CC-BY-4.0 is the plain case (not OSI approved, but
+  # FSF libre); MPL-1.0 is the one the FSF has never ruled on, so its panel must show no FSF row at all.
+  $app->patterns->create(pattern => 'SPDX-License-Identifier: CC-BY-4.0', license => 'CC-BY-4.0');
+  $app->patterns->create(pattern => 'SPDX-License-Identifier: MPL-1.0',   license => 'MPL-1.0');
+
+  $app->pg->db->query(
+    'UPDATE license_patterns SET spdx = license WHERE license IN (?, ?, ?, ?, ?, ?)',
+    'Apache-2.0',
+    'MIT OR BSD-3-Clause',
+    'BSD-2-Clause AND Beerware',
+    'GPL-2.0-or-later WITH Classpath-exception-2.0',
+    'CC-BY-4.0', 'MPL-1.0'
+  );
+
+  my $name = 'license-obligations';
+  my $md5  = 'd0000000000000000000000000000001';
+  my $dir  = $self->checkout_dir->child($name, $md5)->make_path;
+  $dir->child("$name.spec")->spew(<<"SPEC");
+Name:           $name
+Version:        1.0
+Release:        0
+Summary:        Synthetic package for obligation checklist UI testing
+License:        Apache-2.0
+Group:          Development/Libraries/Perl
+Source0:        $name-1.0.tar.gz
+BuildArch:      noarch
+
+%description
+Synthetic package pairing Apache-2.0 with a "MIT OR BSD-3-Clause" expression for the obligations panel.
+SPEC
+
+  my $stage = tempdir;
+  my $src   = $stage->child("$name-1.0")->make_path;
+  $src->child('apache_file.txt')->spew("# SPDX-License-Identifier: Apache-2.0\n\nA permissively licensed helper.\n");
+  $src->child('expr_file.txt')
+    ->spew("# SPDX-License-Identifier: MIT OR BSD-3-Clause\n\nEither license may be chosen.\n");
+  $src->child('partial_file.txt')
+    ->spew("# SPDX-License-Identifier: BSD-2-Clause AND Beerware\n\nOne constituent is unknown to OSADL.\n");
+  $src->child('exception_file.txt')
+    ->spew("# SPDX-License-Identifier: GPL-2.0-or-later WITH Classpath-exception-2.0\n\nBase plus an exception.\n");
+  $src->child('details_file.txt')->spew("# SPDX-License-Identifier: CC-BY-4.0\n\nDocumentation, not code.\n");
+  $src->child('no_fsf_file.txt')->spew("# SPDX-License-Identifier: MPL-1.0\n\nThe FSF never ruled on this one.\n");
+  my $tarball = $dir->child("$name-1.0.tar.gz")->to_string;
+  system('tar', '-czf', $tarball, '-C', $stage->to_string, "$name-1.0") == 0
+    or die "Failed to create synthetic tarball: $?";
+
+  my $pkg_id = $pkgs->add(
+    name            => $name,
+    checkout_dir    => $md5,
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => $name,
+    srcmd5          => $md5,
+    priority        => 5
+  );
+  $pkgs->imported($pkg_id);
+  $pkgs->unpack($pkg_id);
+  $app->minion->perform_jobs;
+  return $pkg_id;
 }
 
 sub unpack_fixtures ($self, $app) {
@@ -287,6 +1000,20 @@ sub unpack_fixtures ($self, $app) {
   $patterns->create(pattern => 'You may obtain a copy of the License at', license => 'Apache-2.0');
   $patterns->create(pattern => 'License: Artistic-2.0',                   license => 'Artistic-2.0');
   $patterns->create(pattern => 'copyright');
+}
+
+# PostgreSQL's "CREATE EXTENSION IF NOT EXISTS" is not safe under concurrency: parallel test files
+# can all see the extension missing and then race to insert it, tripping a duplicate-key error on
+# pg_extension_name_index. Create the extensions the migrations need once, in the shared public schema
+# (so they survive per-test schema drops), serialized by a transaction advisory lock. Every later
+# migration then finds them present and its own CREATE EXTENSION is a harmless no-op.
+sub _ensure_extensions ($self) {
+  my $db = $self->{pg}->db;
+  my $tx = $db->begin;
+  $db->query('SELECT pg_advisory_xact_lock(742019)');
+  $db->query('CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA public');
+  $db->query('CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA public');
+  $tx->commit;
 }
 
 sub _prepare_schema ($self, $name) {

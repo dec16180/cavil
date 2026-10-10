@@ -1,8 +1,19 @@
 {
   "errors" => [
-    "Main package file missing: expected error-missing-specfile.spec, error-missing-specfile.kiwi, error-missing-specfile.Dockerfile, Dockerfile, or Chart.yaml"
+    "Main package file missing: expected error-missing-specfile.spec, debian/control, error-missing-specfile.kiwi, error-missing-specfile.Dockerfile, Dockerfile, or Chart.yaml"
   ],
-  "main"     => {},
-  "sub"      => [{"%doc" => [], "%license" => [], "file" => "wrong-name.spec", "licenses" => [], "type" => "spec"}],
+  "incomplete_checkout" => 0,
+  "main"                => {},
+  "sub"                 => [
+    {
+      "%doc"                 => [],
+      "%license"             => [],
+      "file"                 => "wrong-name.spec",
+      "legal_review_notices" => [],
+      "licenses"             => [],
+      "sources"              => [],
+      "type"                 => "spec"
+    }
+  ],
   "warnings" => []
 }

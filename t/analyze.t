@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -44,22 +32,165 @@ subtest 'Analyze background job' => sub {
   $t->app->minion->perform_jobs;
 
   my $res = $t->app->pg->db->select('bot_packages', '*', {id => 2})->hashes->[0];
-  is $res->{result}, "Diff to closest match 1:\n\n  Different spec file license: Artistic-2.0\n\n", 'different spec';
-  is $res->{state},  'new',                                                                         'not approved';
+  is $res->{result}, undef, 'result cleared';
+  is $res->{notice}, "Diff to closest match 1\n\n  Spec file license  Artistic-2.0 -> GPL-1.0-or-later\n",
+    'different spec';
+  is $res->{diff_report}, undef, 'no structured diff for a spec-only delta (no new unresolved matches)';
+  is $res->{state},       'new', 'not approved';
+};
+
+subtest 'Analyze clears stale notice when reusing a previous accepted review' => sub {
+  my $pkgs = $t->app->packages;
+  my $db   = $t->app->pg->db;
+  my $pkg1 = $pkgs->find(1);
+
+  my $pkg3_id = $pkgs->add(
+    name            => 'perl-Mojolicious',
+    checkout_dir    => $pkg1->{checkout_dir},
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => 1,
+    project         => 'devel:languages:perl',
+    package         => 'perl-Mojolicious',
+    srcmd5          => $pkg1->{checkout_dir},
+    priority        => 5
+  );
+
+  $db->query(
+    'INSERT INTO bot_reports (package, ldig_report, specfile_report, rolemodel)
+     SELECT ?, ldig_report, specfile_report, rolemodel FROM bot_reports WHERE package = ?', $pkg3_id, 1
+  );
+  $db->query(
+    "UPDATE bot_packages SET indexed = NOW(), checksum = ?, notice = ?, diff_report = '{\"version\":1}' WHERE id = ?",
+    $pkg1->{checksum}, 'stale notice', $pkg3_id);
+
+  $t->app->minion->enqueue(analyzed => [$pkg3_id]);
+  $t->app->minion->perform_jobs;
+
+  my $res = $pkgs->find($pkg3_id);
+  is $res->{state},       'acceptable', 'approved from previous review';
+  is $res->{notice},      undef,        'stale notice cleared';
+  is $res->{diff_report}, undef,        'stale structured diff cleared alongside the notice';
+  is $res->{result},      'Accepted because previously reviewed under the same license (1)', 'reused previous review';
+};
+
+subtest 'Re-analyze refreshes notice on already-reviewed packages' => sub {
+  my $pkgs = $t->app->packages;
+  my $db   = $t->app->pg->db;
+
+  # Mark package 2 as lawyer-reviewed with a stale notice from before the
+  # package was approved, and a result the lawyer set manually.
+  $db->query(
+    "UPDATE bot_packages SET state = 'acceptable_by_lawyer', reviewing_user = 1, reviewed = NOW(),
+     result = 'lawyer approved', notice = 'Found new unresolved matches in something' WHERE id = 2"
+  );
+
+  $t->app->minion->enqueue(analyzed => [2]);
+  $t->app->minion->perform_jobs;
+
+  my $res = $pkgs->find(2);
+  is $res->{state},          'acceptable_by_lawyer', 'state preserved';
+  is $res->{result},         'lawyer approved',      'result preserved';
+  is $res->{reviewing_user}, 1,                      'reviewing user preserved';
+  like $res->{notice}, qr/Diff to closest match \d+/, 'notice refreshed to current delta';
 };
 
 subtest 'Prevent analyze race condition' => sub {
   my $minion = $t->app->minion;
   ok my $job_id = $minion->enqueue('analyze', [1]);
-  my $guard = $minion->guard('processing_pkg_1', 172800);
-  ok !$minion->lock('processing_pkg_1', 0), 'lock exists';
+  ok my $guard  = $t->app->packages->claim_guard(1, 999999), 'package claimed by another job';
   my $worker = $minion->worker->register;
   ok my $job = $worker->dequeue(0, {id => $job_id}), 'job dequeued';
   is $job->execute, undef, 'no error';
   like $minion->job($job_id)->info->{result}, qr/Package \d+ is already being processed/, 'race condition prevented';
   $worker->unregister;
   undef $guard;
-  ok $minion->lock('processing_pkg_1', 0), 'lock no longer exists';
+  is $t->app->packages->find(1)->{processing_job}, undef, 'package no longer claimed';
+};
+
+subtest 'dig_report tolerates pattern_matches in files covered by an ignored_files glob' => sub {
+  my $app = $t->app;
+  my $db  = $app->pg->db;
+
+  my $filename = $db->query(
+    'SELECT mf.filename FROM matched_files mf
+       JOIN pattern_matches pm ON pm.file = mf.id
+      WHERE pm.package = 1 AND pm.ignored = false
+      LIMIT 1'
+  )->hash->{filename};
+  ok $filename, "file with unignored pattern_match available ($filename)";
+
+  $app->ignored_files->add($filename, 'test_bot');
+  is $db->select('ignored_lines')->rows, 0, 'no ignored_lines row backs the glob';
+
+  my $report = eval { $app->reports->dig_report(1) };
+  ok !$@,     'dig_report does not raise an FK violation' or diag $@;
+  ok $report, 'got a report';
+
+  my $still_unignored = $db->query(
+    'SELECT COUNT(*) AS c FROM pattern_matches pm
+       JOIN matched_files mf ON pm.file = mf.id
+      WHERE pm.package = 1 AND mf.filename = ? AND pm.ignored = false', $filename
+  )->hash->{c};
+  is $still_unignored, 0, 'matches in the ignored-glob file are now marked ignored';
+
+  my $with_fake_fk = $db->query('SELECT COUNT(*) AS c FROM pattern_matches WHERE ignored_line IS NOT NULL')->hash->{c};
+  is $with_fake_fk, 0, 'glob-ignored matches do not invent an ignored_lines reference';
+};
+
+subtest 'Reindex of an accepted package upgrades it to acceptable_by_lawyer' => sub {
+  my $pkgs = $t->app->packages;
+  my $db   = $t->app->pg->db;
+
+  my $src       = $pkgs->find(1);
+  my $shortname = $src->{checksum};
+  ok $shortname, 'source package has a checksum';
+
+  # Create a same-name sibling sharing package 1's report (so summary()/history()
+  # have real data), in the requested state and with the same checksum.
+  my $make = sub {
+    my ($state) = @_;
+    my $pid = $pkgs->add(
+      name            => 'perl-Mojolicious',
+      checkout_dir    => $src->{checkout_dir},
+      api_url         => 'https://api.opensuse.org',
+      requesting_user => 1,
+      project         => 'devel:languages:perl',
+      package         => 'perl-Mojolicious',
+      srcmd5          => $src->{checkout_dir},
+      priority        => 5
+    );
+    $db->query(
+      'INSERT INTO bot_reports (package, ldig_report, specfile_report, rolemodel)
+       SELECT ?, ldig_report, specfile_report, rolemodel FROM bot_reports WHERE package = 1', $pid
+    );
+    $db->query(
+      'UPDATE bot_packages SET indexed = NOW(), reviewed = NOW(), reviewing_user = 1, checksum = ?, state = ? WHERE id = ?',
+      $shortname, $state, $pid);
+    return $pid;
+  };
+
+  my $lawyer = $make->('acceptable_by_lawyer');
+  my $target = $make->('acceptable');
+  $db->query('UPDATE bot_packages SET ai_assisted = ? WHERE id = ?', 1, $target);
+
+  $t->app->minion->enqueue(analyzed => [$target]);
+  $t->app->minion->perform_jobs;
+
+  my $res = $pkgs->find($target);
+  is $res->{state},          'acceptable_by_lawyer', 'upgraded to acceptable_by_lawyer';
+  is $res->{reviewing_user}, undef,                  'reviewing user cleared on upgrade';
+  ok !$res->{ai_assisted}, 'ai_assisted reset on upgrade';
+  like $res->{result}, qr/reviewed by lawyer under the same license \($lawyer\)/, 'result names the lawyer sibling';
+
+  subtest 'an unacceptable sibling vetoes the upgrade' => sub {
+    $make->('unacceptable');
+    my $target2 = $make->('acceptable');
+
+    $t->app->minion->enqueue(analyzed => [$target2]);
+    $t->app->minion->perform_jobs;
+
+    is $pkgs->find($target2)->{state}, 'acceptable', 'stays acceptable when a sibling is unacceptable';
+  };
 };
 
 done_testing;

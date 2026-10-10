@@ -1,35 +1,8 @@
 % layout 'default';
 % title "License details of $license";
 
-<div class="form-group">
-    <label for="name">Name</label>
-    %= text_field name => $license, class => 'form-control', disabled => 'disabled'
-</div>
+<div id="license-details"></div>
 
-<h3>Patterns for this license
-    %= link_to '(Add new)' => url_for('new_pattern')->query('license-name' => $license), class => 'btn', role => 'btn'
-</h3>
-
-<ul>
-
-% for my $match (@$patterns) {
-    <li>
-        <div>Created <time class="timeago" datetime="<%= $match->{created} %>"><%= $match->{created} %></time>
-            <a href="<%= url_for('edit_pattern', id => $match->{id}) %>" title="Edit" style="float: right"><i class="fas fa-edit"></i></a>
-        </div>
-        <pre><%= $match->{pattern} %></pre>
-        % if ($match->{packname}) {
-            <div>Package: <%= $match->{packname} %></div>
-        % }
-        % if ($match->{opinion} || $match->{patent} || $match->{trademark}) {
-            <div>Flags:
-                %= $match->{opinion} ? 'Opinion' : ''
-                %= $match->{patent} ? 'Patent' : ''
-                %= $match->{trademark} ? 'Trademark' : ''
-            </div>
-        % }
-    </li>
-% }
-</ul>
-
-% content_for ready_function => 'jQuery("time.timeago").timeago();'
+% content_for ready_function => begin
+  cavil.setupLicenseDetails(<%== Mojo::JSON::encode_json($license) %>);
+% end

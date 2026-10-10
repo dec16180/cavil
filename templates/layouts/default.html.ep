@@ -1,3 +1,6 @@
+% use Mojo::JSON qw(encode_json);
+% my $stats = proposal_stats();
+% my $roles = current_user_roles();
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -18,73 +21,93 @@
 
     %= javascript begin
       %= content_for 'head_javascript'
-      $(function() {
-        cavil.setupCreatePattern();
+      document.addEventListener('DOMContentLoaded', () => {
+        cavil.setupMenu();
+        cavil.setupPackageSearch();
         %= content_for 'ready_function'
-      } );
+      });
     % end
 
   </head>
   <body class="d-flex flex-column h-100">
-    <nav class="navbar navbar-expand-lg navbar-light bg-light mb-3 border-bottom">
+    <nav class="navbar navbar-expand-lg navbar-light bg-light border-bottom">
       <div class="container">
-        %= link_to '/' => (class => 'navbar-brand') => begin
-          <img src="<%= url_for '/images/legal-hammer-symbol.svg' %>" width="20" height="20" alt="Legal Icon">
+        %= link_to '/' => (class => 'navbar-brand cavil-brand') => begin
+          <img src="<%= url_for '/images/legal-hammer-symbol.svg' %>" width="32" height="32" alt="Cavil">
+          <span class="cavil-brand-text">
+            <span class="cavil-brand-name">Cavil</span>
+            <span class="cavil-brand-subtitle">Legal Review</span>
+          </span>
         % end
-        <button class="navbar-toggler" type="button" data-toggle="collapse"
-          data-target="#navbarSupportedContent"
-          aria-controls="navbarSupportedContent" aria-expanded="false"
-          aria-label="Toggle navigation">
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarSupportedContent"
+          aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
           <span class="navbar-toggler-icon"></span>
         </button>
         <div class="collapse navbar-collapse" id="navbarSupportedContent">
-          <ul class="navbar-nav mr-auto">
+          <ul class="navbar-nav me-auto mb-2 mb-lg-0">
             <li class="nav-item">
-              %= link_to 'Open Reviews' => '/', class => 'nav-link'
+              %= link_to 'Open Reviews' => '/', class => current_route('dashboard') ? 'nav-link active' : 'nav-link'
             </li>
             <li class="nav-item">
               <%= link_to 'Recently Reviewed' => 'reviews_recent',
-                class => 'nav-link' %>
+                class => current_route('reviews_recent') ? 'nav-link active' : 'nav-link' %>
             </li>
             <li class="nav-item">
-              %= link_to 'All Products' => '/products', class => 'nav-link'
+              %= link_to 'Products' => '/products', class => current_route('products') ? 'nav-link active' : 'nav-link'
             </li>
-            % if (current_user_has_role 'admin') {
-              <li class="nav-item">
-                %= link_to 'All Licenses' => '/licenses', class => 'nav-link'
-              </li>
-              % if (current_package) {
-                <li class="nav-item">
-                  <%= link_to 'Create Pattern' => url_for('new_pattern'),
-                    data => {packname => current_package->{name}},
-                    id => 'create-pattern', accesskey => 'c',
-                    class => 'nav-link' %>
-                </li>
-              % }
-              <li class="nav-item">
-                %= link_to 'Upload' => '/upload', class => 'nav-link'
-              </li>
-            % }
+            <li class="nav-item">
+              %= link_to 'Snippets' => '/snippets', class => current_route('snippets') ? 'nav-link active' : 'nav-link'
+            </li>
+            <li class="nav-item">
+              %= link_to 'Licenses' => '/licenses', class => current_route('licenses') ? 'nav-link active' : 'nav-link'
+            </li>
           </ul>
-          <form action="<%= url_for 'search' %>" class="form-inline">
-            <%= text_field 'q', class => 'form-control mr-sm-2',
-              placeholder => 'Package Search' %>
-          </form>
-          <ul class="navbar-nav">
-            % if (current_user_has_role 'admin') {
-              <li class="nav-item">
-                %= link_to 'Minion' => '/minion', class => 'nav-link'
+          <div
+            id="cavil-package-search"
+            class="cavil-navbar-search"
+            data-search-url="<%= url_for 'search' %>"
+            data-autocomplete-url="<%= url_for 'package_autocomplete' %>"
+            data-query="<%= param 'q' %>"
+          ></div>
+          % if (my $user = current_user) {
+            <ul
+              class="navbar-nav"
+              id="cavil-menubar"
+              data-current-user="<%= $user %>"
+              data-can-curate="<%= current_user_can('curate') ? 1 : 0 %>"
+              data-can-infra="<%= current_user_can('infra') ? 1 : 0 %>"
+              data-roles='<%= encode_json($roles) %>'
+              data-stats='<%= encode_json($stats) %>'
+              data-urls='<%= encode_json({
+                missing          => url_for('missing_licenses')->to_string,
+                proposed         => url_for('proposed_patterns')->to_string,
+                recentPatterns   => url_for('recent_patterns')->to_string,
+                recentNotes      => url_for('recent_notes')->to_string,
+                stats            => url_for('stats')->to_string,
+                upload           => url_for('/upload')->to_string,
+                ignoredMatches   => url_for('/ignored-matches')->to_string,
+                ignoredFiles     => url_for('/ignored-files')->to_string,
+                commentTemplates => url_for('list_comment_templates')->to_string,
+                minion           => url_for('/minion')->to_string,
+                documentation    => 'https://github.com/openSUSE/cavil/blob/master/docs/README.md',
+                apiKeys          => url_for('list_api_keys')->to_string,
+                logout           => url_for('logout')->to_string
+              }) %>'
+            >
+              <li class="nav-item dropdown cavil-user-menu cavil-user-menu-fallback">
+                <a class="nav-link dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Open account menu" title="Open account menu">
+                  <i class="fa-regular fa-circle-user cavil-user-menu-icon" aria-hidden="true"></i><span class="cavil-user-name"><%= $user %></span>
+                </a>
               </li>
-            % }
-            <li class="nav-item">
-              % if (my $user = current_user) {
-                %= link_to "Log out $user" => 'logout', class => 'nav-link'
-              % }
-              % else {
+            </ul>
+          % }
+          % else {
+            <ul class="navbar-nav">
+              <li class="nav-item">
                 %= link_to Login => '/login', class => 'nav-link'
-              % }
-            </li>
-          </ul>
+              </li>
+            </ul>
+          % }
         </div>
       </div>
     </nav>
@@ -101,12 +124,8 @@
             <div class="col-sm align-self-center text-center cavil-copy">
               <b>Cavil</b> is maintained by
               <a href="https://github.com/openSUSE/cavil/issues"><b>Sebastian Riedel</b></a>.
-              <small><i class="far fa-copyright"></i> SUSE LLC.</small>
+              <small><i class="fa-regular fa-copyright"></i> SUSE LLC.</small>
             </div>
-            <!--
-              Logo made by Freepik (http://www.freepik.com) from flaticon.com,
-              is licensed by CC BY 3.0 (http://creativecommons.org/licenses/by/3.0/)
-            -->
           </div>
         </div>
       </div>

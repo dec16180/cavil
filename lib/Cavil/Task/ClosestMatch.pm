@@ -16,9 +16,7 @@
 package Cavil::Task::ClosestMatch;
 use Mojo::Base 'Mojolicious::Plugin', -signatures;
 
-use Mojo::JSON 'encode_json';
-use Cavil::Util;
-use Spooky::Patterns::XS 1.54;
+use Cavil::PatternEngine;
 use Mojo::File qw(path);
 
 sub register ($self, $app, $config) {
@@ -31,25 +29,16 @@ sub _pattern_stats ($job) {
 
   my $rows = $db->select('license_patterns', 'id,pattern')->hashes;
 
-  my $bag = Spooky::Patterns::XS::init_bag_of_patterns;
+  my $bag = Cavil::PatternEngine::init_bag_of_patterns;
   my %patterns;
   $patterns{$_->{id}} = $_->{pattern} for $rows->each;
   $bag->set_patterns(\%patterns);
 
-  my $dir   = path($app->config->{cache_dir});
-  my $cache = $dir->child('cavil.pattern.bag.new.' . $job->id);
+  # Publish under the active engine's bag filename (formats differ between engines)
+  my $bagfile = $app->patterns->bag_cache_file;
+  my $cache   = $bagfile->sibling($bagfile->basename . '.new.' . $job->id);
   $bag->dump($cache);
-  rename($cache, $dir->child('cavil.pattern.bag'));
-
-  $rows = $db->select('snippets', 'id,text', {like_pattern => undef});
-  while (my $next = $rows->hash) {
-    my $best_pattern = $bag->best_for($next->{text}, 1)->[0];
-    $db->update(
-      'snippets',
-      {likelyness => $best_pattern->{match}, like_pattern => $best_pattern->{pattern},},
-      {id         => $next->{id}}
-    );
-  }
+  rename($cache, $bagfile->to_string);
 }
 
 1;
