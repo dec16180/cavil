@@ -9,17 +9,54 @@ use Mojo::File  qw(path);
 use Cavil::Util qw(request_id_from_external_link);
 
 sub register ($self, $app, $config) {
-  $app->minion->add_task(git_import => \&_git);
-  $app->minion->add_task(obs_import => \&_obs);
+  $app->minion->add_task(git_import      => \&_git);
+  $app->minion->add_task(obs_import      => \&_obs);
+  $app->minion->add_task(resolve_targets => \&_resolve_targets);
 }
 
-sub _embargo ($job, $id, $data) {
+# Destination targets can need an OBS request lookup, so they are resolved here off the bot API request path.
+# Gitea links carry their target in the link itself; OBS links need the request. Only unresolved targets are
+# looked up, so re-runs are cheap and a changed link is picked up once the controller clears the old value.
+sub _resolve_targets ($job, $id) {
+  my $app  = $job->app;
+  my $pkgs = $app->packages;
+  return unless my $pkg = $pkgs->find($id);
+
+  $pkgs->update({id => $id, target => _target($app, $pkg->{external_link})}) unless defined $pkg->{target};
+
+  my $requests = $app->requests;
+  for my $request (@{$requests->unresolved_targets($id)}) {
+    $requests->set_target($request->{id}, _target($app, $request->{external_link}));
+  }
+}
+
+# The build service is chosen by the link, never by the package or the bot that sent it: deduplicated packages are
+# shared between build services, and request numbers overlap, so the wrong instance returns an unrelated request
+sub _target ($app, $link) {
+  return undef unless defined $link;
+  return $1 if $link =~ /^(?:soo|ssd)#([^!]+)!\d+$/;
+  for my $source (@{$app->config->{external_link_sources} // []}) {
+    next unless $source->{api} && $source->{pattern} && $link =~ /$source->{pattern}/;
+    return eval { $app->obs->request_target($source->{api}, $1) };
+  }
+  return undef;
+}
+
+sub _bugref_flags ($job, $id, $data) {
   return unless my $link       = $data->{external_link};
   return unless my $request_id = request_id_from_external_link($link);
 
-  my $app       = $job->app;
-  my $embargoed = $app->obs->check_for_embargo($data->{api}, $request_id);
+  my $app     = $job->app;
+  my $obs     = $app->obs;
+  my $bugrefs = $obs->get_bugrefs_for_request($data->{api}, $request_id);
+
+  my $embargoed = $obs->check_for_embargo($data->{api}, $request_id, $bugrefs);
   $app->packages->update({id => $id, embargoed => $embargoed});
+
+  # A single "CVE" marker rather than one tag per id: reviewers prioritize on "is this a security fix",
+  # and the individual ids (dozens on some packages) only cluttered the report - they stay in the request.
+  my $cves = $obs->cves_for_request($data->{api}, $request_id, $bugrefs);
+  $app->packages->add_tags($id, @$cves ? ['CVE'] : []);
 }
 
 sub _git ($job, $id, $data) {
@@ -43,9 +80,7 @@ sub _git ($job, $id, $data) {
   $pkgs->imported($id);
   $log->info("[$id] Imported $dir");
 
-  # Next step, one above this one. The whole chain down to the report is built on the priority this import
-  # was submitted with, so an urgent request stays urgent all the way there and an ordinary one does not
-  # overtake the reviewers waiting on theirs.
+  # Preserve request priority through the build chain.
   undef $guard;
   $pkgs->unpack($id, $job->info->{priority} + 1, [$job->id]);
 }
@@ -55,11 +90,9 @@ sub _obs ($job, $id, $data) {
   my $log  = $app->log;
   my $pkgs = $app->packages;
 
-  # Protect from race conditions
   return $job->finish("Package $id is already being processed") unless my $guard = $pkgs->claim_guard($id, $job->id);
 
-  # Check embargo status before checkout
-  _embargo($job, $id, $data);
+  _bugref_flags($job, $id, $data);
 
   my $checkout_dir = $app->config->{checkout_dir};
   my ($srcpkg, $verifymd5, $api, $project, $pkg, $srcmd5) = @{$data}{qw(srcpkg verifymd5 api project pkg srcmd5)};
@@ -76,9 +109,7 @@ sub _obs ($job, $id, $data) {
   $pkgs->imported($id);
   $log->info("[$id] Imported $dir");
 
-  # Next step, one above this one. The whole chain down to the report is built on the priority this import
-  # was submitted with, so an urgent request stays urgent all the way there and an ordinary one does not
-  # overtake the reviewers waiting on theirs.
+  # Preserve request priority through the build chain.
   undef $guard;
   $pkgs->unpack($id, $job->info->{priority} + 1, [$job->id]);
 }

@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -58,6 +46,7 @@ subtest 'Login required' => sub {
   $t->get_ok('/reviews/fetch_source/1')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/reviews/file_view/1/LICENSE')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/reviews/file_view_meta/1/LICENSE')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/reviews/file_raw/1/LICENSE')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/reviews/notes/recent')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/reviews/notes/recent.json')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/reviews/notes/tags')->status_is(401)->content_like(qr/Login Required/);
@@ -72,6 +61,7 @@ subtest 'Login required' => sub {
   $t->get_ok('/snippets/meta')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/snippet/edit/1')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/snippet/meta/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/licenses/autocomplete.json')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/licenses/pattern/1.json')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/licenses/pattern/1/match_count.json')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/licenses/missing')->status_is(401)->content_like(qr/Login Required/);
@@ -79,7 +69,7 @@ subtest 'Login required' => sub {
   $t->get_ok('/licenses/proposed/meta')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/licenses/recent')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/licenses/recent/meta')->status_is(401)->content_like(qr/Login Required/);
-  $t->get_ok('/spdx/1')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/documents/1/spdx')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/stats')->status_is(401)->content_like(qr/Login Required/);
   $t->get_ok('/stats/meta')->status_is(401)->content_like(qr/Login Required/);
 };
@@ -97,7 +87,12 @@ subtest 'Not authenticated' => sub {
   $t->post_ok('/licenses/meta/Apache-2.0')->status_is(403)->content_like(qr/Permission/);
   $t->post_ok('/licenses/update_patterns')->status_is(403)->content_like(qr/Permission/);
   $t->delete_ok('/licenses/remove_pattern/1')->status_is(403)->content_like(qr/Permission/);
+  $t->get_ok('/snippets/from_file/1/1/2')->status_is(403)->content_like(qr/Permission/);
+  $t->get_ok('/snippets/from_path/1/LICENSE?start=1&end=2')->status_is(403)->content_like(qr/Permission/);
   $t->get_ok('/upload')->status_is(403)->content_like(qr/Permission/);
+  $t->put_ok('/products/openSUSE:Factory/annotation' => form => {product => 'Tumbleweed'})
+    ->status_is(403)
+    ->content_like(qr/Permission/);
 };
 
 subtest 'OpenID' => sub {
@@ -108,10 +103,19 @@ subtest 'Dummy' => sub {
   delete $config->{openid};
   $t = Test::Mojo->new(Cavil => $config);
   $t->get_ok('/upload')->status_is(403)->content_like(qr/Permission/);
+  $t->put_ok('/products/openSUSE:Factory/annotation' => form => {product => 'Tumbleweed'})
+    ->status_is(403)
+    ->content_like(qr/Permission/);
   $t->get_ok('/login')->status_is(302)->header_is(Location => '/');
   $t->get_ok('/upload')->status_is(200)->content_like(qr/Upload/);
+  $t->put_ok('/products/openSUSE:Factory/annotation' => form => {product => 'Tumbleweed'})
+    ->status_is(200)
+    ->json_is('/product', 'Tumbleweed');
   $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
   $t->get_ok('/upload')->status_is(403)->content_like(qr/Permission/);
+  $t->put_ok('/products/openSUSE:Factory/annotation' => form => {product => 'Tumbleweed'})
+    ->status_is(403)
+    ->content_like(qr/Permission/);
 };
 
 done_testing;

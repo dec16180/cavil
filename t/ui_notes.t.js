@@ -11,6 +11,12 @@ import t from 'tap';
 t.test('Cavil UI - notes', skipUnlessOnline, async t => {
   const ui = await launchUi('js_ui_notes');
   const {page, context, url, errorLogs} = ui;
+  const noteScope = '[data-notes-filter]';
+  const currentScope = () => page.locator(noteScope).getAttribute('data-note-scope');
+  const toggleNoteScope = () => page.locator('[data-notes-scope-toggle]').click();
+  const setNoteScope = async scope => {
+    if ((await currentScope()) !== scope) await toggleNoteScope();
+  };
 
   try {
     // Establish the admin session.
@@ -99,6 +105,8 @@ t.test('Cavil UI - notes', skipUnlessOnline, async t => {
         return el && Number(el.textContent) === 26;
       });
       await page.click('[data-tab="notes"]');
+      await page.waitForSelector(noteScope);
+      await toggleNoteScope();
       await page.waitForSelector('#report-notes-pane.is-active .report-note');
       const sharedNewest = page.locator('.report-note').first();
       t.match(await sharedNewest.locator('.report-note-body').innerText(), /First admin reply/);
@@ -121,6 +129,8 @@ t.test('Cavil UI - notes', skipUnlessOnline, async t => {
       );
 
       // Add a lawyer-only note from review #2; verify highlight + tab tint.
+      await setNoteScope('relevant');
+      await page.waitForSelector('[data-composer-input="new"]');
       await page.locator('[data-composer-input="new"]').fill('Confidential note for lawyers only');
       await page.locator('[data-note-lawyer-only]').check();
       const [lawyerPostResp] = await Promise.all([
@@ -147,15 +157,13 @@ t.test('Cavil UI - notes', skipUnlessOnline, async t => {
         newLawyer.locator('.report-note-delete').click()
       ]);
       t.equal(deleteResp.status(), 200);
-      await page.waitForFunction(() => {
-        const first = document.querySelector('.report-note .report-note-body');
-        return first && first.textContent.includes('First admin reply');
-      });
+      await page.waitForSelector('.report-notes-empty');
       t.equal(await page.innerText('[data-tab="notes"] [data-note-count]'), '26');
 
       // Admin can also delete a seed note authored by test_bot. The
       // fixture seeds 24 "Seed note #N" bodies (N=1..24) plus a 25th
       // "Latest review notes" body, so any "Seed note #N" target works.
+      await setNoteScope('history');
       const seedTarget = page.locator('.report-note').filter({hasText: 'Seed note #24'}).first();
       await seedTarget.waitFor();
       page.once('dialog', dialog => dialog.accept());
@@ -245,42 +253,46 @@ t.test('Cavil UI - notes', skipUnlessOnline, async t => {
       );
     });
 
-    await t.test('Note relevance: de-emphasis + Only relevant filter (admin)', async t => {
-      // Every non-relevant note recedes, even when NONE are relevant: review #2
-      // only carries notes inherited from review #1 (different report), so all of
-      // them are de-emphasized and there is no toggle (nothing relevant to keep).
+    await t.test('Note relevance: separate Relevant and History views (admin)', async t => {
+      // Review #2 only carries notes inherited from review #1. The default view
+      // stays empty rather than exposing notes that do not apply, while History
+      // remains discoverable with an explicit count.
       await page.goto(`${url}/reviews/details/2`);
       await page.click('[data-tab="notes"]');
+      await page.waitForSelector(noteScope);
+      t.equal(await currentScope(), 'relevant', 'Relevant is the default scope');
+      t.equal(await page.locator('.report-note').count(), 0, 'historical notes never leak into the Relevant view');
+      t.equal(
+        await page.locator('.report-notes-empty').innerText(),
+        'No notes are relevant to this report.',
+        'empty state explains why the list is empty'
+      );
+      t.match(
+        await page.locator('[data-notes-scope-toggle]').innerText(),
+        /show [1-9]\d* previous/,
+        'History remains discoverable when relevance is zero'
+      );
+      await Promise.all([
+        page.waitForResponse(r => /\/reviews\/notes\/2/.test(r.url()) && r.url().includes('history_only=1')),
+        toggleNoteScope()
+      ]);
       await page.waitForSelector('#report-notes-pane.is-active .report-note');
-      t.ok(
-        (await page.locator('.report-note-deemphasized').count()) > 0,
-        'inherited notes are de-emphasized even with no relevant notes present'
+      t.match(
+        await page.locator('[data-notes-history-hint]').getAttribute('title'),
+        /different licensing.*may not apply/i,
+        'History carries persistent applicability context'
       );
-      t.equal(
-        await page.locator('.report-note:not(.report-note-deemphasized)').count(),
-        0,
-        'all notes recede when every one is inherited from a different report'
-      );
-      t.equal(
-        await page.locator('[data-notes-relevant-only]').count(),
-        0,
-        'no toggle when there are no relevant notes to filter down to'
-      );
+      t.equal(await page.locator('[data-note-relevance-overlay]').count(), 0, 'History uses no blur or hover overlay');
 
-      // All-relevant list (review #1, the common case): nothing is de-emphasized
-      // and there is no toggle, so the page stays plain.
+      // All-relevant list (review #1, the common case): no view switcher is
+      // needed, so the page stays plain.
       await page.goto(`${url}/reviews/details/1`);
       await page.click('[data-tab="notes"]');
       await page.waitForSelector('#report-notes-pane.is-active .report-note');
       t.equal(
-        await page.locator('.report-note-deemphasized').count(),
+        await page.locator('[data-notes-filter]').count(),
         0,
-        'nothing is de-emphasized when every note is relevant'
-      );
-      t.equal(
-        await page.locator('[data-notes-relevant-only]').count(),
-        0,
-        'relevance toggle hidden when all notes are relevant'
+        'scope filter is hidden when all notes are relevant'
       );
 
       // Post a note from review #2 so review #1 inherits a non-relevant note
@@ -288,7 +300,7 @@ t.test('Cavil UI - notes', skipUnlessOnline, async t => {
       // it is NOT an identical-report match).
       await page.goto(`${url}/reviews/details/2`);
       await page.click('[data-tab="notes"]');
-      await page.waitForSelector('#report-notes-pane.is-active .report-note');
+      await page.waitForSelector('[data-composer-input="new"]');
       await page.locator('[data-composer-input="new"]').fill('Inherited from the version 2 review');
       const [postResp] = await Promise.all([
         page.waitForResponse(r => /\/reviews\/notes\/2$/.test(r.url()) && r.request().method() === 'POST'),
@@ -297,55 +309,32 @@ t.test('Cavil UI - notes', skipUnlessOnline, async t => {
       t.equal(postResp.status(), 200);
       const inheritedId = (await postResp.json()).note.id;
 
-      // On review #1 the list is now mixed: the inherited note is de-emphasized
-      // and carries a neutral origin badge back to report #2, while native notes
-      // stay at full contrast.
+      // On review #1 the inherited note is isolated in History. Relevant stays
+      // the default and contains only notes that apply to this report.
       await page.goto(`${url}/reviews/details/1`);
       await page.click('[data-tab="notes"]');
       await page.waitForSelector('#report-notes-pane.is-active .report-note');
       const inherited = page.locator(`#note-${inheritedId}`);
-      await inherited.waitFor();
-      t.ok(
-        await inherited.evaluate(el => el.classList.contains('report-note-deemphasized')),
-        'inherited note from a different report is de-emphasized in a mixed list'
-      );
-      t.equal(
-        await inherited.locator('[data-note-relevance-overlay]').innerText(),
-        'Not relevant to this report',
-        'non-relevant inherited note explains the de-emphasis above the faded content'
-      );
-      await page.click('[data-tab="review"]');
-      t.equal(
-        await page.locator('[data-note-relevance-overlay]:visible').count(),
-        0,
-        'non-relevant note overlay is hidden after switching back to the legal report'
-      );
-      await page.click('[data-tab="notes"]');
+      t.equal(await inherited.count(), 0, 'different-report note is absent from Relevant');
+      const nativeNote = page.locator('.report-note').filter({hasText: 'Edited body with'}).first();
+      await nativeNote.waitFor();
+
+      await Promise.all([
+        page.waitForResponse(r => /\/reviews\/notes\/1/.test(r.url()) && r.url().includes('history_only=1')),
+        toggleNoteScope()
+      ]);
       await inherited.waitFor();
       const originBadge = inherited.locator('[data-note-origin-badge]');
       t.match(await originBadge.innerText(), /from report #2/, 'inherited note links back to report #2');
-      const nativeNote = page.locator('.report-note').filter({hasText: 'Edited body with'}).first();
-      t.notOk(
-        await nativeNote.evaluate(el => el.classList.contains('report-note-deemphasized')),
-        'a native note stays at full contrast'
-      );
+      t.equal(await nativeNote.count(), 0, 'native note is absent from History');
 
-      // The toggle now appears; enabling it hides the inherited note entirely.
-      const toggle = page.locator('[data-notes-relevant-only]');
-      await toggle.waitFor();
-      await toggle.check();
+      await toggleNoteScope();
       await page.waitForSelector(`#note-${inheritedId}`, {state: 'detached'});
-      t.equal(
-        await page.locator('.report-note-deemphasized').count(),
-        0,
-        'no de-emphasized notes remain while the filter is on'
-      );
-
-      // Turning it off brings the inherited note back.
-      await toggle.uncheck();
-      await page.waitForSelector(`#note-${inheritedId}`);
+      await nativeNote.waitFor();
 
       // Cleanup: delete the inherited note so downstream counts stay at 25.
+      await toggleNoteScope();
+      await inherited.waitFor();
       page.once('dialog', dialog => dialog.accept());
       await Promise.all([
         page.waitForResponse(
@@ -354,6 +343,12 @@ t.test('Cavil UI - notes', skipUnlessOnline, async t => {
         inherited.locator('.report-note-delete').click()
       ]);
       await page.waitForSelector(`#note-${inheritedId}`, {state: 'detached'});
+      await nativeNote.waitFor();
+      t.equal(
+        await page.locator('[data-notes-filter]').count(),
+        0,
+        'deleting the final previous note returns to Relevant without a stranded filter state'
+      );
       t.equal(await page.innerText('[data-tab="notes"] [data-note-count]'), '25', 'note count restored to 25');
     });
 
@@ -400,14 +395,11 @@ t.test('Cavil UI - notes', skipUnlessOnline, async t => {
       t.equal(await page.innerText('[data-tab="notes"] [data-note-count]'), '25', 'pinning does not change the count');
 
       // A pin also asserts the note applies to every review of the package, so
-      // on review #2 it keeps full contrast where inherited notes recede.
+      // on review #2 it appears in Relevant rather than History.
       await page.goto(`${url}/reviews/details/2`);
       await page.click('[data-tab="notes"]');
       await page.waitForSelector(`#note-${id}`);
-      t.notOk(
-        await page.locator(`#note-${id}`).evaluate(el => el.classList.contains('report-note-deemphasized')),
-        'pinned note escapes the "not relevant to this report" de-emphasis'
-      );
+      t.equal(await currentScope(), 'relevant', 'pinned inherited note appears in Relevant');
 
       // Unpin from review #2 - any curator can unpin, from any review.
       const [unpinResp] = await Promise.all([
@@ -418,10 +410,13 @@ t.test('Cavil UI - notes', skipUnlessOnline, async t => {
       ]);
       t.equal(unpinResp.status(), 200);
       t.equal((await unpinResp.json()).note.pinned, false, 'server reports the note as unpinned');
-      await page.waitForSelector(`#note-${id} [data-note-pinned-badge]`, {state: 'detached'});
-      t.ok(
-        await page.locator(`#note-${id}`).evaluate(el => el.classList.contains('report-note-deemphasized')),
-        'unpinning drops the note back into the de-emphasized inherited set'
+      await page.waitForSelector(`#note-${id}`, {state: 'detached'});
+      await setNoteScope('history');
+      await page.waitForSelector(`#note-${id}`);
+      t.equal(
+        await page.locator(`#note-${id} [data-note-pinned-badge]`).count(),
+        0,
+        'unpinning moves the note back to History'
       );
 
       // The composer can create an already-pinned note in one step.

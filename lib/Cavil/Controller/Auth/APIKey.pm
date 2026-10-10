@@ -1,17 +1,5 @@
-# Copyright (C) 2026 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Controller::Auth::APIKey;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
@@ -38,9 +26,11 @@ sub check ($self) {
 }
 
 sub _denied ($self) {
+  my $metadata = $self->url_for('oauth_protected_resource')->to_abs;
+  $self->res->headers->www_authenticate(qq{Bearer resource_metadata="$metadata"});
   $self->render(
     json   => {error => 'It appears you have insufficient permissions for accessing this resource'},
-    status => 403
+    status => 401
   );
 }
 

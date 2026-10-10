@@ -9,7 +9,8 @@ use lib "$FindBin::Bin/lib";
 use Test::More;
 use Test::Mojo;
 use Cavil::Test;
-use Mojo::File qw(path);
+use Cavil::Util qw(md5_file);
+use Mojo::File  qw(path tempdir);
 use Mojo::Date;
 use Mojo::JSON qw(true false);
 
@@ -19,12 +20,10 @@ my $cavil_test = Cavil::Test->new(online => $ENV{TEST_ONLINE}, schema => 'user_a
 my $t          = Test::Mojo->new(Cavil => $cavil_test->default_config);
 $cavil_test->mojo_fixtures($t->app);
 
-# Add patterns for known incompatible licenses
 $t->app->patterns->create(pattern => 'SPDX-License-Identifier: Apache-2.0',   license => 'Apache-2.0');
 $t->app->patterns->create(pattern => 'SPDX-License-Identifier: GPL-2.0-only', license => 'GPL-2.0-only');
 $t->app->pg->db->query('UPDATE license_patterns SET spdx = $1 WHERE license = $1', $_) for qw(Apache-2.0 GPL-2.0-only);
 
-# Add licenses for prediction
 $t->app->patterns->create(pattern => 'SPDX-License-Identifier: LGPL-2.1-or-later', license => 'LGPL-2.1-or-later');
 $t->app->patterns->create(pattern => 'SPDX-License-Identifier: MPL-2.0-only',      license => 'MPL-2.0-only');
 $t->app->patterns->create(pattern => 'SPDX-License-Identifier: MPL-2.0-or-later',  license => 'MPL-2.0-or-later');
@@ -45,13 +44,11 @@ $t->app->patterns->create(
   license => 'GPL-2.0-only WITH Classpath-exception-2.0'
 );
 
-# Add files with incompatible licenses
 my $pkg = $t->app->packages->find(1);
 my $dir = path($cavil_test->checkout_dir, $pkg->{name}, $pkg->{checkout_dir});
 $dir->child('apache_file.txt')->spurt("# SPDX-License-Identifier: Apache-2.0\n\nThis is a test file.\n");
 $dir->child('gpl2_file.txt')->spurt("# SPDX-License-Identifier: GPL-2.0-only\n\nThis is another test file.\n");
 
-# Unpack and index
 $t->app->minion->enqueue(unpack => [1]);
 $t->app->minion->perform_jobs;
 
@@ -117,22 +114,25 @@ subtest 'API keys' => sub {
 
   subtest 'Access API without key' => sub {
     $t->get_ok('/api/v1/whoami')
-      ->status_is(403)
+      ->status_is(401)
       ->json_is('/error' => 'It appears you have insufficient permissions for accessing this resource');
     $t->get_ok('/api/v1/reports')
-      ->status_is(403)
+      ->status_is(401)
       ->json_is('/error' => 'It appears you have insufficient permissions for accessing this resource');
     $t->get_ok('/api/v1/report/1.json')
-      ->status_is(403)
+      ->status_is(401)
       ->json_is('/error' => 'It appears you have insufficient permissions for accessing this resource');
     $t->get_ok('/api/v1/report/1.txt')
-      ->status_is(403)
+      ->status_is(401)
       ->json_is('/error' => 'It appears you have insufficient permissions for accessing this resource');
     $t->get_ok('/api/v1/report/1.mcp')
-      ->status_is(403)
+      ->status_is(401)
       ->json_is('/error' => 'It appears you have insufficient permissions for accessing this resource');
-    $t->get_ok('/api/v1/spdx/1')
-      ->status_is(403)
+    $t->get_ok('/api/v1/documents/1/spdx')
+      ->status_is(401)
+      ->json_is('/error' => 'It appears you have insufficient permissions for accessing this resource');
+    $t->get_ok('/api/v1/documents/1/notice')
+      ->status_is(401)
       ->json_is('/error' => 'It appears you have insufficient permissions for accessing this resource');
   };
 
@@ -169,20 +169,34 @@ subtest 'API keys' => sub {
       ->content_like(qr/cavil_search_snippets\(package_id=1\)/);
   };
 
-  subtest 'Access SPDX with API key' => sub {
-    $t->get_ok('/api/v1/spdx/1' => {Authorization => "Bearer $key"})
+  subtest 'Access derived documents with API key' => sub {
+    $t->get_ok('/api/v1/documents/1/spdx' => {Authorization => "Bearer $key"})
       ->status_is(408)
-      ->content_like(qr/Your SPDX report is being generated/)
-      ->content_unlike(qr/<nav>/);
-    $t->get_ok('/api/v1/spdx/1' => {Authorization => "Bearer $key"})
+      ->content_is('being generated');
+    $t->get_ok('/api/v1/documents/1/spdx' => {Authorization => "Bearer $key"})
       ->status_is(408)
-      ->content_like(qr/Your SPDX report is being generated/)
-      ->content_unlike(qr/<nav>/);
+      ->content_is('being generated');
     $t->app->minion->perform_jobs;
-    $t->get_ok('/api/v1/spdx/1' => {Authorization => "Bearer $key"})
+    $t->get_ok('/api/v1/documents/1/spdx' => {Authorization => "Bearer $key"})
       ->status_is(200)
       ->content_type_is('application/json')
       ->json_is('/@context' => 'https://spdx.org/rdf/3.0.1/spdx-context.jsonld');
+
+    # One request built every document, so the NOTICE is already there
+    $t->get_ok('/api/v1/documents/1/notice' => {Authorization => "Bearer $key"})
+      ->status_is(200)
+      ->content_type_is('text/plain')
+      ->header_is('Content-Disposition' => 'attachment; filename="1.NOTICE.txt"')
+      ->content_like(qr/^NOTICE for perl-Mojolicious/)
+      ->content_like(qr/^Completeness$/m)
+      ->content_like(qr/^Copyright \(C\) 2008-2017, Sebastian Riedel and others\.$/m);
+
+    # And the SBOM is reachable under the generic route too
+    $t->get_ok('/api/v1/documents/1/spdx' => {Authorization => "Bearer $key"})
+      ->status_is(200)
+      ->json_is('/@context' => 'https://spdx.org/rdf/3.0.1/spdx-context.jsonld');
+
+    $t->get_ok('/api/v1/documents/1/cyclonedx' => {Authorization => "Bearer $key"})->status_is(404);
   };
 
   subtest 'List reports by external link' => sub {
@@ -259,7 +273,7 @@ subtest 'API keys' => sub {
   subtest 'Expired API key' => sub {
     $t->app->pg->db->query("UPDATE api_keys SET expires = NOW() - INTERVAL '1 hour' WHERE api_key = ?", $key);
     $t->get_ok('/api/v1/whoami' => {Authorization => "Bearer $key"})
-      ->status_is(403)
+      ->status_is(401)
       ->json_is('/error' => 'It appears you have insufficient permissions for accessing this resource');
 
     $t->app->pg->db->query("UPDATE api_keys SET expires = NOW() + INTERVAL '10 hours' WHERE api_key = ?", $key);
@@ -274,7 +288,7 @@ subtest 'API keys' => sub {
 
     $t->delete_ok('/api_keys/1')->status_is(200)->json_is('/removed' => 1);
     $t->get_ok('/api/v1/whoami' => {Authorization => "Bearer $key"})
-      ->status_is(403)
+      ->status_is(401)
       ->json_is('/error' => 'It appears you have insufficient permissions for accessing this resource');
 
     $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
@@ -285,6 +299,173 @@ subtest 'API keys' => sub {
     $t->delete_ok('/api_keys/2')->status_is(200)->json_is('/removed' => 0);
     $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
   }
+};
+
+subtest 'Upload API' => sub {
+  my $expires = Mojo::Date->new(time + 36000)->to_datetime;
+
+  # tester (id 2) is an admin, so has the infra capability; test_bot (id 1) is only a plain user
+  my $admin_rw
+    = $t->app->api_keys->create(owner => 2, type => 'read-write', description => 'a-rw', expires => $expires);
+  my $admin_ro = $t->app->api_keys->create(owner => 2, type => 'read-only', description => 'a-ro', expires => $expires);
+  my $user_rw = $t->app->api_keys->create(owner => 1, type => 'read-write', description => 'u-rw', expires => $expires);
+
+  my $tmp = tempdir;
+  my $src = $tmp->child('proj')->make_path;
+  $src->child('main.c')->spew("// SPDX-License-Identifier: Apache-2.0\nint main() { return 0; }\n");
+  my $archive = $tmp->child('proj.tar.gz');
+  is system('tar', '-czf', $archive->to_string, '-C', $src->to_string, '.'), 0, 'archive created';
+  my $sum = md5_file($archive->to_string);
+
+  # A fresh form each call: Mojo::UserAgent consumes the file asset while building the request, so a shared
+  # hashref would upload empty bytes on the second post.
+  my $form = sub {
+    my %extra = @_;
+    return {name => 'cli-proj', priority => '5', checksum => $sum, tarball => {file => $archive->to_string}, %extra};
+  };
+
+  subtest 'Rejected without the infra capability or a write scope' => sub {
+    $t->post_ok('/api/v1/packages/upload' => form => $form->())->status_is(401);
+    $t->post_ok('/api/v1/packages/upload' => {Authorization => "Bearer $admin_ro->{api_key}"} => form => $form->())
+      ->status_is(403);
+    $t->post_ok('/api/v1/packages/upload' => {Authorization => "Bearer $user_rw->{api_key}"} => form => $form->())
+      ->status_is(403);
+  };
+
+  my $id;
+  subtest 'Admin write key uploads and attributes to the key user' => sub {
+    $t->post_ok('/api/v1/packages/upload' => {Authorization => "Bearer $admin_rw->{api_key}"} => form => $form->())
+      ->status_is(200)
+      ->json_is('/duplicate'  => false)
+      ->json_is('/saved/name' => 'cli-proj');
+    $id = $t->tx->res->json('/saved/id');
+    ok $id, 'package id returned';
+    is $t->app->packages->find($id)->{requesting_user}, 2, 'attributed to the key user, not the bot';
+  };
+
+  subtest 'Checksum mismatch is rejected' => sub {
+    $t->post_ok('/api/v1/packages/upload' => {Authorization => "Bearer $admin_rw->{api_key}"} => form =>
+        $form->(checksum => 'a' x 32))->status_is(400)->json_is('/error' => 'Checksum mismatch');
+  };
+
+  subtest 'Re-upload of the same archive is idempotent' => sub {
+    $t->post_ok('/api/v1/packages/upload' => {Authorization => "Bearer $admin_rw->{api_key}"} => form => $form->())
+      ->status_is(200)
+      ->json_is('/duplicate' => true)
+      ->json_is('/saved/id'  => $id);
+  };
+
+  subtest 'Report is pending with a stage while the review runs' => sub {
+    $t->get_ok("/api/v1/report/$id.json" => {Authorization => "Bearer $admin_rw->{api_key}"})
+      ->status_is(408)
+      ->json_is('/stage' => 'queued');
+  };
+
+  subtest 'Report carries the risk verdict' => sub {
+    $t->app->minion->perform_jobs;
+    $t->get_ok("/api/v1/report/$id.json" => {Authorization => "Bearer $admin_rw->{api_key}"})
+      ->status_is(200)
+      ->json_is('/package/id'      => $id)
+      ->json_is('/acceptable_risk' => $t->app->reports->acceptable_risk);
+    ok defined $t->tx->res->json('/risk'), 'max risk surfaced for gating';
+  };
+
+  subtest 'Ephemeral upload is reviewed but stays out of every listing and is purged' => sub {
+    my $esrc = $tmp->child('eph')->make_path;
+    $esrc->child('main.c')->spew("// SPDX-License-Identifier: Apache-2.0\nint eph() { return 1; }\n");
+    my $earchive = $tmp->child('eph.tar.gz');
+    is system('tar', '-czf', $earchive->to_string, '-C', $esrc->to_string, '.'), 0, 'ephemeral archive created';
+    my $esum = md5_file($earchive->to_string);
+
+    $t->post_ok(
+      '/api/v1/packages/upload' => {Authorization => "Bearer $admin_rw->{api_key}"} => form => {
+        name      => 'eph-proj',
+        priority  => '5',
+        checksum  => $esum,
+        ephemeral => 1,
+        tarball   => {file => $earchive->to_string}
+      }
+    )->status_is(200)->json_is('/duplicate' => false)->json_is('/saved/ephemeral' => 1);
+    my $eid = $t->tx->res->json('/saved/id');
+    ok $eid, 'ephemeral package id returned';
+
+    $t->app->minion->perform_jobs;
+
+    # Reachable directly by id, exactly like a normal report
+    $t->get_ok("/api/v1/report/$eid.json" => {Authorization => "Bearer $admin_rw->{api_key}"})
+      ->status_is(200)
+      ->json_is('/package/id' => $eid);
+
+    # ... but absent from every backlog/search listing, while the normal package is present
+    my $pkgs = $t->app->packages;
+    my $has  = sub {
+      my ($rows, $r) = @_;
+      grep { $_->{id} == $r } @$rows;
+    };
+    my $open = $pkgs->paginate_open_reviews(
+      {
+        search        => '',
+        priority      => 0,
+        in_progress   => 'false',
+        not_embargoed => 'false',
+        notes         => 'any',
+        limit         => 100,
+        offset        => 0
+      }
+    )->{page};
+    my $search = $pkgs->paginate_review_search(undef,
+      {search => '', not_obsolete => 'false', not_embargoed => 'false', limit => 100, offset => 0})->{page};
+    my $recent = $pkgs->paginate_recent_reviews(
+      {
+        search             => '',
+        by_user            => 'false',
+        ai_assisted        => 'false',
+        unresolved_matches => 'false',
+        limit              => 100,
+        offset             => 0
+      }
+    )->{page};
+    ok $has->($search,  $id),  'normal package is in review search';
+    ok !$has->($search, $eid), 'ephemeral package is hidden from review search';
+    ok $has->($open,    $id),  'normal package is in the open review backlog';
+    ok !$has->($open,   $eid), 'ephemeral package is hidden from the open review backlog';
+    ok !$has->($recent, $eid), 'ephemeral package is hidden from recent reviews';
+
+    # Fully purged by the hourly ephemeral cleanup task, leaving no trace
+    my $dir = $pkgs->pkg_checkout_dir($eid);
+    ok -d $dir, 'ephemeral checkout exists before purge';
+    my $src_id = $t->app->pg->db->select('bot_packages', 'source', {id => $eid})->hash->{source};
+    $t->app->config->{hours_to_keep_ephemeral_packages} = 0;
+    $t->app->minion->enqueue('cleanup_ephemeral');
+    $t->app->minion->perform_jobs;
+
+    ok !defined($pkgs->find($eid)),                                          'ephemeral package row is gone';
+    ok !$t->app->pg->db->select('bot_sources', 'id', {id => $src_id})->hash, 'ephemeral source row is gone';
+    ok !-d $dir,                                                             'ephemeral checkout is removed';
+    ok defined($pkgs->find($id)), 'normal package is untouched by the ephemeral purge';
+  };
+
+  subtest 'Uploader key can only submit ephemeral reviews' => sub {
+    my $uploader = $t->app->users->find_or_create(login => 'api_uploader', roles => ['uploader'])->{id};
+    my $up_rw    = $t->app->api_keys->create(owner => $uploader, type => 'read-write', description => 'up-rw',
+      expires => $expires);
+    my $up_ro
+      = $t->app->api_keys->create(owner => $uploader, type => 'read-only', description => 'up-ro', expires => $expires);
+
+    $t->post_ok(
+      '/api/v1/packages/upload' => {Authorization => "Bearer $up_ro->{api_key}"} => form => $form->(name => 'up-proj'))
+      ->status_is(403);
+
+    $t->post_ok(
+      '/api/v1/packages/upload' => {Authorization => "Bearer $up_rw->{api_key}"} => form => $form->(name => 'up-proj'))
+      ->status_is(200)
+      ->json_is('/saved/ephemeral' => 1);
+    ok $t->app->packages->find($t->tx->res->json('/saved/id'))->{ephemeral}, 'forced ephemeral without the flag';
+
+    $t->post_ok('/api/v1/packages/upload' => {Authorization => "Bearer $up_rw->{api_key}"} => form =>
+        $form->(name => 'up-proj2', ephemeral => 0))->status_is(200)->json_is('/saved/ephemeral' => 1);
+    ok $t->app->packages->find($t->tx->res->json('/saved/id'))->{ephemeral}, 'forced ephemeral despite ephemeral=0';
+  };
 };
 
 subtest 'License prediction' => sub {
@@ -453,7 +634,7 @@ subtest 'Package search API' => sub {
   );
 
   subtest 'Requires authentication' => sub {
-    $t->get_ok('/api/v1/search' => form => {component => 'lodash'})->status_is(403);
+    $t->get_ok('/api/v1/search' => form => {component => 'lodash'})->status_is(401);
   };
 
   subtest 'Finds packages by component name, embargoed and obsolete hidden' => sub {

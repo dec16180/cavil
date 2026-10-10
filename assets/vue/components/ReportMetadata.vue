@@ -5,33 +5,42 @@
       <div class="col-10 mt-3">
         <h2 class="report-metadata-name">
           <a :href="searchUrl" target="_blank">{{ pkgName }}</a>
-          <span class="cavil-package-format-icon"
+          <span v-if="formatIcon !== null" class="cavil-package-format-icon"
             >&nbsp;
-            <i class="fa-brands fa-suse" v-if="pkgType === 'spec'"></i>
-            <i class="fa-brands fa-debian" v-else-if="pkgType === 'debian'"></i>
-            <i class="fa-solid fa-kiwi-bird" v-else-if="pkgType === 'kiwi'"></i>
-            <i class="fa-brands fa-docker" v-else-if="pkgType === 'dockerfile'"></i>
-            <i class="fa-solid fa-dharmachakra" v-else-if="pkgType === 'helm'"></i>
-            <i class="fa-solid fa-industry" v-else-if="pkgType === 'obsprj'"></i>
-            <i class="fa-regular fa-circle-question" v-else></i>
+            <i :class="formatIcon"></i>
           </span>
         </h2>
         <dl class="report-metadata-list">
-          <template v-if="pkgLicense !== null && pkgLicense.name !== null">
+          <template v-if="declarations.length > 0">
             <dt>License</dt>
-            <dd id="pkg-license">
-              {{ pkgLicense.name }}
-              <small v-if="pkgLicense.spdx === false">(not SPDX)</small>
+            <dd id="pkg-declarations" :class="{'metadata-declarations-named': namedDeclarations}">
+              <div v-for="(d, index) in declarations" :key="index" class="metadata-declaration">
+                <span v-if="namedDeclarations" class="metadata-declaration-name">{{ d.showName ? d.name : '' }}</span>
+                <span v-if="d.license_html !== null" v-html="d.license_html"></span>
+                <span v-else class="metadata-declaration-undeclared">No license declared</span>
+                <a :href="d.fileUrl" class="metadata-declaration-file" target="_blank">{{ d.file }}</a>
+                <span class="metadata-declaration-format">{{ d.format }}</span>
+              </div>
             </dd>
           </template>
           <dt>Embargoed</dt>
           <dd v-if="pkgEmbargoed === true" id="pkg-embargoed">
-            <span class="badge text-bg-warning embargo-status-badge" title="Package is embargoed">
+            <span class="badge text-bg-warning metadata-status-badge" title="Package is embargoed">
               <i class="fa-solid fa-lock" aria-hidden="true"></i>
               Yes
             </span>
           </dd>
           <dd v-else id="pkg-embargoed">No</dd>
+          <template v-if="pkgEphemeral === true">
+            <dt>Ephemeral</dt>
+            <dd id="pkg-ephemeral">
+              <span class="badge text-bg-warning" title="One-off review, not part of the legal backlog">
+                <i class="fa-solid fa-hourglass-half" aria-hidden="true"></i>
+                One-off review
+              </span>
+              <span v-if="ephemeralDelete !== ''" class="report-ephemeral-hint">deleted {{ ephemeralDelete }}</span>
+            </dd>
+          </template>
           <template v-if="state !== null">
             <dt>State</dt>
             <dd id="pkg-state">
@@ -48,15 +57,6 @@
               >#{{ pkgId }}</copyable-text
             >
           </dd>
-          <template v-if="pkgFiles.length > 0">
-            <dt>Package files</dt>
-            <dd id="num-spec-files">
-              <a href="#spec-files" class="report-metadata-collapse-link" data-bs-toggle="collapse">
-                <span v-if="pkgFiles.length === 1">1 file</span>
-                <span v-else>{{ pkgFiles.length }} files</span>
-              </a>
-            </dd>
-          </template>
           <template v-if="actions.length > 0">
             <dt>Actions</dt>
             <dd>
@@ -68,13 +68,14 @@
           </template>
           <template v-if="externalLink !== null">
             <dt>Link</dt>
-            <dd><ExternalLink :link="externalLink" /></dd>
+            <dd id="pkg-link">
+              <ExternalLink :link="externalLink" />
+            </dd>
           </template>
           <template v-if="requests.length > 0">
             <dt>Requests</dt>
-            <dd>
-              <span v-for="(request, index) in requests" :key="index">
-                <span v-if="index > 0">, </span>
+            <dd class="report-metadata-requests">
+              <span v-for="(request, index) in requests" :key="index" class="report-metadata-request">
                 <ExternalLink :link="request" />
               </span>
             </dd>
@@ -91,19 +92,15 @@
             <dt>Summary</dt>
             <dd id="pkg-summary">{{ pkgSummary }}</dd>
           </template>
-          <template v-if="pkgGroup !== null">
-            <dt>Group</dt>
-            <dd id="pkg-group">{{ pkgGroup }}</dd>
-          </template>
           <template v-if="pkgUrl !== null">
             <dt>URL</dt>
             <dd id="pkg-url">
               <a :href="pkgUrl" target="_blank">{{ pkgUrl }}</a>
             </dd>
           </template>
-          <dt>SPDX report</dt>
-          <dd id="spdx-report">
-            <spdx-download :pkg-id="pkgId" :spdx="spdx" @error="notifyError" />
+          <dt>Documents</dt>
+          <dd id="report-documents">
+            <report-documents :pkg-id="pkgId" :documents="derivedDocuments" @error="notifyError" />
           </dd>
           <template v-if="pkgShortname !== null">
             <dt>Shortname</dt>
@@ -130,19 +127,6 @@
             <dt>Created</dt>
             <dd class="from-now">{{ created }}</dd>
           </template>
-          <template v-if="reviewed !== null">
-            <dt>Reviewed</dt>
-            <dd class="from-now">{{ reviewed }}</dd>
-          </template>
-          <template v-if="reviewingUser !== null">
-            <dt>Reviewing user</dt>
-            <dd>
-              {{ reviewingUser }}
-              <span v-if="pkgAiAssisted" class="ai-assisted-badge"
-                >(with AI Assistant <i class="fa-solid fa-robot"></i>)</span
-              >
-            </dd>
-          </template>
         </dl>
       </div>
       <div class="col-2">
@@ -165,43 +149,6 @@
         </ul>
       </div>
     </div>
-    <div v-if="pkgFiles.length > 0" id="spec-files" class="collapse">
-      <div class="metadata-collapse-inner">
-        <ul class="metadata-file-list">
-          <li v-for="file in pkgFiles" :key="file.file" class="metadata-file-item">
-            <h3 class="metadata-file-title"><i class="fa-solid fa-file-lines"></i> {{ file.file }}</h3>
-            <dl class="metadata-file-details">
-              <template v-if="file.licenses !== null">
-                <dt>Licenses</dt>
-                <dd>{{ file.licenses }}</dd>
-              </template>
-              <template v-if="file.version !== null">
-                <dt>Version</dt>
-                <dd>{{ file.version }}</dd>
-              </template>
-              <template v-if="file.summary !== null">
-                <dt>Summary</dt>
-                <dd>{{ file.summary }}</dd>
-              </template>
-              <template v-if="file.group !== null">
-                <dt>Group</dt>
-                <dd>{{ file.group }}</dd>
-              </template>
-              <template v-if="file.url !== null">
-                <dt>URL</dt>
-                <dd>
-                  <a :href="file.url" target="_blank">{{ file.url }}</a>
-                </dd>
-              </template>
-              <template v-if="file.sources !== null">
-                <dt>Sources</dt>
-                <dd>{{ file.sources }}</dd>
-              </template>
-            </dl>
-          </li>
-        </ul>
-      </div>
-    </div>
     <section v-if="notice !== null" id="review-information" class="review-information-card">
       <header class="review-information-card-bar">
         <i class="fa-solid fa-caret-right"></i>
@@ -219,29 +166,43 @@
       >{{ segment.text }}</a><template v-else>{{ segment.text }}</template></span></pre>
     </section>
     <cavil-notice-panel
-      v-if="errors.length > 0"
-      id="spec-errors"
+      v-if="incompleteCheckout.length > 0"
+      id="incomplete-checkout"
       icon="fa-solid fa-triangle-exclamation"
-      :items="errors"
-      title="Package file warnings for packagers"
-      tone="warning"
-    />
-    <cavil-notice-panel
-      v-if="warnings.length > 0"
-      id="spec-warnings"
-      icon="fa-solid fa-clipboard-check"
-      :items="warnings"
-      title="Package file warnings for reviewers"
+      :items="incompleteCheckout"
+      title="Checkout may be incomplete"
       tone="warning"
     />
     <cavil-notice-panel
       v-if="legalReviewNotices.length > 0"
       id="spec-legal-review-notices"
-      icon="fa-solid fa-scale-balanced"
+      icon="fa-solid fa-user-pen"
       :items="legalReviewNotices"
-      title="Legal review notices"
+      title="Legal review notices from packagers"
       tone="success"
     />
+    <section v-if="tags.length > 0 || canEditTags" id="package-tags" class="package-tags-bar">
+      <span class="package-tags-label">Tags</span>
+      <div id="pkg-tags" class="package-tags-body">
+        <TagInput
+          v-if="canEditTags"
+          :model-value="tags"
+          :suggestions="knownTags"
+          data-key="pkg-tags"
+          @update:model-value="onTagsChanged"
+        />
+        <div v-else class="package-tags-readonly">
+          <span
+            v-for="tag in tags"
+            :key="tag"
+            class="report-note-tag"
+            :class="{'report-cve-tag': isCve(tag)}"
+            :title="`Tag: ${tag}`"
+            >{{ tag }}</span
+          >
+        </div>
+      </div>
+    </section>
     <div class="metadata-review-section">
       <form class="container metadata-review-form" id="pkg-review" @submit.prevent>
         <div class="col metadata-review-editor">
@@ -259,38 +220,104 @@
                 @select="insertTemplate"
               />
             </template>
+            <template #footer v-if="selectedButtonId !== null">
+              <div
+                :class="['metadata-review-status', `is-${selectedButtonId}`]"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                <i class="fa-solid fa-circle-check metadata-review-status-icon" aria-hidden="true"></i>
+                <strong>Review finalized</strong>
+                <span v-if="reviewingUser !== null || reviewed !== null" class="metadata-review-status-detail">
+                  <template v-if="reviewingUser !== null">
+                    by {{ reviewingUser }}
+                    <span v-if="pkgAiAssisted" class="ai-assisted-badge">
+                      (with AI Assistant <i class="fa-solid fa-robot" aria-hidden="true"></i>)
+                    </span>
+                  </template>
+                  <template v-if="reviewingUser !== null && reviewed !== null"> &middot; </template>
+                  <template v-if="reviewed !== null">{{ reviewed }}</template>
+                </span>
+              </div>
+            </template>
           </CommentEditor>
         </div>
         <div v-if="canReview" class="col mb-3 metadata-review-actions">
           <div class="metadata-review-actions-group">
             <!-- One accept button; the server derives acceptable vs acceptable_by_lawyer from the
-                 reviewer's capability, so a non-lawyer can never post a lawyer sign-off. -->
-            <input
+                 reviewer's capability, so a non-lawyer can never post a lawyer sign-off.
+
+                 The pair doubles as a live indicator of the current decision: the button matching the
+                 stored state stays solid, while the alternative recedes to an outline but stays fully
+                 clickable so the reviewer can still switch their mind. -->
+            <button
               v-for="button in reviewButtons"
               :key="button.id"
-              :class="['btn', button.variant]"
+              type="button"
+              :class="[
+                'btn',
+                buttonClass(button),
+                {'is-decision-current': selectedButtonId === button.id, 'is-decision-flash': flashId === button.id}
+              ]"
               :id="button.id"
               :name="button.id"
-              type="button"
+              :aria-pressed="selectedButtonId === button.id"
               :disabled="submitting"
-              :value="button.label"
               @click="submitReview(submitUrl, button.id)"
-            />
+            >
+              <i v-if="submittingId === button.id" class="fa-solid fa-rotate fa-spin" aria-hidden="true"></i>
+              {{ button.label }}
+            </button>
           </div>
           <button
             v-if="hasAdminRole === true"
             type="button"
             :class="['btn', reindexBtnVariant, 'metadata-review-actions-secondary']"
             :title="reindexTitle"
-            :disabled="reindexBusy"
+            :disabled="reindexBusy || rebuildPending"
             id="reindex_button"
             @click="reindex"
           >
-            Reindex
+            <i v-if="reindexBusy || rebuildPending" class="fa-solid fa-rotate fa-spin" aria-hidden="true"></i>
+            {{ reindexBusy || rebuildPending ? 'Reindexing…' : 'Reindex' }}
           </button>
         </div>
       </form>
     </div>
+    <cavil-notice-panel
+      v-if="documents.length > 0"
+      id="legal-documents"
+      icon="fa-solid fa-scale-balanced"
+      title="Legal documents"
+      :note="documentsDropped > 0 ? `${count(documentsDropped)} more not listed` : null"
+    >
+      <ul class="cavil-notice-list">
+        <li v-for="document in shownDocuments" :key="document.path" class="cavil-notice-item legal-document-item">
+          <a :href="document.url" target="_blank" rel="noopener" class="legal-document-path"
+            ><FilePath :path="document.path"
+          /></a>
+          <span class="legal-document-lines" :title="documentShare(document)">
+            <!-- Absolute, not a percentage: 15 novel lines in a 312-line BSD file round away to "5%" -->
+            <span class="legal-document-tally">{{ documentTally(document) }}</span>
+            <span class="legal-document-meter" aria-hidden="true"
+              ><i
+                v-for="block in 5"
+                :key="block"
+                :class="['legal-document-block', {'is-covered': block <= documentBlocks(document)}]"
+              ></i
+            ></span>
+          </span>
+        </li>
+        <ListMoreToggle
+          v-if="documents.length > DOCUMENTS_PREVIEW"
+          :expanded="documentsExpanded"
+          :hidden="documents.length - DOCUMENTS_PREVIEW"
+          :preview="DOCUMENTS_PREVIEW"
+          @toggle="documentsExpanded = !documentsExpanded"
+        />
+      </ul>
+    </cavil-notice-panel>
     <cavil-notice-panel
       v-if="copiedFiles['%doc'] !== null || copiedFiles['%license'] !== null"
       icon="fa-regular fa-copy"
@@ -316,15 +343,35 @@ import CavilNoticePanel from './CavilNoticePanel.vue';
 import CommentEditor from './CommentEditor.vue';
 import CopyableText from './CopyableText.vue';
 import ExternalLink from './ExternalLink.vue';
+import FilePath from './FilePath.vue';
 import LegalLoading from './LegalLoading.vue';
-import SpdxDownload from './SpdxDownload.vue';
+import ListMoreToggle from './ListMoreToggle.vue';
+import ReportDocuments from './ReportDocuments.vue';
+import TagInput from './TagInput.vue';
 import TemplatePicker from './TemplatePicker.vue';
 import ToastNotifier from './ToastNotifier.vue';
-import {productLink} from '../helpers/links.js';
+import {fileViewUrl, productLink, setupPopoverDelayed} from '../helpers/links.js';
 import {findPlaceholders} from '../helpers/placeholders.js';
 import Refresh from '../mixins/refresh.js';
 import UserAgent from '@mojojs/user-agent';
 import moment from 'moment';
+
+const FORMAT_ICONS = {
+  spec: 'fa-brands fa-suse',
+  debian: 'fa-brands fa-debian',
+  kiwi: 'fa-solid fa-kiwi-bird',
+  dockerfile: 'fa-brands fa-docker',
+  helm: 'fa-solid fa-dharmachakra',
+  obsprj: 'fa-solid fa-industry',
+  npm: 'fa-brands fa-npm',
+  cargo: 'fa-brands fa-rust',
+  pypi: 'fa-brands fa-python',
+  maven: 'fa-brands fa-java',
+  golang: 'fa-brands fa-golang',
+  composer: 'fa-brands fa-php',
+  gem: 'fa-solid fa-gem',
+  nuget: 'fa-brands fa-microsoft'
+};
 
 export default {
   name: 'ReportMetadata',
@@ -333,8 +380,11 @@ export default {
     CommentEditor,
     CopyableText,
     ExternalLink,
+    FilePath,
     LegalLoading,
-    SpdxDownload,
+    ListMoreToggle,
+    ReportDocuments,
+    TagInput,
     TemplatePicker,
     ToastNotifier
   },
@@ -346,7 +396,10 @@ export default {
       checkoutUrl: null,
       copiedFiles: {'%doc': null, '%license': null},
       created: null,
-      errors: [],
+      declarations: [],
+      DOCUMENTS_PREVIEW: 10,
+      documentsExpanded: false,
+      legalDocuments: null,
       externalLink: null,
       fasttrackUrl: `/reviews/fasttrack_package/${this.pkgId}`,
       legalReviewNotices: [],
@@ -355,15 +408,17 @@ export default {
       pkgAiAssisted: false,
       pkgChecksum: null,
       pkgEmbargoed: false,
-      pkgFiles: [],
-      pkgGroup: null,
-      pkgLicense: null,
+      pkgEphemeral: false,
+      tags: [],
+      knownTags: [],
+      canEditTags: false,
+      ephemeralDelete: '',
+      incompleteCheckout: [],
       pkgName: null,
       pkgPriority: null,
       pkgRisk: null,
       pkgShortname: null,
       pkgSummary: null,
-      pkgType: null,
       pkgUrl: null,
       pkgVersion: null,
       productsHtml: null,
@@ -384,19 +439,40 @@ export default {
       reviewingUser: null,
       reviewUrl: `/reviews/review_package/${this.pkgId}`,
       searchUrl: null,
-      spdx: null,
+      derivedDocuments: null,
       state: null,
       submitting: false,
+      submittingId: null,
+      flashId: null,
+      flashTimer: null,
       templates: [],
       unpackedFiles: 0,
-      unpackedSize: 'n/a',
-      warnings: []
+      unpackedSize: 'n/a'
     };
   },
   computed: {
+    namedDeclarations() {
+      return this.declarations.some(d => d.showName);
+    },
+    formatIcon() {
+      return FORMAT_ICONS[this.declarations[0]?.format] ?? null;
+    },
     canReview() {
       return this.hasAdminRole === true || this.hasManagerRole === true;
     },
+
+    documents() {
+      return this.legalDocuments?.documents ?? [];
+    },
+
+    shownDocuments() {
+      return this.documentsExpanded ? this.documents : this.documents.slice(0, this.DOCUMENTS_PREVIEW);
+    },
+
+    documentsDropped() {
+      return this.legalDocuments?.dropped ?? 0;
+    },
+
     // A curator gets accept and reject, a manager only the fasttrack accept
     reviewButtons() {
       if (this.hasAdminRole === true) {
@@ -405,20 +481,28 @@ export default {
           {id: 'unacceptable', variant: 'btn-danger', label: 'Unacceptable'}
         ];
       }
-      if (this.hasManagerRole === true) return [{id: 'acceptable', variant: 'btn-warning', label: 'Acceptable'}];
+      if (this.hasManagerRole === true) return [{id: 'acceptable', variant: 'btn-success', label: 'Acceptable'}];
       return [];
     },
     submitUrl() {
       return this.hasAdminRole === true ? this.reviewUrl : this.fasttrackUrl;
     },
-    // Notices that compare against an older review name it by id ("Diff to
-    // closest match 538922", "Not found any significant difference against
-    // 538922"). Those ids become links to that report, everything else stays
-    // plain text.
+    // Which review button the stored state currently corresponds to (null while the package is still
+    // "new"), so the pair can show the decision instead of just firing it
+    selectedButtonId() {
+      if (this.state === 'acceptable' || this.state === 'acceptable_by_lawyer') return 'acceptable';
+      if (this.state === 'unacceptable') return 'unacceptable';
+      return null;
+    },
+    // Notices that refer to an older review name it by id ("Diff to closest
+    // match 538922", "Not found any significant difference against 538922",
+    // "Limitation noted in 538922", "same license as 538922"). Those ids
+    // become links to that report, everything else stays plain text.
     noticeSegments() {
       if (this.notice === null) return [];
       const segments = [];
-      const pattern = /(?<=Diff to closest match |significant difference against )\d+/g;
+      const pattern =
+        /(?<=Diff to closest match |significant difference against |Limitation noted in |same license as )\d+/g;
       let plainFrom = 0;
       for (const match of this.notice.matchAll(pattern)) {
         segments.push({text: this.notice.slice(plainFrom, match.index)});
@@ -456,8 +540,7 @@ export default {
     },
     stateBadgeClass() {
       if (this.state === 'new') return 'text-bg-secondary';
-      if (this.state === 'acceptable_by_lawyer') return 'text-bg-success';
-      if (this.state === 'acceptable') return 'text-bg-warning';
+      if (this.state === 'acceptable_by_lawyer' || this.state === 'acceptable') return 'text-bg-success';
       return 'text-bg-danger';
     },
     // A rebuild that is already on its way answers the button, so it stops advertising the patterns that
@@ -484,6 +567,77 @@ export default {
     insertTemplate(template) {
       this.$refs.commentEditor?.insertTemplate(template.body);
     },
+
+    isCve(tag) {
+      return /^CVE(-|$)/i.test(tag);
+    },
+
+    onTagsChanged(tags) {
+      this.tags = tags;
+      this.saveTags();
+    },
+
+    async saveTags() {
+      const ua = new UserAgent({baseURL: window.location.href});
+      const res = await ua.patch(`/reviews/tags/${this.pkgId}`, {form: {tags_json: JSON.stringify(this.tags)}});
+      if (!res.isSuccess) this.$refs.toaster?.notify('Failed to save tags', 'danger', 5000);
+    },
+
+    async loadKnownTags() {
+      const ua = new UserAgent({baseURL: window.location.href});
+      const res = await ua.get('/reviews/tags.json');
+      if (res.isSuccess) {
+        const data = await res.json();
+        if (Array.isArray(data.tags)) this.knownTags = data.tags;
+      }
+    },
+
+    // Never zero and never full below 100%: the case this exists for is a few lines in a large file
+    // Filled is coverage, the direction every other meter in the world fills. Marking the deficit
+    // instead put amber on the rows that needed reading and lawyers could not decode it.
+    documentBlocks(document) {
+      if (document.unexplained >= document.lines) return 0;
+      return 5 - Math.min(4, Math.ceil((document.unexplained / document.lines) * 5));
+    },
+
+    // One annotation on the mark rather than two aligned columns, now that the mark is what gets scanned.
+    // Counts recognised lines, the same direction the blocks fill, or the two halves of the row disagree.
+    documentTally(document) {
+      const recognised = document.lines - document.unexplained;
+      if (document.unexplained > 0) return `${this.count(recognised)} of ${this.count(document.lines)} lines`;
+      return `${this.count(document.lines)} ${document.lines === 1 ? 'line' : 'lines'}`;
+    },
+
+    documentShare(document) {
+      const recognised = document.lines - document.unexplained;
+      return `${this.count(recognised)} of ${this.count(document.lines)} lines recognised`;
+    },
+    // Grouped explicitly rather than by browser locale, so a line count reads the same for everyone and
+    // cannot come back as "4.651" for a reader whose locale swaps the separators.
+    count(number) {
+      return number.toLocaleString('en-US');
+    },
+    // Before a decision both buttons stay solid (a plain call to action). Once one is the stored decision
+    // it keeps its solid colour and the other relaxes to an outline - quieter, but still obviously a button
+    // the reviewer can click to switch.
+    buttonClass(button) {
+      if (this.selectedButtonId === null || this.selectedButtonId === button.id) return button.variant;
+      return button.variant.replace('btn-', 'btn-outline-');
+    },
+    // A short one-shot pulse on the button that just became the decision, so a change registers right where
+    // the cursor is even when accept/reject are toggled back and forth
+    flashDecision(id) {
+      if (id === null) return;
+      if (this.flashTimer !== null) clearTimeout(this.flashTimer);
+      this.flashId = null;
+      this.$nextTick(() => {
+        this.flashId = id;
+        this.flashTimer = setTimeout(() => {
+          this.flashId = null;
+          this.flashTimer = null;
+        }, 900);
+      });
+    },
     async loadTemplates() {
       try {
         const ua = new UserAgent({baseURL: window.location.href});
@@ -506,6 +660,7 @@ export default {
       }
 
       this.submitting = true;
+      this.submittingId = decision;
 
       try {
         const ua = new UserAgent({baseURL: window.location.href});
@@ -525,6 +680,9 @@ export default {
           // stale local state is what makes refreshData() adopt the comment the server just stored
           this.cancelApiRefresh();
           await this.doApiRefresh();
+
+          // The refresh has flipped the selected button, now pulse it so the change is unmissable
+          this.flashDecision(this.selectedButtonId);
           return;
         }
 
@@ -534,6 +692,7 @@ export default {
         this.$refs.toaster?.notify(`Review request failed: ${err}`, 'danger', 5000);
       } finally {
         this.submitting = false;
+        this.submittingId = null;
       }
     },
     notifyError(message) {
@@ -574,9 +733,9 @@ export default {
       if (copiedFiles['%license'].length > 0) this.copiedFiles['%license'] = copiedFiles['%license'].join(' ');
 
       this.created = moment(data.created * 1000).fromNow();
-      this.errors = data.errors;
+      this.legalDocuments = data.legal_documents ?? null;
       this.externalLink = data.external_link_data ?? data.external_link;
-      this.spdx = data.spdx;
+      this.derivedDocuments = data.documents;
       this.legalReviewNotices = data.legal_review_notices;
 
       this.actions = data.actions;
@@ -585,23 +744,30 @@ export default {
         action.actionUrl = `/reviews/details/${action.id}`;
       }
 
-      this.pkgFiles = data.package_files;
-      for (const file of this.pkgFiles) {
-        file.licenses = file.licenses.length > 0 ? file.licenses.join(', ') : null;
-        file.sources = file.sources.length > 0 ? file.sources.join(', ') : null;
+      this.declarations = data.declarations;
+      const perFile = {};
+      for (const d of this.declarations) perFile[d.file] = (perFile[d.file] ?? 0) + 1;
+      for (const d of this.declarations) {
+        d.fileUrl = fileViewUrl(this.pkgId, d.file);
+        d.showName = perFile[d.file] > 1;
       }
+      this.incompleteCheckout = data.incomplete_checkout.map(
+        service => `Remote service in _service file: ${service.name} (mode: ${service.mode})`
+      );
 
-      this.pkgGroup = data.package_group;
-      this.pkgLicense = data.package_license;
       this.pkgName = data.package_name;
       this.pkgPriority = data.package_priority;
       this.pkgRisk = data.package_risk;
       this.pkgShortname = data.package_shortname;
       this.pkgSummary = data.package_summary;
-      this.pkgType = data.package_type;
       this.pkgUrl = data.package_url;
       this.pkgVersion = data.package_version;
       this.pkgEmbargoed = data.embargoed;
+      this.tags = data.tags ?? [];
+      this.canEditTags = data.can_edit_tags === true;
+      if (this.canEditTags && this.knownTags.length === 0) this.loadKnownTags();
+      this.pkgEphemeral = data.ephemeral;
+      this.ephemeralDelete = data.ephemeral_delete ? moment(data.ephemeral_delete * 1000).fromNow() : '';
       this.pkgAiAssisted = data.ai_assisted;
 
       this.pkgChecksum = data.package_checksum;
@@ -611,7 +777,7 @@ export default {
       this.reindexing = data.reindexing;
 
       if (data.products.length > 0) {
-        this.productsHtml = data.products.map(name => productLink({name})).join(', ');
+        this.productsHtml = data.products.map(name => productLink({name}, {blank: true})).join(', ');
       }
       this.requests = [];
       if (data.requests.length > 0) {
@@ -632,7 +798,13 @@ export default {
         this.unpackedSize = data.unpacked_size;
       }
 
-      this.warnings = data.warnings;
+      // Initialise the target hover popovers once their icons have rendered (getOrCreateInstance keeps
+      // repeated polls from stacking duplicates).
+      this.$nextTick(setupPopoverDelayed);
+
+      // This block sits above the report tabs, so its height decides where they end up. Anything
+      // deep-linking to a tab has to wait for it.
+      this.$emit('loaded');
     }
   }
 };
@@ -645,7 +817,7 @@ export default {
   margin-bottom: 1.1rem;
 }
 .report-metadata-list {
-  color: #1f2328;
+  color: var(--cavil-fg);
   display: grid;
   font-feature-settings: 'liga', 'kern';
   font-size: 15px;
@@ -656,7 +828,7 @@ export default {
   margin: 0;
 }
 .report-metadata-list dt {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   font-size: 13px;
   font-weight: 500;
   letter-spacing: 0.02em;
@@ -669,7 +841,7 @@ export default {
   overflow-wrap: anywhere;
 }
 .report-metadata-list a:not(.cavil-external-link-target) {
-  color: #0969da;
+  color: var(--cavil-accent);
   text-decoration: none;
   text-underline-offset: 2px;
 }
@@ -678,7 +850,7 @@ export default {
   text-decoration: underline;
 }
 .report-metadata-list small {
-  color: #8c959f;
+  color: var(--cavil-fg-disabled);
   font-size: 12px;
   font-weight: 400;
 }
@@ -689,14 +861,90 @@ export default {
   padding: 0.4em 0.65em;
   vertical-align: baseline;
 }
-.embargo-status-badge {
+.metadata-status-badge {
   align-items: center;
   display: inline-flex;
   gap: 0.35rem;
 }
+.report-ephemeral-hint {
+  color: var(--cavil-fg-muted);
+  font-size: 13px;
+  margin-left: 0.4rem;
+}
+.report-metadata-requests {
+  align-items: flex-start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.5rem;
+}
+.report-metadata-request {
+  display: inline-flex;
+  flex: 0 0 auto;
+  max-width: 100%;
+  min-width: 0;
+}
+/* One bordered bar with a distinct-background "Tags" label segment on the left, mirroring the two-tone
+   ExternalLink idiom. TagInput brings its own bordered editor, so inside the bar that inner border is
+   neutralised: the bar is the single box, the label is a segment of it, not a box around a box. */
+.package-tags-bar {
+  align-items: stretch;
+  border: 1px solid var(--cavil-border);
+  border-radius: 6px;
+  display: flex;
+  margin: 1.25rem 0;
+  position: relative;
+}
+/* Anchor TagInput's autocomplete popover to the whole bar (not the input segment right of the label) so it
+   spans full width and drops below the bar instead of starting mid-bar. */
+.package-tags-body .tag-input {
+  position: static;
+}
+.package-tags-bar:focus-within {
+  border-color: var(--cavil-accent);
+  box-shadow: 0 0 0 3px rgba(var(--cavil-accent-rgb), 0.18);
+}
+/* Matches the CommentEditor header label just below it (same bg, colour, size, weight) so the two
+   interactive elements read as a consistent pair. */
+.package-tags-label {
+  align-items: center;
+  background: var(--cavil-canvas-subtle);
+  border-radius: 6px 0 0 6px;
+  border-right: 1px solid var(--cavil-border);
+  color: var(--cavil-fg);
+  display: flex;
+  flex: 0 0 auto;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 0.45rem 0.75rem;
+}
+.package-tags-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.4rem 0.6rem;
+}
+.package-tags-body .report-note-tag-editor {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  margin-bottom: 0;
+  padding: 0;
+}
+.package-tags-body .report-note-tag-editor:focus-within {
+  box-shadow: none;
+}
+.package-tags-readonly {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+#pkg-tags .report-note-tag.report-cve-tag {
+  background: var(--cavil-danger-bg);
+  border-color: var(--cavil-danger-border);
+  color: var(--cavil-danger);
+}
 .report-metadata-id {
   border-radius: 6px;
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
   font-size: 14px;
   padding: 0.05rem 0.35rem;
@@ -706,12 +954,12 @@ export default {
 }
 .report-metadata-id:hover,
 .report-metadata-id:focus {
-  background: #f6f8fa;
-  color: #0969da;
+  background: var(--cavil-canvas-subtle);
+  color: var(--cavil-accent);
   outline: none;
 }
 .report-metadata-collapse-link {
-  border-bottom: 1px dashed #afb8c1;
+  border-bottom: 1px dashed var(--cavil-border-strong);
 }
 .report-metadata-collapse-link:hover,
 .report-metadata-collapse-link:focus {
@@ -735,10 +983,10 @@ export default {
 }
 .metadata-count-pill {
   align-items: center;
-  background: #f6f8fa;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas-subtle);
+  border: 1px solid var(--cavil-border);
   border-radius: 999px;
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   display: inline-flex;
   font-size: 12px;
   font-weight: 600;
@@ -749,24 +997,92 @@ export default {
 }
 .metadata-count-pill:hover,
 .metadata-count-pill:focus {
-  background: #eef6ff;
-  border-color: #b6e3ff;
-  color: #0969da;
+  background: var(--cavil-accent-tint-1);
+  border-color: var(--cavil-accent-border);
+  color: var(--cavil-accent);
   text-decoration: none;
+}
+.cavil-notice-item.legal-document-item {
+  align-items: baseline;
+  display: flex;
+  gap: 0.85rem;
+  white-space: normal;
+}
+.cavil-notice-item.legal-document-item,
+#legal-documents .list-more-toggle {
+  background: linear-gradient(90deg, rgba(var(--cavil-success-rgb), 0.08), var(--cavil-canvas) 2.5rem);
+}
+.cavil-notice-item.legal-document-item:hover,
+#legal-documents .list-more-toggle:hover {
+  background: linear-gradient(90deg, rgba(var(--cavil-success-rgb), 0.12), var(--cavil-canvas-subtle) 2.5rem);
+}
+/* A wash needs a light canvas to read as a tint; over near-black it only ever comes out as
+   grey haze. Dark marks the row the way the risk bands already do, with a thin inset rule. */
+[data-bs-theme='dark'] .cavil-notice-item.legal-document-item,
+[data-bs-theme='dark'] #legal-documents .list-more-toggle {
+  background: var(--cavil-canvas);
+  box-shadow: inset 2px 0 0 var(--cavil-success-emphasis);
+}
+[data-bs-theme='dark'] .cavil-notice-item.legal-document-item:hover,
+[data-bs-theme='dark'] #legal-documents .list-more-toggle:hover {
+  background: var(--cavil-canvas-subtle);
+}
+/* File names follow the report's convention: muted until hovered, where they turn link-blue */
+.legal-document-path {
+  color: var(--cavil-fg-muted);
+  flex: 1 1 auto;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-decoration-color: transparent;
+}
+.legal-document-path:hover,
+.legal-document-path:focus {
+  color: var(--cavil-accent-strong);
+  text-decoration-color: currentColor;
+}
+.legal-document-lines {
+  /* The mark has no text of its own, so its baseline is its bottom edge: it sits on the annotation's
+     baseline, where it sat when it was part of that text run. Stretch would hang it from the top. */
+  align-items: baseline;
+  color: var(--cavil-fg-subtle);
+  display: flex;
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  gap: 0.6rem;
+  white-space: nowrap;
+}
+/* GitHub's diffstat mark: proportion beside the count, never instead of it. Amber rather than red, which
+   would grade text that is only unmatched, and green/red is the one pair some readers cannot separate.
+   A covered file marks five greys rather than nothing, which is what amber is read against. */
+.legal-document-meter {
+  display: inline-flex;
+  gap: 2px;
+}
+.legal-document-block {
+  background: var(--cavil-border);
+  border-radius: 1px;
+  height: 8px;
+  width: 8px;
+}
+.legal-document-block.is-covered {
+  background: var(--cavil-success);
 }
 .metadata-collapse-inner {
   padding: 0.85rem 0 1.1rem;
 }
-.metadata-related-list,
-.metadata-file-list {
+.metadata-related-list {
   list-style: none;
   margin: 0;
   padding: 0;
 }
 .metadata-related-item {
   align-items: center;
-  background: #ffffff;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas);
+  border: 1px solid var(--cavil-border);
   border-radius: 8px;
   display: grid;
   gap: 0.75rem;
@@ -779,22 +1095,21 @@ export default {
 .metadata-related-item:last-child {
   margin-bottom: 0;
 }
-.metadata-related-item:hover,
-.metadata-file-item:hover {
-  background: #f6f8fa;
+.metadata-related-item:hover {
+  background: var(--cavil-canvas-subtle);
 }
 .metadata-related-name {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 13px;
   font-weight: 600;
   min-width: 0;
   overflow-wrap: anywhere;
 }
 .metadata-related-pill {
-  background: #f6f8fa;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas-subtle);
+  border: 1px solid var(--cavil-border);
   border-radius: 999px;
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 12px;
   font-weight: 600;
   line-height: 1;
@@ -803,7 +1118,7 @@ export default {
 }
 .metadata-related-user,
 .metadata-related-date {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 13px;
   min-width: 0;
   overflow-wrap: anywhere;
@@ -815,78 +1130,62 @@ export default {
 }
 .metadata-related-date:hover,
 .metadata-related-date:focus {
-  color: #0550ae;
+  color: var(--cavil-accent-strong);
   text-decoration-color: currentColor;
 }
-.metadata-file-item {
-  background: #ffffff;
-  border: 1px solid #d0d7de;
-  border-radius: 8px;
-  margin-bottom: 0.85rem;
-  overflow: hidden;
-  transition: background-color 0.15s ease;
-}
-.metadata-file-item:last-child {
-  margin-bottom: 0;
-}
-.metadata-file-title {
-  align-items: center;
-  background: #f6f8fa;
-  border-bottom: 1px solid #d0d7de;
-  color: #1f2328;
-  display: flex;
-  font-size: 13px;
-  font-weight: 600;
-  gap: 0.45rem;
-  line-height: 1.35;
-  margin: 0;
-  overflow-wrap: anywhere;
-  padding: 0.65rem 0.85rem;
-}
-.metadata-file-title i {
-  color: #6e7781;
-}
-.metadata-file-details {
+#pkg-declarations {
+  align-items: baseline;
   display: grid;
+  gap: 0.25rem 1rem;
+  grid-template-columns: repeat(3, auto);
+  justify-content: start;
+}
+#pkg-declarations.metadata-declarations-named {
+  grid-template-columns: repeat(4, auto);
+}
+.metadata-declaration {
+  display: contents;
+}
+.metadata-declaration-name,
+.metadata-declaration-undeclared,
+.report-metadata-list a.metadata-declaration-file {
+  color: var(--cavil-fg-muted);
   font-size: 13px;
-  gap: 0.35rem 0.85rem;
-  grid-template-columns: max-content minmax(0, 1fr);
-  margin: 0;
-  padding: 0.75rem 0.85rem;
 }
-.metadata-file-details dt {
-  color: #57606a;
+.report-metadata-list a.metadata-declaration-file:hover,
+.report-metadata-list a.metadata-declaration-file:focus {
+  color: var(--cavil-accent);
+}
+.metadata-declaration-format {
+  background: var(--cavil-canvas-subtle);
+  border: 1px solid var(--cavil-border);
+  border-radius: 999px;
+  color: var(--cavil-fg-muted);
+  font-size: 11px;
   font-weight: 600;
+  justify-self: start;
+  letter-spacing: 0.03em;
+  line-height: 1;
+  padding: 0.3rem 0.55rem;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
-.metadata-file-details dd {
-  color: #1f2328;
-  margin: 0;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-.metadata-file-details a {
-  text-decoration-color: transparent;
-}
-.metadata-file-details a:hover,
-.metadata-file-details a:focus {
-  text-decoration-color: currentColor;
-}
-/* Review-information card. Rendered as a terminal/console panel — a small
+/* Review-information card. Rendered as a terminal/console panel - a small
    dark title bar with a prompt-style caret + label, then the freeform
    monospace body as if it were tool output. Visually distinct from the
    surrounding notice stack so reviewers and packagers can't miss it,
    regardless of whether the body is a single sentence or a multi-line diff. */
 .review-information-card {
-  background: #ffffff;
-  border: 1px solid #1f2328;
+  background: var(--cavil-canvas);
+  border: 1px solid var(--cavil-review-card-border);
   border-radius: 6px;
   margin: 1.25rem 0;
   overflow: hidden;
 }
 .review-information-card-bar {
   align-items: center;
-  background: #1f2328;
-  color: #d0d7de;
+  background: var(--cavil-inverse-bg-alt);
+  color: var(--cavil-inverse-fg-subtle);
   display: flex;
   font-size: 12px;
   font-weight: 500;
@@ -896,11 +1195,11 @@ export default {
   text-transform: lowercase;
 }
 .review-information-card-bar i {
-  color: #7d8590;
+  color: var(--cavil-grey-4);
   font-size: 11px;
 }
 /* The compared report id links to that report, but stays typographically
-   part of the tool output — only an underline on hover gives it away. */
+   part of the tool output - only an underline on hover gives it away. */
 .review-information-card-body a {
   color: inherit;
   text-decoration: none;
@@ -910,7 +1209,7 @@ export default {
   text-decoration: underline;
 }
 .review-information-card-body {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-family: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
   font-size: 13px;
   line-height: 1.55;
@@ -939,6 +1238,28 @@ export default {
   font-weight: 600;
   position: relative;
 }
+.metadata-review-status {
+  align-items: center;
+  color: var(--cavil-fg);
+  display: flex;
+  flex: 1;
+  font-size: 13px;
+  gap: 0.5rem;
+}
+.metadata-review-status-icon {
+  color: var(--cavil-success);
+}
+.metadata-review-status.is-unacceptable .metadata-review-status-icon {
+  color: var(--cavil-danger);
+}
+.metadata-review-status strong {
+  font-weight: 600;
+}
+.metadata-review-status-detail {
+  color: var(--cavil-fg-muted);
+  font-size: 12px;
+  margin-left: auto;
+}
 .metadata-review-actions-group {
   align-items: center;
   display: inline-flex;
@@ -964,6 +1285,34 @@ export default {
 .metadata-review-actions .btn:focus {
   z-index: 1;
 }
+.metadata-review-actions .btn i {
+  margin-right: 0.4em;
+}
+/* The button that reflects the stored decision keeps its solid fill and sits above its outlined
+   neighbour so its border reads as a single unbroken segment */
+.metadata-review-actions .btn.is-decision-current {
+  z-index: 1;
+}
+/* One-shot pulse when a decision is made or switched, drawing the eye to the button under the cursor */
+.metadata-review-actions .btn.is-decision-flash {
+  animation: metadata-decision-flash 0.7s ease;
+}
+@keyframes metadata-decision-flash {
+  0% {
+    filter: brightness(1);
+  }
+  35% {
+    filter: brightness(1.4);
+  }
+  100% {
+    filter: brightness(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .metadata-review-actions .btn.is-decision-flash {
+    animation: none;
+  }
+}
 .metadata-review-actions-secondary {
   margin-left: auto;
 }
@@ -977,11 +1326,12 @@ export default {
   }
 }
 @media (max-width: 700px) {
-  .metadata-file-details {
-    grid-template-columns: 1fr;
+  .metadata-review-status-detail {
+    flex-basis: calc(100% - 1.5rem);
+    margin-left: 1.5rem;
   }
-  .metadata-file-details dd + dt {
-    margin-top: 0.25rem;
+  .metadata-review-status {
+    flex-wrap: wrap;
   }
 }
 .cavil-classification-badge {
@@ -990,14 +1340,17 @@ export default {
   align-items: center;
   padding: 0.5rem;
   border-radius: 1rem;
-  background-color: #0b374d;
-  color: #ffffff;
+  background-color: var(--cavil-accent-deep-2);
+  color: var(--cavil-canvas);
   width: 150px;
 }
 .cavil-package-format-icon i {
-  color: #6c757d;
+  color: var(--cavil-fg-secondary);
 }
 
+/* The fills stay put across themes: they are saturated chips carrying white text, and the
+   brighter dark-mode greens and reds would drop that below legible. The neutral one is the
+   exception, because its light value inverts to a pale grey. */
 .cavil-green-ribbon {
   --cavil-ribbon-bg-color: #198754;
 }
@@ -1009,10 +1362,30 @@ export default {
   --cavil-ribbon-bg-color: #dc3545;
 }
 .cavil-gray-ribbon {
-  --cavil-ribbon-bg-color: #57606a;
+  --cavil-ribbon-bg-color: var(--cavil-risk-unknown-bg);
+}
+/* Tinted rather than filled, matching the risk chips. The ribbon is still the loudest thing
+   on the page: at this size the emphasis comes from the shape, so it does not also need a
+   saturated fill, which next to the chips just read as dated. No border, because clip-path
+   cuts the arrow out of the element and would cut the border with it. */
+[data-bs-theme='dark'] .cavil-green-ribbon {
+  --cavil-ribbon-bg-color: rgba(var(--cavil-success-rgb), 0.22);
+  --cavil-ribbon-color: var(--cavil-success);
+}
+[data-bs-theme='dark'] .cavil-orange-ribbon {
+  --cavil-ribbon-bg-color: rgba(var(--cavil-attention-border-rgb), 0.22);
+  --cavil-ribbon-color: var(--cavil-attention-deep);
+}
+[data-bs-theme='dark'] .cavil-red-ribbon {
+  --cavil-ribbon-bg-color: rgba(var(--cavil-danger-rgb), 0.22);
+  --cavil-ribbon-color: var(--cavil-danger);
+}
+[data-bs-theme='dark'] .cavil-gray-ribbon {
+  --cavil-ribbon-bg-color: var(--cavil-neutral-bg);
+  --cavil-ribbon-color: var(--cavil-fg-muted);
 }
 .cavil-ribbon {
-  color: var(--cavil-ribbon-color, #fff);
+  color: var(--cavil-ribbon-color, var(--cavil-on-accent));
   font-family:
     system-ui,
     -apple-system,

@@ -27,6 +27,7 @@ export async function waitForInlineSnippetEditorClosed(page) {
 }
 
 export async function expandFileDetails(page, fileId) {
+  await page.waitForSelector('.cavil-reveal-leave-active', {state: 'detached'});
   if (!(await page.isVisible(`#file-details-${fileId}`))) {
     await page.locator(`#filelist-snippets a[href="#file-${fileId}"]`).click();
   }
@@ -35,13 +36,13 @@ export async function expandFileDetails(page, fileId) {
 
 export async function openCreatePatternEditor(page, fileId, options = {}) {
   await waitForInlineSnippetEditorClosed(page);
-  await page.waitForSelector(`#file-details-${fileId} table.snippet`);
+  await expandFileDetails(page, fileId);
 
   if (options.triggerSelector) {
     await page.locator(options.triggerSelector).click();
     await page
       .locator(`#file-details-${fileId} .dropdown-menu.show a.dropdown-item`)
-      .filter({hasText: 'Create Pattern from selection'})
+      .filter({hasText: 'Create Pattern from match'})
       .first()
       .click();
     await waitForInlineSnippetEditor(page);
@@ -52,8 +53,8 @@ export async function openCreatePatternEditor(page, fileId, options = {}) {
     const root = document.getElementById(`file-details-${id}`);
     if (!root) throw new Error(`No #file-details-${id}`);
     const items = [...root.querySelectorAll('.dropdown-menu a.dropdown-item')];
-    const item = items.find(el => el.textContent.trim() === 'Create Pattern from selection');
-    if (!item) throw new Error(`No "Create Pattern from selection" item in #file-details-${id}`);
+    const item = items.find(el => el.textContent.trim() === 'Create Pattern from match');
+    if (!item) throw new Error(`No "Create Pattern from match" item in #file-details-${id}`);
     item.click();
   }, fileId);
   await waitForInlineSnippetEditor(page);
@@ -126,8 +127,13 @@ export async function launchUi(schema) {
 // expected-failure ones. Every t/ui_*.t.js file calls this once at the end.
 export function assertNoUnexpectedConsoleErrors(t, errorLogs) {
   // Some subtests intentionally drive the server to return 400 - the browser
-  // logs that as a console error.
-  const unexpected = errorLogs.filter(msg => !/status of 400 \(Bad Request\)/.test(msg));
+  // logs that as a console error. A 409 is the same kind of expected, handled
+  // response: submitting a decision while the report is being rebuilt is refused
+  // as a whole and the page just waits for the new report, but the browser still
+  // logs the refused request.
+  const unexpected = errorLogs.filter(
+    msg => !/status of 400 \(Bad Request\)/.test(msg) && !/status of 409 \(Conflict\)/.test(msg)
+  );
   for (const message of unexpected) {
     t.comment(`Unexpected console error: ${message.replace(/\s+/g, ' ')}`);
   }

@@ -39,11 +39,22 @@
           <template v-else-if="meta.kind === 'directory'">
             {{ meta.entries.length }} {{ meta.entries.length === 1 ? 'item' : 'items' }}
           </template>
-          <template v-else-if="sourceIsOversized">{{ meta.source.sizeLabel }} file</template>
+          <template v-else-if="meta.source.window"
+            >lines {{ meta.source.window.from }}-{{ meta.source.window.to }}</template
+          >
           <template v-else
             >{{ meta.source.lines.length }} {{ meta.source.lines.length === 1 ? 'line' : 'lines' }}</template
           >
         </span>
+        <a
+          v-if="meta.kind === 'file'"
+          :href="meta.source.rawUrl"
+          class="file-browser-download"
+          download
+          title="Download raw file"
+          aria-label="Download raw file"
+          ><i class="fa-solid fa-download" aria-hidden="true"></i
+        ></a>
       </nav>
 
       <div v-if="meta.kind === 'unavailable'" class="file-browser-panel">
@@ -80,18 +91,13 @@
       </div>
 
       <div v-else-if="meta.kind === 'file'" class="file-browser-panel file-browser-source-panel">
-        <div v-if="sourceIsOversized" class="file-browser-too-large" role="status">
-          <i class="fa-regular fa-file-lines"></i>
-          <strong>This file is too large to display.</strong>
-          <span
-            >{{ meta.source.filename }} is {{ meta.source.sizeLabel }}. The display limit is
-            {{ meta.source.maxSizeLabel }}.</span
-          >
-        </div>
-        <div v-else class="source file-browser-source">
+        <div class="source file-browser-source">
           <FileSource
             :lines="meta.source.lines"
+            :file-window="meta.source.window || null"
+            :target-line="targetLine"
             :file-id="meta.source.id || 0"
+            :package-id="meta.package.id"
             :filename="meta.source.filename"
             :packname="meta.source.name"
             :has-admin-role="hasAdminRole"
@@ -99,8 +105,10 @@
             :read-only="reindexing"
             :pending-actions="pendingActionsForCurrentFile"
             :inline-editor="openInlineEditor"
+            @page="onPage"
             @extend="onExtend"
             @open-editor="openEditor"
+            @ignore-match="onIgnoreMatch"
             @dismiss-action="dismissAction"
             @close-editor="closeInlineEditor"
             @editor-submit="onEditorSubmit"
@@ -119,7 +127,12 @@ import LegalLoading from './components/LegalLoading.vue';
 import PendingActionsWidget from './components/PendingActionsWidget.vue';
 import ProgressBar from './components/ProgressBar.vue';
 import {encodePath, fileViewUrl} from './helpers/links.js';
-import {resolveSnippetFromFile, submitSnippetDecisions} from './helpers/snippetDecisions.js';
+import {
+  ignorePendingAction,
+  resolveMatchChecksum,
+  resolveSnippetFromFile,
+  submitSnippetDecisions
+} from './helpers/snippetDecisions.js';
 
 let openEditorKeySeq = 0;
 let pendingActionIdSeq = 0;
@@ -129,6 +142,7 @@ let pendingActionIdSeq = 0;
 const REBUILD_LABELS = ['Queued', 'Unpacking', 'Indexing', 'Analyzing'];
 const STATE_POLL_DELAY = 5000;
 const IDLE_POLL_DELAY = 15000;
+const WINDOW_LINES = 2000;
 
 export default {
   name: 'FileBrowser',
@@ -165,7 +179,8 @@ export default {
       rebuildLabels: REBUILD_LABELS,
       rebuildStage: null,
       reindexing: false,
-      statePollTimer: null
+      statePollTimer: null,
+      targetLine: 0
     };
   },
   computed: {
@@ -175,22 +190,19 @@ export default {
     pendingActionsForCurrentFile() {
       if (!this.meta || this.meta.kind !== 'file') return [];
       return this.pendingActions.filter(a => a.fileId === this.meta.source.id);
-    },
-    sourceIsOversized() {
-      return this.meta && this.meta.kind === 'file' && this.meta.source && this.meta.source.oversized;
     }
   },
   mounted() {
     window.addEventListener('popstate', this.onPopState);
-    this.fetchPath(this.initialPath, {replace: true});
+    this.fetchPath(this.initialPath, {replace: true, seek: true});
   },
   beforeUnmount() {
     window.removeEventListener('popstate', this.onPopState);
     if (this.statePollTimer !== null) clearTimeout(this.statePollTimer);
   },
   methods: {
-    metaUrl(path) {
-      return `/reviews/file_view_meta/${this.pkgId}/${encodePath(path)}`;
+    metaUrl(path, from) {
+      return `/reviews/file_view_meta/${this.pkgId}/${encodePath(path)}${from > 1 ? `?from=${from}` : ''}`;
     },
     viewUrl(path) {
       return fileViewUrl(this.pkgId, path);
@@ -200,8 +212,11 @@ export default {
       this.error = null;
       this.editorError = null;
       this.notice = null;
+      // A file too large to show at once opens on a window that starts a little above the linked line
+      const line = options.replace ? Number((window.location.hash.match(/^#L(\d+)$/) || [])[1] ?? 0) : 0;
+      const from = options.from ?? Math.max(1, line - 20);
       try {
-        const res = await fetch(this.metaUrl(path));
+        const res = await fetch(this.metaUrl(path, from));
         if (!res.ok) {
           this.error = `Could not load file browser data (HTTP ${res.status}).`;
           return;
@@ -216,12 +231,27 @@ export default {
         else if (this.meta.kind === 'directory')
           document.title = `Directory listing of ${this.meta.currentPath || '/'}`;
         else document.title = `Content of ${this.meta.currentPath}`;
-        const nextUrl = this.viewUrl(this.meta.currentPath);
+        this.targetLine = line;
+        const nextUrl = this.viewUrl(this.meta.currentPath) + (options.replace ? window.location.hash : '');
         if (options.replace) history.replaceState({path: this.meta.currentPath}, '', nextUrl);
         else history.pushState({path: this.meta.currentPath}, '', nextUrl);
       } finally {
         this.loading = false;
       }
+      if (line && options.seek) {
+        await this.$nextTick();
+        document.querySelector('tr.line-target')?.scrollIntoView({block: 'center'});
+      }
+    },
+    async onPage(direction) {
+      const {from, to} = this.meta.source.window;
+      await this.fetchPath(this.meta.currentPath, {
+        replace: true,
+        from: direction === 'next' ? to + 1 : Math.max(1, from - WINDOW_LINES)
+      });
+      const rows = document.querySelectorAll('.file-browser-source tr');
+      if (direction === 'next') rows[0]?.scrollIntoView({block: 'start'});
+      else rows[rows.length - 1]?.scrollIntoView({block: 'end'});
     },
     openPath(event, path) {
       if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
@@ -264,7 +294,7 @@ export default {
       const prefix = `/reviews/file_view/${this.pkgId}`;
       let path = window.location.pathname.startsWith(prefix) ? window.location.pathname.slice(prefix.length) : '';
       path = path.replace(/^\//, '');
-      this.fetchPath(decodeURIComponent(path), {replace: true});
+      this.fetchPath(decodeURIComponent(path), {replace: true, seek: true});
     },
     async fetchSource(start = 0, end = 0) {
       if (!this.meta || this.meta.kind !== 'file' || !this.meta.source.id) return;
@@ -314,10 +344,16 @@ export default {
     async openEditor(meta) {
       this.editorError = null;
       let snippetId = meta.snippetId;
+      let hash = meta.hash ?? null;
+      let from = meta.from ?? null;
       try {
         if (snippetId === null) {
+          // A selection has no snippet or hash yet; creating it returns both, and the hash is what
+          // lets the editor offer the full set of actions right away (not just after a reload).
           const data = await resolveSnippetFromFile(meta);
           snippetId = data.snippet;
+          if (!hash) hash = data.hash || null;
+          if (!from) from = data.from || null;
         }
       } catch (err) {
         this.editorError = err.message ?? String(err);
@@ -328,8 +364,8 @@ export default {
         fileId: meta.fileId,
         startLine: meta.startLine,
         endLine: meta.endLine,
-        hash: meta.hash ?? null,
-        from: meta.from ?? null,
+        hash,
+        from,
         filePath: meta.filePath ?? null,
         initial: null
       });
@@ -342,6 +378,18 @@ export default {
     },
     closeInlineEditor() {
       this.openInlineEditor = null;
+    },
+    async onIgnoreMatch(meta) {
+      // Curator correction path (the menu item is gated on the curate capability in FileSource): stage the
+      // ignore in one click instead of opening the editor, since ignoring needs no editing.
+      let hash;
+      try {
+        ({hash} = await resolveMatchChecksum(meta));
+      } catch (err) {
+        this.editorError = err.message ?? String(err);
+        return;
+      }
+      this.pendingActions.push(ignorePendingAction({id: ++pendingActionIdSeq, meta, hash}));
     },
     onEditorSubmit(payload) {
       const ctx = this.openInlineEditor ?? {};
@@ -458,16 +506,16 @@ export default {
 
 <style>
 .file-browser {
-  color: #1f2328;
+  color: var(--cavil-fg);
   margin-top: 1rem;
 }
 .file-browser-loading {
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   padding: 24px 0;
 }
 .file-browser-header {
   align-items: center;
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--cavil-border);
   border-radius: 6px 6px 0 0;
   display: flex;
   justify-content: space-between;
@@ -482,7 +530,7 @@ export default {
 }
 .file-browser-package {
   align-items: center;
-  color: #0969da;
+  color: var(--cavil-accent);
   display: inline-flex;
   font-size: 16px;
   font-weight: 600;
@@ -496,9 +544,9 @@ export default {
 }
 .file-browser-checkout,
 .file-browser-match-badge {
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--cavil-border);
   border-radius: 2em;
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   font-size: 12px;
   line-height: 18px;
   padding: 0 7px;
@@ -506,8 +554,8 @@ export default {
 }
 .file-browser-breadcrumb {
   align-items: center;
-  background: #f6f8fa;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas-subtle);
+  border: 1px solid var(--cavil-border);
   border-top: 0;
   display: flex;
   flex-wrap: wrap;
@@ -516,25 +564,35 @@ export default {
   padding: 10px 16px;
 }
 .file-browser-count {
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   font-size: 12px;
   margin-left: auto;
   white-space: nowrap;
+}
+.file-browser-breadcrumb a.file-browser-download {
+  color: var(--cavil-fg-muted-alt);
+  font-size: 13px;
+  line-height: 1;
+}
+.file-browser-breadcrumb a.file-browser-download:hover,
+.file-browser-breadcrumb a.file-browser-download:focus-visible {
+  color: var(--cavil-accent);
+  text-decoration: none;
 }
 .file-browser-breadcrumb-item {
   display: inline-flex;
   gap: 6px;
 }
 .file-browser-breadcrumb a {
-  color: #0969da;
+  color: var(--cavil-accent);
   font-weight: 600;
   text-decoration: none;
 }
 .file-browser-separator {
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
 }
 .file-browser-panel {
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--cavil-border);
   border-radius: 0 0 6px 6px;
   border-top: 0;
   margin-bottom: 24px;
@@ -545,43 +603,43 @@ export default {
   width: 100%;
 }
 .file-browser-table tr {
-  border-bottom: 1px solid #d8dee4;
+  border-bottom: 1px solid var(--cavil-border-muted);
 }
 .file-browser-table tr:last-child {
   border-bottom: 0;
 }
 .file-browser-table tr:hover {
-  background: #f6f8fa;
+  background: var(--cavil-canvas-subtle);
 }
 .file-browser-table td {
   padding: 8px 10px;
 }
 .file-browser-icon {
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   text-align: center;
   width: 36px;
 }
 .file-browser-table .has-match .file-browser-icon {
-  color: #cf222e;
+  color: var(--cavil-danger);
 }
 .file-browser-name a {
-  color: #0969da;
+  color: var(--cavil-accent);
   text-decoration: none;
 }
 .file-browser-kind {
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   font-size: 12px;
   text-align: right;
   white-space: nowrap;
   width: 120px;
 }
 .file-browser-match-badge {
-  background: rgba(207, 34, 46, 0.08);
-  border-color: rgba(207, 34, 46, 0.2);
-  color: #cf222e;
+  background: rgba(var(--cavil-danger-rgb), 0.08);
+  border-color: rgba(var(--cavil-danger-rgb), 0.2);
+  color: var(--cavil-danger);
 }
 .file-browser-empty {
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   padding: 24px 16px !important;
   text-align: center;
 }
@@ -600,10 +658,9 @@ export default {
 .file-browser-source .snippet tr.has-pattern-tooltip td.code {
   cursor: help;
 }
-.file-browser-too-large,
 .file-browser-unavailable {
   align-items: center;
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -612,14 +669,12 @@ export default {
   padding: 32px 16px;
   text-align: center;
 }
-.file-browser-too-large i,
 .file-browser-unavailable i {
-  color: #8c959f;
+  color: var(--cavil-fg-disabled);
   font-size: 32px;
 }
-.file-browser-too-large strong,
 .file-browser-unavailable strong {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 16px;
 }
 .cavil-pattern-tip-floating {

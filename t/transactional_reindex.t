@@ -128,9 +128,9 @@ subtest 'The report stays readable for the whole rebuild, then swaps' => sub {
 
 subtest 'The promote never leaves the report row empty' => sub {
   my $row = $db->select('bot_reports', '*', {package => 1})->hash;
-  ok $row,                    'report row exists';
-  ok $row->{ldig_report},     'dig report is cached';
-  ok $row->{specfile_report}, 'spec file report is cached';
+  ok $row,                 'report row exists';
+  ok $row->{ldig_report},  'dig report is cached';
+  ok $row->{declarations}, 'declarations are cached';
 };
 
 subtest 'Every reader stays on the live report while a build has rows beside it' => sub {
@@ -159,6 +159,15 @@ subtest 'Every reader stays on the live report while a build has rows beside it'
     {package => 1, file => $file, snippet => $snippet_id, sline => 1, eline => 1, generation => $generation});
   $db->insert('urls',   {package => 1, url   => "https://$marker.example.com/", hits => 3, generation => $generation});
   $db->insert('emails', {package => 1, email => "$marker\@example.com",         hits => 2, generation => $generation});
+  $db->insert(
+    'copyrights',
+    {
+      package    => 1,
+      copyright  => "Copyright (c) 2019 $marker",
+      files      => ["$marker/BUILD-ONLY.txt"],
+      generation => $generation
+    }
+  );
   $db->insert(
     'package_components',
     {
@@ -217,7 +226,7 @@ subtest 'Every reader stays on the live report while a build has rows beside it'
   # Pattern flags are aggregated over every match of the package, and the build's pattern is flagged
   is_deeply $pkgs->flags(1), $flags_before, 'package flags are not confused by the build';
 
-  is $pkgs->discard_builds(1, undef), 4, 'the build is thrown away again';
+  is $pkgs->discard_builds(1, undef), 5, 'the build is thrown away again';
   is $db->query('SELECT COUNT(*) FROM pattern_matches WHERE package = 1 AND generation <> 0')->array->[0], 0,
     'matches cascaded with it';
   is $db->query('SELECT COUNT(*) FROM file_snippets WHERE package = 1 AND generation <> 0')->array->[0], 0,
@@ -227,22 +236,22 @@ subtest 'Every reader stays on the live report while a build has rows beside it'
 subtest 'The cached reports are only ever replaced, never emptied' => sub {
   my sub cached ($column) { return $db->select('bot_reports', $column, {package => 1})->hash->{$column} }
 
-  # A spec file report that could only have come from the previous sources, so it is obvious which of the
-  # two paths below refreshed it
-  my $stale = to_json({main => {license => 'Cached-From-The-Previous-Sources'}});
-  $db->update('bot_reports', {specfile_report => $stale}, {package => 1});
+  # Declarations that could only have come from the previous sources, so it is obvious which of the two
+  # paths below refreshed them
+  my $stale = to_json({declarations => [{license => 'Cached-From-The-Previous-Sources'}], incomplete_checkout => []});
+  $db->update('bot_reports', {declarations => $stale}, {package => 1});
 
   # A plain re-analyze - an approved snippet, a newly ignored line - used to begin by nulling the cached
   # dig report, which took the report page down for as long as it ran
   $pkgs->analyze(1);
   step_jobs(sub ($task) { ok cached('ldig_report'), "the dig report is still cached after $task" });
-  is cached('specfile_report'), $stale, 'a re-analyze has no new sources and keeps the cached spec file report';
+  is cached('declarations'), $stale, 'a re-analyze has no new sources and keeps the cached declarations';
 
-  # A rebuild can follow a re-unpack, which replaces the sources and with them the spec file
+  # A rebuild can follow a re-unpack, which replaces the sources and with them the declarations
   is $pkgs->reindex(1), 'now', 'reindex enqueued';
   step_jobs(sub ($task) { ok cached('ldig_report'), "the dig report is still cached after $task" });
-  isnt cached('specfile_report'), $stale, 'a rebuild replaced the spec file report';
-  is_deeply $app->reports->specfile_report(1), $app->reports->build_specfile_report(1),
+  isnt cached('declarations'), $stale, 'a rebuild replaced the declarations';
+  is_deeply $app->reports->declarations(1), $app->reports->build_declarations(1),
     'with one built from the sources it just indexed';
 };
 
@@ -293,7 +302,7 @@ subtest 'A rebuild puts the report page into read-only mode' => sub {
 };
 
 subtest 'Generating an SPDX report does not lock the page' => sub {
-  $minion->enqueue('spdx_report' => [1] => {notes => {pkg_1 => 1}});
+  $minion->enqueue('documents' => [1] => {notes => {pkg_1 => 1}});
   $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/reindexing' => Mojo::JSON->false);
   $minion->perform_jobs;
 };
@@ -302,11 +311,10 @@ subtest 'A reindex requested while an SPDX report runs starts as soon as it is o
   my $before = report_details();
   ok !$before->{error}, 'report is readable to begin with';
 
-  # An spdx job claims the package for as long as it takes, and one follows every single build when SPDX
-  # reports are generated automatically - so a reviewer pressing "Reindex" lands in that window fairly
-  # easily. Nothing is queued behind it that could notice the request, which is what makes the job itself
-  # responsible for it: otherwise the reviewer stares at a read-only report until the nightly sweep.
-  my $spdx_id = $minion->enqueue('spdx_report' => [1] => {notes => {pkg_1 => 1}});
+  # An spdx job claims the package for as long as it takes, so a reviewer pressing "Reindex" can land in
+  # that window. Nothing is queued behind it that could notice the request, which is what makes the job
+  # itself responsible for it: otherwise the reviewer stares at a read-only report until the nightly sweep.
+  my $spdx_id = $minion->enqueue('documents' => [1] => {notes => {pkg_1 => 1}});
   ok $pkgs->claim(1, $spdx_id), 'the spdx job has the package';
   is $pkgs->reindex(1), 'later', 'the reindex has to wait for it';
   $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/reindexing' => Mojo::JSON->true);

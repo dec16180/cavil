@@ -1,59 +1,45 @@
 <template>
-  <div class="license-obligations" :class="{'is-open': open}">
-    <button
-      type="button"
-      class="license-obligations-toggle"
-      :aria-expanded="open ? 'true' : 'false'"
-      @click="open = !open"
-    >
-      <i :class="['fa-solid', open ? 'fa-caret-down' : 'fa-caret-right']" aria-hidden="true"></i>
-      {{ toggleLabel }}
-    </button>
+  <div class="license-obligations">
+    <span class="lob-source">{{ sourceLabel }}</span>
+    <p v-if="exceptions.length > 0" class="lob-caveat">
+      <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
+      <span>May be modified by {{ exceptionsLabel }}.</span>
+    </p>
+    <section v-for="lic in licenses" :key="lic.license" class="lob-license">
+      <h5 v-if="showNames" class="lob-license-name">
+        <button type="button" class="license-link spdx" :data-license="lic.license">{{ lic.license }}</button>
+      </h5>
 
-    <div v-if="open" class="license-obligations-body">
-      <span class="lob-source">{{ sourceLabel }}</span>
-      <p v-if="exceptions.length > 0" class="lob-caveat">
-        <i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i>
-        <span>May be modified by {{ exceptionsLabel }}.</span>
-      </p>
-      <section v-for="lic in licenses" :key="lic.license" class="lob-license">
-        <h5 v-if="showNames" class="lob-license-name">
-          <a class="spdx-link" :href="lic.spdxUrl" target="_blank" rel="noopener noreferrer">{{ lic.license }}</a>
-        </h5>
-
-        <dl v-if="lic.attrs.length > 0" class="lob-attrs">
-          <div v-for="attr in lic.attrs" :key="attr.label" class="lob-attr">
-            <dt>{{ attr.label }}</dt>
-            <dd>{{ attr.value }}</dd>
-          </div>
-        </dl>
-
-        <div v-for="uc in lic.sections" :key="uc.label" class="lob-usecase">
-          <div class="lob-usecase-label">{{ uc.label }}</div>
-          <ul v-if="uc.rows.length > 0" class="lob-tree">
-            <li
-              v-for="(row, idx) in uc.rows"
-              :key="idx"
-              :class="['lob-row', 'lob-' + row.kind]"
-              :style="{paddingLeft: row.depth * 1.15 + 'rem'}"
-            >
-              <i v-if="row.icon" :class="['lob-icon', 'fa-solid', row.icon]" aria-hidden="true"></i>
-              <span v-if="row.label" class="visually-hidden">{{ row.label }}</span>
-              <span class="lob-text">{{ row.text }}</span>
-            </li>
-          </ul>
-          <p v-else class="lob-none">No specific obligations.</p>
+      <dl v-if="lic.attrs.length > 0" class="lob-attrs">
+        <div v-for="attr in lic.attrs" :key="attr.label" class="lob-attr">
+          <dt>{{ attr.label }}</dt>
+          <dd>{{ attr.value }}</dd>
         </div>
+      </dl>
 
-        <p v-if="lic.sections.length === 0" class="lob-none">No obligation checklist published for this license.</p>
-      </section>
-    </div>
+      <div v-for="uc in lic.sections" :key="uc.label" class="lob-usecase">
+        <div class="lob-usecase-label">{{ uc.label }}</div>
+        <ul v-if="uc.rows.length > 0" class="lob-tree">
+          <li
+            v-for="(row, idx) in uc.rows"
+            :key="idx"
+            :class="['lob-row', 'lob-' + row.kind]"
+            :style="{paddingLeft: row.depth * 1.15 + 'rem'}"
+          >
+            <i v-if="row.icon" :class="['lob-icon', 'fa-solid', row.icon]" aria-hidden="true"></i>
+            <span v-if="row.label" class="visually-hidden">{{ row.label }}</span>
+            <span class="lob-text">{{ row.text }}</span>
+          </li>
+        </ul>
+        <p v-else class="lob-none">No specific obligations.</p>
+      </div>
+
+      <p v-if="lic.sections.length === 0" class="lob-none">No obligation checklist published for this license.</p>
+    </section>
   </div>
 </template>
 
 <script>
-import {spdxLicenseUrl} from '../helpers/links.js';
-
 // Conditions that hold a condition -> subtree map directly, rendered as "<label> <condition>". EITHER IF
 // / OR IF are handled separately in flatten() because they wrap their conditions in numbered alternative
 // branches (like EITHER / OR); anything not a known keyword is a named obligation/qualifier shown verbatim.
@@ -85,6 +71,14 @@ function isEmpty(value) {
   return false;
 }
 
+// How complete the information is, in one word. "Obligations" is a strict superset of "Details": it means
+// OSADL publishes an actual checklist for at least one constituent, so the panel answers what you have to
+// do. Without one, all we have is classification, and promising obligations we cannot deliver would be
+// worse than naming the smaller thing.
+export function obligationsLabel(entries) {
+  return entries.some(entry => !isEmpty(entry.use_cases)) ? 'Obligations' : 'Details';
+}
+
 export default {
   name: 'LicenseObligations',
   props: {
@@ -100,17 +94,7 @@ export default {
     // AOMPL-1.0 has no checklist), so the obligations shown are clearly attributed to BSD-2-Clause.
     label: {type: String, default: ''}
   },
-  data() {
-    return {open: false};
-  },
   computed: {
-    // How complete the information is, in one word. "Obligations" is a strict superset of "Details":
-    // it means OSADL publishes an actual checklist for at least one constituent, so the panel answers
-    // what you have to do. Without one, all we have is classification, and promising obligations we
-    // cannot deliver would be worse than naming the smaller thing.
-    toggleLabel() {
-      return this.entries.some(entry => !isEmpty(entry.use_cases)) ? 'Obligations' : 'Details';
-    },
     // Credit only the sources that actually contributed to this panel - OSADL requires attribution
     // (CC-BY-4.0) and naming a source that said nothing here would be misleading either way. SPDX
     // comes first, matching the order its flags appear in within each attributes row.
@@ -142,7 +126,6 @@ export default {
     licenses() {
       return this.entries.map(entry => ({
         license: entry.license,
-        spdxUrl: spdxLicenseUrl(entry.license),
         attrs: this.attributes(entry),
         sections: this.useCaseSections(entry)
       }));
@@ -296,66 +279,27 @@ export default {
 
 <style scoped>
 .license-obligations {
-  margin-top: 0.4rem;
-}
-
-/* Quiet, in-row toggle - the license list stays as clean as before until a reviewer opens it. */
-.license-obligations-toggle {
-  align-items: center;
-  appearance: none;
-  background: transparent;
-  border: 0;
-  color: #57606a;
-  cursor: pointer;
-  display: inline-flex;
-  font: inherit;
-  font-size: 12px;
-  font-weight: 600;
-  gap: 0.4rem;
-  letter-spacing: 0.01em;
-  padding: 0.1rem 0;
-}
-/* :focus-visible, not :focus, so a mouse click does not leave the toggle stuck blue after it keeps
-   focus - keyboard users still get the colour cue. */
-.license-obligations-toggle:hover,
-.license-obligations-toggle:focus-visible {
-  color: #0969da;
-}
-.license-obligations-toggle i {
-  color: #8c959f;
-  width: 0.7rem;
-}
-
-/* A full-width section of the license row, not a card floating inside it: negative horizontal margins
-   cancel the .risk-license-item padding so the top rule spans edge to edge, and content re-pads to stay
-   aligned with the license name above. */
-.license-obligations-body {
-  border-top: 1px solid #d8dee4;
-  margin: 0.5rem -1rem 0;
   position: relative;
 }
-.lob-license {
-  padding: 0.7rem 1rem;
-}
-/* Separator only BETWEEN license sections (expressions) - never above the first one, which would draw a
-   stray line under the caveat / below the toggle. */
 .lob-license + .lob-license {
-  border-top: 1px solid #eaeef2;
+  border-top: 1px solid var(--cavil-neutral-bg);
+  margin-top: 1rem;
+  padding-top: 1rem;
 }
 
 /* Caveat for a "WITH exception" license (base license shown; exception may relax it). Muted amber - a
    caution, not a deep-red risk signal. Extra right margin keeps it clear of the OSADL corner label. */
 .lob-caveat {
   align-items: baseline;
-  color: #6e5200;
+  color: var(--cavil-attention-deep-4);
   display: flex;
   font-size: 12px;
   gap: 0.45rem;
   line-height: 1.4;
-  margin: 0.6rem 4rem 0 1rem;
+  margin: 0 4rem 0.8rem 0;
 }
 .lob-caveat i {
-  color: #9a6700;
+  color: var(--cavil-attention);
   flex: 0 0 auto;
   font-size: 11px;
 }
@@ -364,8 +308,8 @@ export default {
   font-weight: 600;
   margin: 0 0 0.5rem;
 }
-.lob-license-name .spdx-link {
-  color: #1f2328;
+.lob-license-name .license-link {
+  color: var(--cavil-fg);
 }
 
 /* Verified classification facts, "low tech report" style: small-caps muted label + plain value. */
@@ -386,14 +330,14 @@ export default {
   gap: 0.4rem;
 }
 .lob-attr dt {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 .lob-attr dd {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 12px;
   font-weight: 500;
   margin: 0;
@@ -406,7 +350,7 @@ export default {
   margin-top: 0;
 }
 .lob-usecase-label {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.05em;
@@ -422,7 +366,7 @@ export default {
 }
 .lob-row {
   align-items: baseline;
-  color: #1f2328;
+  color: var(--cavil-fg);
   display: flex;
   font-size: 13px;
   gap: 0.45rem;
@@ -443,10 +387,10 @@ export default {
 /* Obligations: distinguished by icon SHAPE (check vs cross), with only a muted tint - deep reds are
    reserved for risk signals elsewhere, so must-not uses a calm terracotta rather than a signal red. */
 .lob-must .lob-icon {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
 }
 .lob-mustnot .lob-icon {
-  color: #a0562d;
+  color: var(--cavil-attention-deep-7);
 }
 
 /* Conditions and alternatives read as group headers, not code: muted branch icon, semibold (not italic)
@@ -458,30 +402,30 @@ export default {
 }
 .lob-condition .lob-icon,
 .lob-alt .lob-icon {
-  color: #8c959f;
+  color: var(--cavil-fg-disabled);
 }
 .lob-condition .lob-text,
 .lob-alt .lob-text,
 .lob-group .lob-text {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-weight: 600;
 }
 
 /* Leaf qualifiers: quiet, dash-led, so the "how" recedes behind the obligation itself. */
 .lob-attribute .lob-text {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   font-size: 12px;
 }
 /* Leaf qualifiers and named sub-group headers share one dash marker so every item at a level is
    marked consistently; weight (group is semibold, qualifier muted) carries the hierarchy. */
 .lob-attribute .lob-text::before,
 .lob-group .lob-text::before {
-  color: #8c959f;
+  color: var(--cavil-fg-disabled);
   content: '– ';
 }
 
 .lob-none {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   font-size: 12px;
   font-style: italic;
   margin: 0;
@@ -490,13 +434,13 @@ export default {
 /* Source credit floated top-right, mirroring the "OSADL verdict" label on the compatibility matrix.
    Absolute so it does not take its own line; room for other sources beside OSADL later. */
 .lob-source {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.02em;
   position: absolute;
-  right: 1rem;
+  right: 0;
   text-transform: uppercase;
-  top: 0.5rem;
+  top: 0;
 }
 </style>

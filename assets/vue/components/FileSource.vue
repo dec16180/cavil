@@ -1,5 +1,5 @@
 <template>
-  <table class="snippet" :class="{'editor-open': inlineEditor}">
+  <table class="snippet" :class="{'editor-open': inlineEditor, 'is-picking': picking}">
     <colgroup>
       <col v-if="!readOnly" class="snippet-col-actions" />
       <col class="snippet-col-linenumber" :style="lineNumberColumnStyle" />
@@ -7,6 +7,19 @@
       <col v-if="!readOnly" class="snippet-col-quick-actions" />
     </colgroup>
     <tbody>
+      <tr v-if="fileWindow && fileWindow.from > 1">
+        <td
+          class="source-gap source-window"
+          :class="{'has-matches': fileWindow.matchesAbove > 0}"
+          :colspan="tableColspan"
+        >
+          <button type="button" @click="$emit('page', 'previous')">
+            Show previous lines<template v-if="fileWindow.matchesAbove > 0">
+              · {{ matchCount(fileWindow.matchesAbove) }} above</template
+            >
+          </button>
+        </td>
+      </tr>
       <!-- eslint-disable-next-line vue/no-v-for-template-key -->
       <template v-for="(line, idx) in lines" :key="idx">
         <tr v-if="line[1].withgap">
@@ -15,11 +28,22 @@
         <tr
           v-if="!isHiddenByEditor(line)"
           :id="matchStartId(line)"
-          :class="rowClass(line[1])"
-          @mouseenter="onRowEnter($event, line[1])"
+          :class="[rowClass(line[1]), rangeClass(line[0])]"
+          @mouseenter="onRowEnter($event, line)"
           @mouseleave="onRowLeave"
         >
-          <td v-if="!readOnly && !showActions(line[1])" class="actions"></td>
+          <td v-if="!readOnly && !showActions(line)" class="actions">
+            <a
+              v-if="canSelectLines"
+              href="#"
+              class="snippet-tool-btn select-line-btn"
+              :title="selectLabel"
+              :aria-label="selectLabel"
+              @click.prevent="selectLine(line[0], $event)"
+            >
+              <i class="fa-solid fa-plus"></i>
+            </a>
+          </td>
           <td v-else-if="!readOnly" class="actions dropdown show">
             <a
               href="#"
@@ -34,22 +58,17 @@
               <i class="actions-menu fa-solid fa-ellipsis-vertical"></i>
             </a>
             <div class="dropdown-menu" :aria-labelledby="'dropdownMenuLink-' + fileId + '-' + line[0]">
-              <!-- Any snippet-backed line (unresolved, folded, cleared, or covered) edits the snippet
-                   to create or correct a pattern; a folded/cleared/covered line is how a reviewer fixes
-                   a wrong derived resolution. -->
+              <!-- A folded/cleared/covered line edits its snippet, which is how a reviewer corrects a
+                   wrong derived resolution -->
               <a
-                v-if="line[1].snippet"
+                v-if="rowRange(line)"
                 class="dropdown-item"
-                :href="editSnippetUrl(line[1].snippet, line[1].hash)"
-                @click="onCreateClick($event, line, line[1].snippet)"
-                >{{ snippetActionLabel(line[1]) }}</a
+                :href="rangeUrl(rowRange(line))"
+                @click="openRange($event, rowRange(line))"
+                >{{ rowRange(line).label }}</a
               >
-              <a
-                v-else-if="line[1].risk === 9"
-                class="dropdown-item"
-                :href="newSnippetUrl(line[0], line[1].end, line[1].hash)"
-                @click="onCreateClick($event, line, null)"
-                >Create Pattern from selection</a
+              <a v-if="selectionStartsHere(line)" href="#" class="dropdown-item" @click.prevent="clearSelection"
+                >Clear selection</a
               >
               <a
                 v-if="line[1].pid != null"
@@ -57,47 +76,70 @@
                 :href="editPatternUrl(line[1].pid)"
                 target="_blank"
                 rel="noopener"
-                >Show Pattern</a
+                >Show pattern</a
+              >
+              <a v-if="canIgnoreMatch(line)" href="#" class="dropdown-item" @click.prevent="openIgnore(line)"
+                >Ignore this match</a
+              >
+              <a v-if="fileUrl" class="dropdown-item" :href="lineUrl(line[0])" target="_blank" rel="noopener"
+                >View in file at line {{ line[0] }}</a
               >
 
-              <template v-if="line[0] > 1">
-                <div class="dropdown-divider"></div>
-                <a
-                  v-if="line[1].prevstart"
-                  href="#"
-                  class="dropdown-item"
-                  @click.prevent="emitExtend('match-above', line)"
-                  >Extend to match above</a
-                >
-                <a href="#" class="dropdown-item" @click.prevent="emitExtend('one-line-above', line)"
-                  >Extend one line above</a
-                >
-                <a href="#" class="dropdown-item" @click.prevent="emitExtend('top', line)">Extend to the top of file</a>
-              </template>
+              <template v-if="fileId > 0">
+                <template v-if="line[0] > 1">
+                  <div class="dropdown-divider"></div>
+                  <a
+                    v-if="extendRange(line).prevstart"
+                    href="#"
+                    class="dropdown-item"
+                    @click.prevent="emitExtend('match-above', extendRange(line))"
+                    >Extend to match above</a
+                  >
+                  <a href="#" class="dropdown-item" @click.prevent="emitExtend('one-line-above', extendRange(line))"
+                    >Extend one line above</a
+                  >
+                  <a href="#" class="dropdown-item" @click.prevent="emitExtend('top', extendRange(line))"
+                    >Extend to the top of file</a
+                  >
+                </template>
 
-              <template v-if="line[1].end">
+                <template v-if="extendRange(line).end">
+                  <div class="dropdown-divider"></div>
+                  <a
+                    v-if="extendRange(line).nextend"
+                    href="#"
+                    class="dropdown-item"
+                    @click.prevent="emitExtend('match-below', extendRange(line))"
+                    >Extend to match below</a
+                  >
+                  <a href="#" class="dropdown-item" @click.prevent="emitExtend('one-line-below', extendRange(line))"
+                    >Extend one line below</a
+                  >
+                  <a href="#" class="dropdown-item" @click.prevent="emitExtend('bottom', extendRange(line))"
+                    >Extend to the end of the file</a
+                  >
+                </template>
+
                 <div class="dropdown-divider"></div>
-                <a
-                  v-if="line[1].nextend"
-                  href="#"
-                  class="dropdown-item"
-                  @click.prevent="emitExtend('match-below', line)"
-                  >Extend to match below</a
-                >
-                <a href="#" class="dropdown-item" @click.prevent="emitExtend('one-line-below', line)"
-                  >Extend one line below</a
-                >
-                <a href="#" class="dropdown-item" @click.prevent="emitExtend('bottom', line)"
-                  >Extend to the end of the file</a
+                <a href="#" class="dropdown-item" @click.prevent="emitExtend('reset', extendRange(line))"
+                  >Reset selection</a
                 >
               </template>
-
-              <div class="dropdown-divider"></div>
-              <a href="#" class="dropdown-item" @click.prevent="emitExtend('reset', line)">Reset selection</a>
             </div>
           </td>
 
-          <td class="linenumber" :style="lineNumberColumnStyle">{{ line[0] }}</td>
+          <td
+            class="linenumber"
+            :class="{selectable: canSelectLines}"
+            :style="lineNumberColumnStyle"
+            :title="canSelectLines ? selectLabel : null"
+            @click="selectLine(line[0])"
+          >
+            <a v-if="fileUrl && !canSelectLines" :href="lineUrl(line[0])" target="_blank" rel="noopener">{{
+              line[0]
+            }}</a>
+            <template v-else>{{ line[0] }}</template>
+          </td>
           <td class="code">
             {{ line[2] }}<span v-if="derivedBadge(line)" class="derived-badge">{{ derivedBadge(line) }}</span>
             <PendingActionIndicator
@@ -130,19 +172,19 @@
             </a>
           </td>
 
-          <td v-if="!readOnly && line[1].end && line[1].risk === 9" class="quick-actions">
+          <td v-if="!readOnly" class="quick-actions">
             <a
-              :href="newSnippetUrl(line[0], line[1].end, line[1].hash)"
+              v-if="penRange(line)"
+              :href="rangeUrl(penRange(line))"
               class="snippet-tool-btn"
               target="_blank"
-              title="Create pattern from selection"
-              aria-label="Create pattern from selection"
-              @click="onCreateClick($event, line, line[1].snippet || null)"
+              :title="penRange(line).label"
+              :aria-label="penRange(line).label"
+              @click="openRange($event, penRange(line))"
             >
               <i class="fa-solid fa-pen-to-square"></i>
             </a>
           </td>
-          <td v-else-if="!readOnly" class="quick-actions"></td>
         </tr>
         <tr v-if="!readOnly && inlineEditor && inlineEditor.startLine === line[0]" class="inline-editor-row">
           <td colspan="4">
@@ -150,6 +192,7 @@
               <SnippetEditor
                 :key="inlineEditor.key"
                 :snippet-id="inlineEditor.snippetId"
+                :file-id="fileId"
                 :hash="inlineEditor.hash"
                 :from="inlineEditor.from"
                 :initial="inlineEditor.initial"
@@ -163,6 +206,19 @@
           </td>
         </tr>
       </template>
+      <tr v-if="fileWindow && fileWindow.more">
+        <td
+          class="source-gap source-window"
+          :class="{'has-matches': fileWindow.matchesBelow > 0}"
+          :colspan="tableColspan"
+        >
+          <button type="button" @click="$emit('page', 'next')">
+            Show next lines<template v-if="fileWindow.matchesBelow > 0">
+              · {{ matchCount(fileWindow.matchesBelow) }} below</template
+            >
+          </button>
+        </td>
+      </tr>
     </tbody>
   </table>
 </template>
@@ -172,13 +228,18 @@ import PendingActionIndicator from './PendingActionIndicator.vue';
 import SnippetEditor from './SnippetEditor.vue';
 import {patternIdsFromInfo, showPatternTooltip} from '../helpers/patternTooltip.js';
 import {showResolutionTooltip} from '../helpers/resolutionTooltip.js';
+import {snippetRangeUrl} from '../helpers/snippetDecisions.js';
 
 export default {
   name: 'FileSource',
   components: {PendingActionIndicator, SnippetEditor},
   props: {
     lines: {type: Array, required: true},
+    fileWindow: {type: Object, default: null},
+    fileUrl: {type: String, default: ''},
+    targetLine: {type: Number, default: 0},
     fileId: {type: Number, required: true},
+    packageId: {type: Number, default: 0},
     filename: {type: String, default: ''},
     packname: {type: String, default: ''},
     hasAdminRole: {type: Boolean, default: false},
@@ -187,13 +248,41 @@ export default {
     inlineEditor: {type: Object, default: null},
     readOnly: {type: Boolean, default: false}
   },
-  emits: ['extend', 'open-editor', 'dismiss-action', 'close-editor', 'editor-submit'],
+  emits: ['page', 'extend', 'open-editor', 'ignore-match', 'dismiss-action', 'close-editor', 'editor-submit'],
   data() {
-    return {hoveredGroup: null, activeTooltip: null, pendingCompensation: null, dropdownOpen: false};
+    return {
+      hoveredGroup: null,
+      activeTooltip: null,
+      pendingCompensation: null,
+      dropdownOpen: false,
+
+      pickAnchor: null,
+      pickHover: null,
+      selection: null
+    };
   },
   computed: {
     isAdminOrContributor() {
       return this.hasAdminRole || this.hasContributorRole;
+    },
+
+    // A file that matched nothing has no id, and is exactly where a pattern has to start
+    canSelectLines() {
+      return !this.readOnly && this.isAdminOrContributor && (this.fileId > 0 || this.packageId > 0);
+    },
+
+    picking() {
+      return this.pickAnchor !== null;
+    },
+
+    selectLabel() {
+      return this.picking ? 'Finish the selection here' : 'Start a selection here';
+    },
+
+    preview() {
+      if (!this.picking) return null;
+      const reach = this.pickHover ?? this.pickAnchor;
+      return {start: Math.min(this.pickAnchor, reach), end: Math.max(this.pickAnchor, reach)};
     },
     tableColspan() {
       return this.readOnly ? 2 : 4;
@@ -211,8 +300,8 @@ export default {
         const info = line[1];
         if (info.risk === 9 && info.end) {
           map.set(info.end, {
-            startLine: line[0],
-            endLine: info.end,
+            start: line[0],
+            end: info.end,
             prevstart: info.prevstart || 0,
             nextend: info.nextend || 0
           });
@@ -257,6 +346,7 @@ export default {
     }
   },
   mounted() {
+    document.addEventListener('keydown', this.onKeyDown);
     // Bootstrap dropdown events bubble to the table root. When a row's action menu opens, hide the hover
     // tooltip and keep it suppressed until the menu closes, so the two never overlap; it comes back the
     // next time the cursor moves onto a row.
@@ -264,6 +354,7 @@ export default {
     this.$el.addEventListener('hidden.bs.dropdown', this.onDropdownHidden);
   },
   beforeUnmount() {
+    document.removeEventListener('keydown', this.onKeyDown);
     this.$el.removeEventListener('show.bs.dropdown', this.onDropdownShow);
     this.$el.removeEventListener('hidden.bs.dropdown', this.onDropdownHidden);
     if (this.activeTooltip) this.activeTooltip.destroy();
@@ -272,7 +363,7 @@ export default {
     rowClass(info) {
       // Only tag rows that actually correspond to a match (license pattern
       // or unresolved snippet). The server hands back `risk: 0` for plain
-      // context lines too — coloring those would paint the entire snippet
+      // context lines too - coloring those would paint the entire snippet
       // preview, defeating the highlight.
       const classes = [];
       if (info.pid != null || info.snippet != null) classes.push(`risk-${info.risk}`);
@@ -301,6 +392,10 @@ export default {
       if (info.snippet != null) return `s${info.snippet}`;
       return null;
     },
+    onKeyDown(event) {
+      if (event.key === 'Escape' && (this.picking || this.selection)) this.clearSelection();
+    },
+
     onDropdownShow() {
       this.dropdownOpen = true;
       this.hideTooltip();
@@ -308,7 +403,9 @@ export default {
     onDropdownHidden() {
       this.dropdownOpen = false;
     },
-    onRowEnter(event, info) {
+    onRowEnter(event, line) {
+      const info = line[1];
+      if (this.picking) this.pickHover = line[0];
       this.hoveredGroup = this.groupKey(info);
       // An open action menu owns the row; don't pop a tooltip over it until it closes.
       if (this.dropdownOpen) return;
@@ -358,14 +455,139 @@ export default {
       if (info.risk !== 9 || !info.end) return null;
       return `line-${this.fileId}-${line[0]}`;
     },
-    showActions(info) {
-      return !this.readOnly && this.isAdminOrContributor && this.fileId > 0 && info.end;
+    showActions(line) {
+      if (this.readOnly || !this.isAdminOrContributor) return false;
+      return Boolean(line[1].end && this.fileId > 0) || this.selectionStartsHere(line);
+    },
+
+    // What the row's menu entry, button, link and click all act on, so they cannot describe different
+    // ranges: the picked selection where it starts, otherwise the match group it heads
+    rowRange(line) {
+      if (this.selectionStartsHere(line)) {
+        const {start, end} = this.selection;
+        return {
+          start,
+          end,
+          hash: null,
+          snippetId: null,
+          label: start === end ? 'Create Pattern from line' : 'Create Pattern from selection',
+          isSelection: true
+        };
+      }
+      const info = line[1];
+      if (!info.end || (!info.snippet && info.risk !== 9)) return null;
+      return {
+        start: line[0],
+        end: info.end,
+        hash: info.hash ?? null,
+
+        // An extended range comes back marked with a synthetic snippet 0, which is not a snippet to edit
+        snippetId: info.snippet || null,
+        label: this.snippetActionLabel(info),
+        isSelection: false
+      };
+    },
+
+    penRange(line) {
+      const range = this.rowRange(line);
+      if (range === null) return null;
+      return range.isSelection || line[1].risk === 9 ? range : null;
+    },
+
+    // The shape the link, the editor and the fetch behind it all speak
+    rangeRef(range) {
+      return {
+        fileId: this.fileId,
+        packageId: this.packageId,
+        filePath: this.filename,
+        from: this.packname,
+        startLine: range.start,
+        endLine: range.end,
+        hash: range.hash
+      };
+    },
+
+    rangeUrl(range) {
+      if (range.snippetId) return this.editSnippetUrl(range.snippetId, range.hash);
+      return snippetRangeUrl(this.rangeRef(range));
+    },
+
+    openRange(event, range) {
+      event.preventDefault();
+      this.hideTooltip();
+      if (range.isSelection) this.clearSelection();
+      this.$emit('open-editor', {...this.rangeRef(range), snippetId: range.snippetId});
+    },
+
+    // A resolved licensed match (has a license pattern, so risk != 9, and no derived snippet). Gated on the
+    // curator capability (hasAdminRole = current_user_can('curate')), like every other create action; this
+    // is a correction path, not a proposal.
+    canIgnoreMatch(line) {
+      const info = line[1];
+      return this.hasAdminRole && info.pid != null && info.risk !== 9 && !info.snippet;
+    },
+
+    // Ignoring a match needs no editing, so the host stages it straight away instead of opening the editor.
+    // pid + line resolve the hash from the match's stored range (which can differ from the rendered group
+    // under overlaps); startLine/endLine are the displayed range the pending-action marker attaches to.
+    openIgnore(line) {
+      this.hideTooltip();
+      this.$emit('ignore-match', {
+        fileId: this.fileId,
+        from: this.packname,
+        filePath: this.filename,
+        pid: line[1].pid,
+        line: line[0],
+        startLine: line[0],
+        endLine: line[1].end ?? line[0]
+      });
+    },
+
+    selectionStartsHere(line) {
+      return this.selection !== null && this.selection.start === line[0];
+    },
+
+    // Anchor, then confirm, with the preview between them: no click produces a range that was not shown
+    // first
+    selectLine(lineNumber, event = null) {
+      if (!this.canSelectLines) return;
+
+      // Focus keeps a button visible, so a mouse click would leave its + behind. Keyboard activation
+      // (detail 0) keeps focus, or the ring is lost.
+      if (event?.detail > 0) event.currentTarget.blur();
+
+      if (!this.picking) {
+        this.selection = null;
+        this.pickAnchor = lineNumber;
+        this.pickHover = lineNumber;
+        return;
+      }
+      this.selection = this.preview;
+      this.pickAnchor = null;
+      this.pickHover = null;
+    },
+
+    clearSelection() {
+      this.selection = null;
+      this.pickAnchor = null;
+      this.pickHover = null;
+    },
+
+    rangeClass(lineNumber) {
+      if (lineNumber === this.targetLine) return ['line-target'];
+      const preview = this.preview;
+      if (preview && lineNumber >= preview.start && lineNumber <= preview.end) {
+        return lineNumber === this.pickAnchor ? ['line-preview', 'line-anchor'] : ['line-preview'];
+      }
+      const selection = this.selection;
+      if (selection && lineNumber >= selection.start && lineNumber <= selection.end) return ['line-selected'];
+      return [];
     },
     snippetActionLabel(info) {
       if (info.folded) return 'Correct this fold';
       if (info.cleared) return info.clearReason === 'overlap' ? 'Review redundant text' : 'Review cleared text';
       if (info.covered) return 'Review covered snippet';
-      return 'Create Pattern from selection';
+      return 'Create Pattern from match';
     },
     derivedBadge(line) {
       const info = line[1];
@@ -393,46 +615,35 @@ export default {
     onDismiss(action) {
       this.$emit('dismiss-action', action.id);
     },
-    onCreateClick(event, line, snippetId) {
-      event.preventDefault();
-      this.hideTooltip();
-      this.$emit('open-editor', {
-        snippetId: snippetId ?? null,
-        fileId: this.fileId,
-        startLine: line[0],
-        endLine: line[1].end,
-        hash: line[1].hash ?? null,
-        from: this.packname,
-        filePath: this.filename
-      });
-    },
     hideTooltip() {
       this.hoveredGroup = null;
       if (!this.activeTooltip) return;
       this.activeTooltip.destroy();
       this.activeTooltip = null;
     },
-    newSnippetUrl(start, end, hash) {
-      const qs = new URLSearchParams({from: this.packname});
-      if (hash) qs.set('hash', hash);
-      return `/snippets/from_file/${this.fileId}/${start}/${end}?${qs.toString()}`;
-    },
     editSnippetUrl(id, hash) {
       const params = {from: this.packname};
       if (hash) params.hash = hash;
       return `/snippet/edit/${id}?${new URLSearchParams(params).toString()}`;
     },
+    lineUrl(lineNumber) {
+      return `${this.fileUrl}#L${lineNumber}`;
+    },
+    matchCount(count) {
+      return `${count} ${count === 1 ? 'match' : 'matches'}`;
+    },
     editPatternUrl(id) {
       return `/licenses/edit_pattern/${id}`;
     },
-    emitExtend(kind, line) {
-      this.$emit('extend', {
-        kind,
-        start: line[0],
-        end: line[1].end,
-        prevstart: line[1].prevstart || 0,
-        nextend: line[1].nextend || 0
-      });
+    // Like rowRange: a picked selection extends itself, not the match its first row happens to sit in
+    extendRange(line) {
+      if (this.selectionStartsHere(line)) return {...this.selection, prevstart: 0, nextend: 0};
+      const info = line[1];
+      return {start: line[0], end: info.end, prevstart: info.prevstart || 0, nextend: info.nextend || 0};
+    },
+    emitExtend(kind, range) {
+      this.clearSelection();
+      this.$emit('extend', {kind, ...range});
     },
     canExtendUp(line) {
       return !this.readOnly && this.isAdminOrContributor && line[1].risk === 9 && line[1].end && line[0] > 1;
@@ -442,19 +653,13 @@ export default {
     },
     onExtendUp(event, line) {
       this.scheduleCompensation(event, 'one-line-above', line[0] - 1);
-      this.emitExtend('one-line-above', line);
+      this.emitExtend('one-line-above', this.extendRange(line));
     },
     onExtendDown(event, endLine) {
       const meta = this.matchExtents.get(endLine);
       if (!meta) return;
       this.scheduleCompensation(event, 'one-line-below', endLine + 1);
-      this.$emit('extend', {
-        kind: 'one-line-below',
-        start: meta.startLine,
-        end: meta.endLine,
-        prevstart: meta.prevstart,
-        nextend: meta.nextend
-      });
+      this.emitExtend('one-line-below', meta);
     },
     scheduleCompensation(event, kind, targetLine) {
       // Capture the button's viewport y BEFORE the re-render. The watcher on
@@ -475,7 +680,7 @@ export default {
    would feed its intrinsic content width back into the table's column
    distribution, and the editor would visibly resize while the user scrolled
    through long patterns. Fixed layout with explicit col widths breaks that
-   loop — the editor's content can never push the column wider. */
+   loop - the editor's content can never push the column wider. */
 .source .snippet {
   table-layout: fixed;
   width: 100%;
@@ -489,10 +694,73 @@ export default {
   padding: 0 0.35em 0 0.25em;
   width: auto;
 }
+.source .snippet td.linenumber.selectable {
+  cursor: pointer;
+}
+/* Painted on the row so the buttons sit inside the range rather than beside it. Blue: the risk palette is
+   spoken for, and a dashed border already means a derived resolution. */
+.snippet tr.line-preview {
+  background-color: var(--cavil-accent-tint-3);
+}
+.snippet tr.line-anchor {
+  box-shadow: inset 3px 0 0 var(--cavil-accent);
+  animation: legal-line-anchor 1.6s ease-in-out infinite;
+}
+.snippet tr.line-selected {
+  background-color: var(--cavil-accent-bg);
+  box-shadow: inset 3px 0 0 var(--cavil-accent);
+}
+/* A linked line. A row tint would hide the risk colour of a match, so it gets a pointer in the 1ch of slack
+   lineNumberColumnStyle leaves left of the number instead. */
+.source .snippet tr.line-target td.linenumber {
+  color: var(--cavil-fg);
+  font-weight: 600;
+  position: relative;
+}
+.source .snippet tr.line-target td.linenumber::before {
+  border-bottom: 5px solid transparent;
+  border-left: 6px solid var(--cavil-fg);
+  border-top: 5px solid transparent;
+  content: '';
+  left: 0.25em;
+  position: absolute;
+  top: calc(50% - 5px);
+}
+.source .snippet td.linenumber a {
+  color: inherit;
+  text-decoration: none;
+}
+.source .snippet td.linenumber a:hover {
+  color: var(--cavil-accent);
+}
+@keyframes legal-line-anchor {
+  50% {
+    box-shadow: inset 3px 0 0 rgba(var(--cavil-accent-rgb), 0.35);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .snippet tr.line-anchor {
+    animation: none;
+  }
+}
+/* Hovering a match row reveals the whole group's controls, which was written when only the match-start
+   row had any: the gutter + belongs to the row under the pointer alone, or a 20-line group lights up 20
+   of them at once. */
+.snippet tr.group-hovered:not(:hover) .select-line-btn {
+  opacity: 0;
+}
+/* What acts on a live range stays put; the gutter + is not one of those and stays hover-only */
+.snippet tr.line-selected .snippet-tool-btn:not(.select-line-btn) {
+  opacity: 1;
+}
+/* Mid-pick there is exactly one thing to click */
+.snippet.is-picking .snippet-tool-btn:not(.select-line-btn) {
+  display: none;
+}
 .snippet .inline-editor-row > td {
-  background: #ffffff;
-  border-top: 1px solid #d0d7de !important;
-  border-bottom: 1px solid #d0d7de !important;
+  background: var(--cavil-canvas);
+  border-top: 1px solid var(--cavil-border) !important;
+  border-bottom: 1px solid var(--cavil-border) !important;
   padding: 12px 16px !important;
 }
 .snippet .inline-editor-row #inline-snippet-editor .snippet-editor {
@@ -513,9 +781,9 @@ export default {
   position: relative;
 }
 .snippet td.source-gap {
-  background: #f6f8fa;
+  background: var(--cavil-canvas-subtle);
   border: 0 !important;
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   font-family: inherit;
   font-size: 11px;
   letter-spacing: 0;
@@ -526,7 +794,7 @@ export default {
   user-select: none;
 }
 .snippet td.source-gap::before {
-  background: #d0d7de;
+  background: var(--cavil-border);
   content: '';
   height: 1px;
   left: 12px;
@@ -535,12 +803,49 @@ export default {
   top: 50%;
 }
 .snippet td.source-gap span {
-  background: #f6f8fa;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas-subtle);
+  border: 1px solid var(--cavil-border);
   border-radius: 999px;
   padding: 1px 8px;
   position: relative;
   z-index: 1;
+}
+/* Window boundaries of a file too large to show at once: the skipped-lines pill as a button, amber when
+   matches sit on the far side. As first or last row the strip tucks inside the panel's rounded corners,
+   which the panel cannot clip itself without cutting off row action menus. */
+.snippet tr:first-child td.source-window {
+  border-top-left-radius: 5px;
+  border-top-right-radius: 5px;
+}
+.snippet tr:last-child td.source-window {
+  border-bottom-left-radius: 5px;
+  border-bottom-right-radius: 5px;
+}
+.snippet td.source-window button {
+  background: var(--cavil-canvas-subtle);
+  border: 1px solid var(--cavil-border);
+  border-radius: 999px;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 1px 8px;
+  position: relative;
+  z-index: 1;
+}
+.snippet td.source-window button:hover,
+.snippet td.source-window button:focus-visible {
+  border-color: var(--cavil-accent);
+  color: var(--cavil-accent);
+}
+.snippet td.source-window.has-matches {
+  color: var(--cavil-attention-deep-2);
+}
+.snippet td.source-window.has-matches::before {
+  background: var(--cavil-attention-4);
+}
+.snippet td.source-window.has-matches button {
+  background: var(--cavil-attention-tint-1);
+  border-color: var(--cavil-attention-4);
 }
 /* Derived resolutions keep the risk/clear tint in the code area, but the gutter stays neutral.
    A dashed boundary and first-line badge mark the row as machine-derived without making it look like
@@ -553,7 +858,7 @@ export default {
 .snippet tr.folded td.code::before,
 .snippet tr.cleared td.code::before,
 .snippet tr.covered td.code::before {
-  border-left: 1px dashed #8c959f;
+  border-left: 1px dashed var(--cavil-fg-disabled);
   bottom: 0;
   content: '';
   left: 0;
@@ -564,7 +869,7 @@ export default {
    noise; their first-line badge ("cleared" vs "covered") is what tells them apart. */
 .snippet tr.cleared td.code,
 .snippet tr.covered td.code {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   font-style: italic;
 }
 /* A derived row explains itself through the resolution tooltip on hover, so flag it with the help
@@ -577,12 +882,12 @@ export default {
    grey title header are the shared .cavil-pattern-tip styling (kept identical on purpose), except the
    header gets a bottom border so it is symmetric with the bordered footer. */
 .cavil-resolution-tip .cavil-pattern-tip-header {
-  border-bottom: 1px solid #d1d9e0b3;
+  border-bottom: 1px solid var(--cavil-border-translucent);
 }
 /* A per-variant icon on the left of the title makes fold vs clear vs overlap vs covered legible at a
    glance without reading the text. */
 .cavil-resolution-tip-icon {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   margin-right: 6px;
   width: 12px;
 }
@@ -591,7 +896,7 @@ export default {
 }
 /* The lead sentence is context; keep it muted so the metric rows below carry the visual weight. */
 .cavil-resolution-tip-lead {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
 }
 .cavil-resolution-tip-metrics {
   align-items: baseline;
@@ -602,14 +907,14 @@ export default {
   row-gap: 3px;
 }
 .cavil-resolution-tip-metric-label {
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 .cavil-resolution-tip-metric-value {
-  color: #1f2328;
+  color: var(--cavil-fg);
   margin: 0;
   text-align: right;
 }
@@ -618,14 +923,14 @@ export default {
   font-size: 10px;
 }
 .cavil-resolution-tip-hint {
-  background: #f6f8fa;
-  border-top: 1px solid #d1d9e0b3;
-  color: #59636e;
+  background: var(--cavil-canvas-subtle);
+  border-top: 1px solid var(--cavil-border-translucent);
+  color: var(--cavil-fg-muted-alt);
   font-style: italic;
   padding: 6px 11px;
 }
 .snippet .derived-badge {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   float: right;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: 11px;
@@ -634,17 +939,17 @@ export default {
   margin: 1px 8px 0 12px;
   padding: 0 1px 1px;
   position: relative;
-  text-decoration: underline dashed #8c959f 1px;
+  text-decoration: underline dashed var(--cavil-fg-disabled) 1px;
   text-underline-offset: 3px;
   z-index: 1;
 }
 .snippet .snippet-tool-btn {
   align-items: center;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid #d0d7de;
+  background: var(--cavil-surface-raised);
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
-  box-shadow: 0 1px 2px rgba(31, 35, 40, 0.08);
-  color: #1f2328;
+  box-shadow: 0 1px 2px rgba(var(--cavil-shadow-alt-rgb), 0.08);
+  color: var(--cavil-fg);
   cursor: pointer;
   display: inline-flex;
   font-size: 13px;
@@ -695,23 +1000,23 @@ export default {
   bottom: -12px;
 }
 .source .snippet .snippet-tool-btn i {
-  color: #1f2328;
+  color: var(--cavil-fg);
 }
 .snippet .snippet-tool-btn:hover {
-  background: #ffffff;
-  box-shadow: 0 2px 4px rgba(31, 35, 40, 0.12);
-  color: #0969da;
+  background: var(--cavil-canvas);
+  box-shadow: 0 2px 4px rgba(var(--cavil-shadow-alt-rgb), 0.12);
+  color: var(--cavil-accent);
 }
 .source .snippet .snippet-tool-btn:hover i {
-  color: #0969da;
+  color: var(--cavil-accent);
 }
 .snippet .snippet-tool-btn:focus {
-  border-color: #0969da;
-  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.3);
-  color: #0969da;
+  border-color: var(--cavil-accent);
+  box-shadow: 0 0 0 3px rgba(var(--cavil-accent-rgb), 0.3);
+  color: var(--cavil-accent);
   outline: none;
 }
 .source .snippet .snippet-tool-btn:focus i {
-  color: #0969da;
+  color: var(--cavil-accent);
 }
 </style>

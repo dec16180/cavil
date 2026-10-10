@@ -1,88 +1,62 @@
-# Copyright (C) 2019 SUSE Linux GmbH
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Model::Snippets;
 use Mojo::Base -base, -signatures;
 
 use Mojo::File  qw(path);
-use Cavil::Util qw(file_and_checksum read_lines);
+use Cavil::Util qw(checkout_path file_and_checksum path_within read_lines);
 use Cavil::ReportUtil
   qw(is_license_filename overlapping_licenses should_clear_boilerplate should_cover_snippet should_fold_snippet should_overlap_clear);
 
 has [qw(checkout_dir pg snippet_fold)];
 
-# The single place the fold/clear/overlap/covered decision is made: for every snippet occurrence in a
-# package compute its resolution and store it on file_snippets.resolution ('fold' / 'clear' / 'overlap'
-# / 'covered' / undef). Called from the analyze task (per reindex) and from `snippets --rescore`; every
-# consumer (report, file browser, SPDX, Classify Snippets) then just reads the column. The gates live in
-# Cavil::ReportUtil and are called only here.
-#
-# The generation says which report to resolve: 0 is the live one, a non-zero value is a reindex building
-# alongside it. Both have their own file_snippets rows, and resolving one must never touch the other.
+# A snippet is "reported" when a contributor/agent has filed a missing-license report against it (a
+# proposed_changes row with action 'missing_license' whose data->>'snippet' is the snippet id) AND no
+# new_license proposal has answered it yet. Excluding already-proposed snippets keeps the triage sweep
+# self-limiting; the underlying report is kept as a fallback (see propose_new_license) and re-enters this
+# set if the proposal is dismissed. Keyed on the id (not token_hexsum) to sidestep the snippet-hash prefix.
+# Shared by snippet_search (MCP) and unclassified (web UI) so both surfaces resolve the same set.
+my $REPORTED_EXISTS
+  = "EXISTS (SELECT 1 FROM proposed_changes pc WHERE pc.action = 'missing_license'"
+  . " AND (pc.data->>'snippet')::bigint = s.id)"
+  . " AND NOT EXISTS (SELECT 1 FROM proposed_changes np WHERE np.action = 'new_license'"
+  . " AND (np.data->>'snippet')::bigint = s.id)";
+
+# Store resolution once so report consumers cannot reimplement or drift from these gates.
+# Keep generations isolated while a reindex builds beside the live report.
 sub resolve_snippets ($self, $package_id, $generation = 0) {
   my $db  = $self->pg->db;
   my $cfg = $self->snippet_fold;
 
-  # Snippets the reviewer has ignored for this package are never resolved (they drop out as ignored
-  # noise), so the stored column reflects that without any consumer needing its own ignore check.
+  # Leave ignored snippets unresolved so consumers need no separate ignore rule.
   my $packname = $db->select('bot_packages', 'name', {id => $package_id})->hash->{name};
   my %ignored  = map { $_->{hash} => 1 } $db->select('ignored_lines', 'hash', {packname => $packname})->hashes->each;
 
-  # Per-file line spans of non-ignored concrete license matches, for overlap detection. Grab-bag markers
-  # (lp.catch_all: "Any floating warranty", "Any CLA", "All Rights Reserved", ...) are excluded, exactly
-  # as they are for the "covered" resolution below: overlap-clear's premise is that the snippet swallowed
-  # a *genuine* license declaration already on the report, and a catch_all marker is not one. Counting it
-  # would clear a snippet that captured a real (possibly novel, higher-risk) license sitting next to some
-  # boilerplate disclaimer - the exact way a custom relicense hides behind a retained BSD/MIT tail.
-  my %spans;
+# Catch-all markers cannot establish coverage; treating them as concrete can hide novel terms.
+  my $cover_scope = ($cfg && $cfg->{enabled}) ? ($cfg->{cover_scope} // 'off') : 'off';
+  my $cover       = $cover_scope ne 'off';
+  my (%spans, %file_cover, %dir_cover, %file_dir);
   for my $m (
     $db->query(
-      "SELECT pm.file, pm.sline, pm.eline, lp.license
-       FROM pattern_matches pm JOIN license_patterns lp ON lp.id = pm.pattern
+      "SELECT pm.file, pm.sline, pm.eline, lp.license, lp.risk, mf.filename
+       FROM pattern_matches pm
+       JOIN license_patterns lp ON lp.id = pm.pattern
+       JOIN matched_files mf ON mf.id = pm.file
       WHERE pm.package = ? AND pm.generation = ? AND pm.ignored = false AND lp.license <> ''
         AND lp.catch_all = false", $package_id, $generation
     )->hashes->each
     )
   {
     push @{$spans{$m->{file}}}, [$m->{sline}, $m->{eline}, $m->{license}];
+    next unless $cover;
+    my $risk = $m->{risk};
+    $file_cover{$m->{file}} = $risk if !defined $file_cover{$m->{file}} || $risk > $file_cover{$m->{file}};
+    my $dir = $m->{filename} =~ s{/[^/]*$}{}r;
+    $dir_cover{$dir} = $risk if !defined $dir_cover{$dir} || $risk > $dir_cover{$dir};
   }
 
-  # Concrete (non-catch_all) license coverage per file and per directory, for the "covered" resolution:
-  # a snippet is redundant when its file - or, at directory scope, its directory - already carries a real
-  # license at least as risky. Grab-bag markers (lp.catch_all) never count as coverage.
-  my $cover_scope = ($cfg && $cfg->{enabled}) ? ($cfg->{cover_scope} // 'off') : 'off';
-  my (%file_cover, %dir_cover, %file_dir);
-  if ($cover_scope ne 'off') {
-    for my $m (
-      $db->query(
-        "SELECT pm.file, lp.risk, mf.filename
-           FROM pattern_matches pm
-           JOIN license_patterns lp ON lp.id = pm.pattern
-           JOIN matched_files mf ON mf.id = pm.file
-          WHERE pm.package = ? AND pm.generation = ? AND pm.ignored = false AND lp.license <> ''
-            AND lp.catch_all = false", $package_id, $generation
-      )->hashes->each
-      )
-    {
-      my $risk = $m->{risk};
-      $file_cover{$m->{file}} = $risk if !defined $file_cover{$m->{file}} || $risk > $file_cover{$m->{file}};
-      my $dir = $m->{filename} =~ s{/[^/]*$}{}r;
-      $dir_cover{$dir} = $risk if !defined $dir_cover{$dir} || $risk > $dir_cover{$dir};
-    }
-
-    # Directory of every snippet-bearing file, so directory-scope lookups work per occurrence
+  if ($cover) {
     for my $f (
       $db->query(
         'SELECT DISTINCT mf.id, mf.filename FROM matched_files mf
@@ -95,7 +69,6 @@ sub resolve_snippets ($self, $package_id, $generation = 0) {
     }
   }
 
-  # Each occurrence with its snippet's similarity metadata and closest-license details
   my $rows = $db->query(
     'SELECT fs.id, fs.file, fs.sline, fs.eline, fs.resolution AS current_resolution, s.hash, s.license,
             s.likelyness, s.second_match, s.score_version, s.like_pattern, lp.license AS plicense, lp.risk AS prisk,
@@ -107,15 +80,12 @@ sub resolve_snippets ($self, $package_id, $generation = 0) {
       WHERE fs.package = ? AND fs.generation = ?', $package_id, $generation
   );
 
-  # Compute each occurrence's resolution and bucket the ids by the resulting value, skipping rows already
-  # at that value. resolution has only a handful of distinct values, so the writes below collapse into a
-  # few bulk UPDATEs instead of thousands of per-row SQL::Abstract updates (the analyze hotspot).
+  # Bucket the few resolution values to avoid thousands of individual updates.
   my %ids_by_resolution;
   for my $row ($rows->hashes->each) {
     my $pattern = {license => $row->{plicense}, risk => $row->{prisk}};
     $row->{is_license_file} = is_license_filename($row->{filename});
 
-    # Highest-risk concrete license already covering this occurrence, per the configured scope
     my $cover_risk;
     if    ($cover_scope eq 'file') { $cover_risk = $file_cover{$row->{file}} }
     elsif ($cover_scope eq 'dir')  { $cover_risk = $dir_cover{$file_dir{$row->{file}} // ''} }
@@ -129,7 +99,6 @@ sub resolve_snippets ($self, $package_id, $generation = 0) {
     }
     elsif (should_cover_snippet($cfg, $row, $cover_risk)) { $resolution = 'covered' }
 
-    # Skip rows whose resolution does not change (the common case on reindex)
     my $current = $row->{current_resolution};
     next
       if (defined $current && defined $resolution && $current eq $resolution)
@@ -137,7 +106,7 @@ sub resolve_snippets ($self, $package_id, $generation = 0) {
     push @{$ids_by_resolution{defined $resolution ? $resolution : ''}}, $row->{id};
   }
 
-  # One UPDATE per distinct resolution, in a short transaction (computation above ran outside it)
+  # Keep the write transaction short by computing first.
   my $tx = $db->begin;
   for my $resolution (sort keys %ids_by_resolution) {
     $db->query(
@@ -149,19 +118,11 @@ sub resolve_snippets ($self, $package_id, $generation = 0) {
   $tx->commit;
 }
 
-# Per-line match/snippet info for the file browser (and the report's inline file view), keyed by line
-# number. Real curated license matches win their own lines; every remaining snippet renders from its
-# stored resolution (computed once by resolve_snippets): 'fold' as the inferred license, 'clear' /
-# 'overlap' / 'covered' as resolved (cleared) noise, anything else as an unresolved snippet. Resolved
-# rows also carry the detail the file browser shows in its hover tooltip - what the snippet resembles,
-# how similar, how confident the classifier was - so a reviewer can see *how* a snippet was resolved at a
-# glance. That detail comes straight off the snippet row; the resolution itself was already decided by
-# resolve_snippets, so nothing here re-derives overlap or coverage.
+# Render stored resolution; curated matches remain authoritative for their own lines.
 sub file_line_info ($self, $package_id, $file_id) {
   my $db   = $self->pg->db;
   my $info = {};
 
-  # Real curated license matches win their own lines.
   my %matched;
   my $matches = $db->query(
     'SELECT pm.sline, pm.eline, lp.id, lp.license, lp.spdx, lp.risk
@@ -191,9 +152,6 @@ sub file_line_info ($self, $package_id, $file_id) {
     next if $snippet->{classified} && !$snippet->{license};
     my $resolution = $snippet->{resolution} // '';
 
-    # Fields shared by every snippet row: the handle that keeps the region correctable, plus the tooltip
-    # detail - the closest license it resembles (what the scorer keyed on), its similarity (the 0..1 score
-    # scaled to a percentage, as in snippet_search) and the classifier confidence.
     my $has_closest = defined $snippet->{plicense} && $snippet->{plicense} ne '';
     my %common      = (
       snippet    => $snippet->{id},
@@ -217,10 +175,7 @@ sub file_line_info ($self, $package_id, $file_id) {
       };
     }
 
-    # Boilerplate-clear and overlap-clear both assert no license but for different reasons, so the tooltip
-    # tells them apart via clearReason: 'boilerplate' resembles license body text naming no single
-    # license; 'overlap' repeats a real license declaration inside the snippet's own lines (already
-    # painted on those lines, so no need to name it again here).
+    # Preserve distinct explanations for two no-license outcomes.
     elsif ($resolution eq 'clear' || $resolution eq 'overlap') {
       $line_info = {
         %common,
@@ -231,8 +186,6 @@ sub file_line_info ($self, $package_id, $file_id) {
       };
     }
 
-    # Covered: a concrete license already established in this file or directory covers this fragment, so it
-    # adds nothing - that license is already on the report through its own match.
     elsif ($resolution eq 'covered') {
       $line_info = {%common, risk => 0, name => 'Covered by existing license match', covered => 1};
     }
@@ -241,10 +194,7 @@ sub file_line_info ($self, $package_id, $file_id) {
       $line_info->{pids} = [$snippet->{like_pattern}] if $snippet->{like_pattern};
     }
 
-    # A resolved snippet (fold/clear/overlap/covered) describes the region, but a real licensed match is
-    # authoritative for its own line - it must not repaint a line that has its own curated match (e.g. a
-    # "Free Software Foundation" match on the first line of a folded GPL header). Unresolved snippets
-    # still take over their region (matching the report's needed_lines precedence).
+    # Resolved regions defer to curated matches; unresolved regions retain precedence.
     my $defers_to_match = $resolution =~ /^(?:fold|clear|overlap|covered)$/;
     for my $line ($snippet->{sline} .. $snippet->{eline}) {
       next if $defers_to_match && $matched{$line};
@@ -293,7 +243,8 @@ sub from_file ($self, $file_id, $first_line, $last_line) {
   return undef unless $file;
 
   my $package = $db->select('bot_packages', '*', {id => $file->{package}})->hash;
-  my $path    = path($self->checkout_dir, $package->{name}, $package->{checkout_dir}, '.unpacked', $file->{filename});
+  my $path
+    = checkout_path($self->checkout_dir, $package->{name}, $package->{checkout_dir}, '.unpacked', $file->{filename});
 
   my ($text, $hash) = file_and_checksum($path, $first_line, $last_line);
   my $snippet_id
@@ -320,11 +271,57 @@ sub from_file ($self, $file_id, $first_line, $last_line) {
   return $snippet_id;
 }
 
+# Just the content checksum of a range, with no snippet or file_snippets row created. Used by the
+# ignore-a-match path, which only needs the hash and must not leave an occurrence behind.
+sub checksum_for_file ($self, $file_id, $first_line, $last_line) {
+  my $db = $self->pg->db;
+  return undef unless my $file = $db->select('matched_files', '*', {id => $file_id})->hash;
+  my $package = $db->select('bot_packages', ['name', 'checkout_dir'], {id => $file->{package}})->hash;
+  my $path
+    = checkout_path($self->checkout_dir, $package->{name}, $package->{checkout_dir}, '.unpacked', $file->{filename});
+  my (undef, $hash) = file_and_checksum($path, $first_line, $last_line);
+  return $hash;
+}
+
+# The checksum a licensed match must be ignored by. It has to be hashed over the match's own stored
+# [sline, eline] - the same range the indexer recomputes - not the visual group the report renders, which
+# can differ when a higher-risk match overlaps or an identical pattern matches an adjacent block. The
+# caller passes the pattern id plus any line the match covers (the row the reviewer clicked); the tightest
+# covering match wins if several share the pattern on that line.
+sub checksum_for_match ($self, $file_id, $pid, $line) {
+  my $match = $self->pg->db->select(
+    'pattern_matches',
+    ['sline', 'eline'],
+    {file     => $file_id, pattern => $pid, generation => 0, sline => {'<=' => $line}, eline => {'>=' => $line}},
+    {order_by => \'(eline - sline)', limit => 1}
+  )->hash;
+  return undef unless $match;
+  return $self->checksum_for_file($file_id, $match->{sline}, $match->{eline});
+}
+
+# Indexing only records a file once something matched in it, so a file with no matches at all has no row
+# to hang a snippet on. That is exactly the file whose license text nobody has a pattern for yet, so the
+# row is created on demand; a reindex replaces these rows anyway, and the snippet outlives them.
 sub from_file_path ($self, $package_id, $filename, $first_line, $last_line) {
-  return undef
-    unless my $file
-    = $self->pg->db->select('matched_files', 'id', {package => $package_id, filename => $filename, generation => 0})
-    ->hash;
+  my $db   = $self->pg->db;
+  my $file = $db->select('matched_files', 'id', {package => $package_id, filename => $filename, generation => 0})->hash;
+
+  if (!$file) {
+    return undef if $filename =~ /\.\./;
+    return undef unless my $package = $db->select('bot_packages', ['name', 'checkout_dir'], {id => $package_id})->hash;
+
+    my $unpacked = checkout_path($self->checkout_dir, $package->{name}, $package->{checkout_dir}, '.unpacked');
+    my $path     = $unpacked->child($filename);
+    return undef unless -f $path && path_within($unpacked, $path);
+
+    # The mimetype is used for display alone
+    $file->{id} = $db->insert(
+      'matched_files',
+      {package   => $package_id, filename => $filename, mimetype => 'text/plain', generation => 0},
+      {returning => 'id'}
+    )->hash->{id};
+  }
+
   return $self->from_file($file->{id}, $first_line, $last_line);
 }
 
@@ -388,6 +385,14 @@ sub unclassified ($self, $options) {
     $match .= " AND fs.resolution IN ($placeholders)";
   }
 
+  # "Reported" is independent of the file_snippets.resolution states by design: a report can be filed
+  # against a snippet Cavil auto-resolved (folded/cleared/covered) as a correction, and hiding those would
+  # let a wrongly-resolved new license slip through. So it does not touch $match/@kinds - the linked
+  # occurrence and counts stay generation-only, and reported snippets surface whatever their resolution.
+  elsif ($resolution_option eq 'reported') {
+    $resolution = "AND $REPORTED_EXISTS";
+  }
+
   # Full-text (lexeme) search over snippet bodies; expression matches the GIN index exactly.
   my $search = '';
   if (defined $options->{search} && $options->{search} ne '') {
@@ -403,7 +408,21 @@ sub unclassified ($self, $options) {
     : @kinds                              ? ' AND fs_count.resolution IN (' . join(', ', ('?') x @kinds) . ')'
     :                                       '';
   my @count_binds = (@kinds, @kinds);
-  my $order       = $options->{order} // 'recent';
+
+  # A bare numeric search is an exact snippets.id lookup (review notes cite snippet ids). Match the one
+  # row and drop every other filter: a cited snippet is often already classified/approved/resolved, and
+  # the state defaults (classified, not approved) would otherwise hide it, defeating the lookup.
+  my $where = "$is_approved AND $is_classified $before $legal $confidence $timeframe $resolution $search";
+  if (defined $options->{search} && $options->{search} =~ /^\d+$/) {
+    $where       = 's.id = ?';
+    @binds       = ($options->{search});
+    @kinds       = ();
+    $match       = 'AND fs.generation = 0';
+    $count_match = 'AND fs_count.generation = 0';
+    @count_binds = ();
+  }
+
+  my $order = $options->{order} // 'recent';
   my $order_by
     = $order eq 'occurrences' ? 'occurrence_count DESC, package_count DESC, s.id DESC'
     : $order eq 'packages'    ? 'package_count DESC, occurrence_count DESC, s.id DESC'
@@ -418,7 +437,7 @@ sub unclassified ($self, $options) {
      FROM snippets s
        LEFT JOIN bot_packages bp ON (bp.id = s.package)
        LEFT JOIN license_patterns lp ON (lp.id = s.like_pattern)
-     WHERE $is_approved AND $is_classified $before $legal $confidence $timeframe $resolution $search
+     WHERE $where
      ORDER BY $order_by LIMIT 11 $offset", @count_binds, @binds
   )->hashes->to_array;
 
@@ -449,12 +468,7 @@ sub unclassified ($self, $options) {
   return {has_more => $has_more, snippets => $snippets};
 }
 
-# Query the snippet backlog generically for agents/UI (backs the cavil_search_snippets MCP tool).
-# Filter by resolution ('unresolved' = resolution IS NULL / fold|clear|overlap|covered / 'any'),
-# optional package scope, closest-license, and full-text search; then either aggregate identical
-# snippets by impact (group => 'text') or list individual occurrences (group => 'none'). Snippets are
-# content-hash-deduped (find_or_create), so grouping by s.id already aggregates fleet-wide. The
-# unresolved path is served by the partial indexes file_snippets_unresolved_snippet_idx/_package_idx.
+# Grouping by content-derived snippet id aggregates identical text fleet-wide.
 sub snippet_search ($self, $options) {
   my $db = $self->pg->db;
 
@@ -468,6 +482,7 @@ sub snippet_search ($self, $options) {
   my $res_clause
     = $res eq 'any'                              ? '1 = 1'
     : $res eq 'unresolved'                       ? 'fs.resolution IS NULL'
+    : $res eq 'reported'                         ? $REPORTED_EXISTS
     : $res =~ /^(?:fold|clear|overlap|covered)$/ ? do { push @binds, $res; 'fs.resolution = ?' }
     :                                              'fs.resolution IS NULL';
 
@@ -479,7 +494,12 @@ sub snippet_search ($self, $options) {
   # license = false). Confirmed candidates (license = true) and snippets still pending classification
   # (classified = false) are kept. Without this the tool floods callers with classifier-rejected code
   # comments the report never shows, and its counts drift far above the package's unresolved_matches.
-  $extra .= ' AND (s.license OR NOT s.classified)';
+  #
+  # Skip this for "reported": a missing-license report is an explicit human/agent assertion that the
+  # snippet IS a license, and reporting one Cavil auto-resolved (folded/cleared/covered) or the classifier
+  # rejected is an expected *correction*. Those must surface regardless of resolution or classifier verdict
+  # (the res_clause above already imposes no resolution filter), and the curated report set can't flood.
+  $extra .= ' AND (s.license OR NOT s.classified)' unless $res eq 'reported';
   if (defined $options->{license} && $options->{license} ne '') {
     $extra .= ' AND lp.license = ?';
     push @binds, $options->{license};
@@ -497,8 +517,8 @@ sub snippet_search ($self, $options) {
   # snippets are dead work; excluding them (as every other query does) keeps the impact ranking real.
   # Occurrences are also pinned to the live report (generation 0), so a package being reindexed right now
   # contributes each of its occurrences once, not twice.
-  my $visible
-    = 'fs.generation = 0 AND bp.embargoed = false AND bp.obsolete = false AND COALESCE(sp.embargoed, false) = false';
+  my $visible = 'fs.generation = 0 AND bp.embargoed = false AND bp.obsolete = false AND bp.ephemeral = false'
+    . ' AND COALESCE(sp.embargoed, false) = false';
 
   # Fetch one extra row to detect a next page without an exact total (COUNT(*) OVER does not scale).
   my $rows;
@@ -630,7 +650,11 @@ sub _occurrence ($db, $id, $file_id) {
     $sql .= ' AND fs.file = ?';
     push @bind, $file_id;
   }
-  $sql .= ' LIMIT 1';
+
+  # Deterministic pick for the no-file_id fallback (standalone snippet/missing-license views): without
+  # an order the arbitrary occurrence could flip between reindexes. Scoping by file_id above is the
+  # real fix; this just keeps the fallback stable.
+  $sql .= ' ORDER BY fs.file LIMIT 1';
   return $db->query($sql, @bind)->hash;
 }
 
@@ -640,7 +664,8 @@ sub _visible_occurrence ($db, $id) {
   return $db->query(
     'SELECT fs.package, fs.file, fs.sline, fs.eline
        FROM file_snippets fs JOIN bot_packages p ON p.id = fs.package
-      WHERE fs.snippet = ? AND fs.generation = 0 AND p.embargoed = false AND p.obsolete = false LIMIT 1', $id
+      WHERE fs.snippet = ? AND fs.generation = 0 AND p.embargoed = false AND p.obsolete = false
+        AND p.ephemeral = false LIMIT 1', $id
   )->hash;
 }
 
@@ -668,7 +693,8 @@ sub with_context ($self, $id, $file_id = undef) {
     $sline   = $example->{sline};
     $package = {id => $example->{package}, name => $example->{name}, filename => $example->{filename}};
 
-    my $file = path($self->checkout_dir, $package->{name}, $example->{checkout_dir}, '.unpacked', $example->{filename});
+    my $file = checkout_path($self->checkout_dir, $package->{name}, $example->{checkout_dir}, '.unpacked',
+      $example->{filename});
     $text = read_lines($file, $example->{sline}, $example->{eline});
 
     my $patterns = $db->query(

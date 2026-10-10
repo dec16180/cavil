@@ -1,4 +1,4 @@
-# Copyright SUSE LLC
+# SPDX-FileCopyrightText: SUSE LLC
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict, -signatures;
@@ -678,6 +678,15 @@ subtest 'Relevance: same_report flag and relevant_only filter' => sub {
   );
   ok(!(grep { $_->{same_report} == false && $_->{original_package}{id} != 1 } @$filtered),
     'no non-relevant notes survive the relevant_only filter');
+
+  # history_only is the complementary audit trail: different-report notes
+  # remain available without mixing them into the applicable notes stream.
+  $t->get_ok('/reviews/notes/1?history_only=1')->status_is(200);
+  my $history = $t->tx->res->json('/notes');
+  ok((grep { $_->{body} eq 'relevance identical note' } @$history), 'different-report note kept under history_only');
+  ok(!(grep { $_->{body} eq 'relevance native note' } @$history),   'native note hidden under history_only');
+  ok(!(grep { $_->{pinned} } @$history),                            'pinned notes never enter history');
+  $t->get_ok('/reviews/notes/1?relevant_only=1&history_only=1')->status_is(400);
   logout($t);
 
   $app->notes->remove($_) for ($native, $ident);
@@ -782,6 +791,7 @@ subtest 'Pinned notes are hoisted out of the paginated stream' => sub {
 
   # A pin outlives the relevance filter resetting the scroll.
   $t->get_ok('/reviews/notes/1?relevant_only=1')->status_is(200)->json_is('/pinned/0/id' => $id);
+  $t->get_ok('/reviews/notes/1?history_only=1')->status_is(200)->json_hasnt('/pinned');
 
   logout($t);
   $app->notes->remove($id);
@@ -890,6 +900,122 @@ subtest 'Composer can create an already-pinned note' => sub {
 
   logout($t);
   $app->notes->remove($_) for ($id, $plain);
+};
+
+subtest 'Limitation notes are standing context for every review' => sub {
+  my $db    = $app->pg->db;
+  my $orig1 = $app->packages->find(1)->{checksum};
+  my $orig2 = $app->packages->find(2)->{checksum};
+  $db->update('bot_packages', {checksum => 'LIM-A'}, {id => 1});
+  $db->update('bot_packages', {checksum => 'LIM-B'}, {id => 2});
+
+  my $pkg1   = {id => 1, name => 'perl-Mojolicious', checksum => 'LIM-A'};
+  my $before = $app->notes->relevant_count('perl-Mojolicious', 1, 'LIM-A');
+  is $app->notes->relevant_notes([$pkg1])->{1}{limitation} // 0, 0, 'no limitation yet';
+
+  my $pinned = $app->notes->add(2, 'perl-Mojolicious', $contrib_id, 'standing advice', 0);
+  $app->notes->set_pinned($pinned->{id}, 1);
+  my $id = $app->notes->add(2, 'perl-Mojolicious', $lawyer_id, 'only with approval', 0, 0, undef, 1)->{id};
+
+  my $relevant = $app->notes->list('perl-Mojolicious', relevant_only => 1, package_id => 1, checksum => 'LIM-A');
+  ok((grep { $_->{id} == $id } @{$relevant->{notes}}), 'different-report limitation survives relevant_only');
+  my $history = $app->notes->list('perl-Mojolicious', history_only => 1, package_id => 1, checksum => 'LIM-A');
+  ok !(grep { $_->{id} == $id } @{$history->{notes}}), 'but is never history';
+  is $app->notes->relevant_count('perl-Mojolicious', 1, 'LIM-A'), $before + 2, 'relevant count includes both';
+  is $app->notes->relevant_notes([$pkg1])->{1}{limitation},       1,           'listing icon knows about it';
+
+  my $page = $app->notes->paginate_for_package('perl-Mojolicious', limit => 5, package_id => 1, checksum => 'LIM-A');
+  is $page->{page}[0]{id},         $id, 'limitation sorts first for the MCP list, above pins';
+  is $page->{page}[0]{limitation}, 1,   'limitation flag is exposed to the MCP renderer';
+
+  login_admin($t);
+  $t->get_ok('/reviews/notes/1?relevant_only=1')
+    ->status_is(200)
+    ->json_is('/pinned/0/id'         => $id)
+    ->json_is('/pinned/0/limitation' => 1)
+    ->json_is('/pinned/1/id'         => $pinned->{id});
+  ok !(grep { $_->{id} == $id } @{$t->tx->res->json('/notes')}), 'not repeated in the stream';
+  logout($t);
+
+  $t->get_ok('/test/become/contrib_user')->status_is(200);
+  $t->get_ok('/reviews/notes/recent.json?limitation=1')->status_is(200)->json_is('/notes/0/id' => $id);
+  is scalar(@{$t->tx->res->json('/notes')}), 1, 'the recent feed can list just the limitations, for everyone';
+  $t->get_ok('/reviews/notes/recent.json?limitation=2')->status_is(400);
+  logout($t);
+
+  $app->notes->remove($_) for ($id, $pinned->{id});
+  $db->update('bot_packages', {checksum => $orig1}, {id => 1});
+  $db->update('bot_packages', {checksum => $orig2}, {id => 2});
+};
+
+subtest 'relevant_notes resolves a whole page of reviews at once' => sub {
+
+  # Two reviews of a package no other subtest touches, so leftover notes cannot skew the counts
+  my $name = 'zz-relevance-fixture';
+  my @ids  = map {
+    $app->packages->add(
+      name            => $name,
+      checkout_dir    => "checkout-$_",
+      api_url         => '',
+      project         => '',
+      package         => $name,
+      srcmd5          => "srcmd5-$_",
+      requesting_user => $contrib_id,
+      priority        => 5
+    )
+  } 1, 2;
+  my $db = $app->pg->db;
+  $db->update('bot_packages', {checksum => 'report-a'}, {id => $ids[0]});
+  $db->update('bot_packages', {checksum => 'report-b'}, {id => $ids[1]});
+  my $one = {id => $ids[0], name => $name, checksum => 'report-a'};
+  my $two = {id => $ids[1], name => $name, checksum => 'report-b'};
+
+  is_deeply $app->notes->relevant_notes([]),           {}, 'no query for an empty page';
+  is_deeply $app->notes->relevant_notes([$one, $two]), {}, 'no notes, no icons';
+
+  my $own = $app->notes->add($ids[0], $name, $contrib_id, 'about review 1', 0);
+  my $got = $app->notes->relevant_notes([$one, $two]);
+  is $got->{$ids[0]}{count},  1,     'note counts for the review it was written on';
+  is $got->{$ids[0]}{review}, 0,     'untagged note is not a review note';
+  is $got->{$ids[1]},         undef, 'and not for a sibling with a different report';
+
+  my $ai_only  = $app->notes->add($ids[0], $name, $contrib_id, 'agent summary, untagged', 0, 1);
+  my $untagged = $app->notes->relevant_notes([$one])->{$ids[0]};
+  is $untagged->{review}, 0, 'an AI-assisted note without the tag is not a review note';
+  is $untagged->{ai},     0, 'and does not count as an AI review either';
+
+  my $human    = $app->notes->add($ids[0], $name, $contrib_id, 'lawyer wrote this', 0, 0, ['review']);
+  my $by_human = $app->notes->relevant_notes([$one])->{$ids[0]};
+  is $by_human->{review}, 1, 'tagged note is a review note';
+  is $by_human->{ai},     0, 'written by a human, so not an AI review';
+
+  my $review   = $app->notes->add($ids[0], $name, $contrib_id, 'agent says ok', 0, 1, ['review']);
+  my $by_agent = $app->notes->relevant_notes([$one])->{$ids[0]};
+  is $by_agent->{review},                            1,     'tagged and AI-assisted is still a review note';
+  is $by_agent->{ai},                                1,     'and is flagged as an AI review';
+  is $app->notes->relevant_notes([$two])->{$ids[1]}, undef, 'but not on the sibling it does not apply to';
+
+  my $pinned = $app->notes->add($ids[1], $name, $contrib_id, 'standing context', 0);
+  $app->notes->set_pinned($pinned->{id}, 1);
+  is $app->notes->relevant_notes([$one])->{$ids[0]}{count},  5, 'pinned note counts for every review of the package';
+  is $app->notes->relevant_notes([$two])->{$ids[1]}{review}, 0, 'a pinned note alone is no review note';
+
+  # Notes on review 1 reach review 2 once their license reports match
+  $db->update('bot_packages', {checksum => 'report-a'}, {id => $ids[1]});
+  $two->{checksum} = 'report-a';
+  my $same = $app->notes->relevant_notes([$one, $two]);
+  is $same->{$ids[1]}{count},  5, 'identical report pulls in the whole set';
+  is $same->{$ids[1]}{review}, 1, 'including the review note';
+  is $same->{$ids[1]}{ai},     1, 'and the fact that an agent wrote one';
+
+  my $secret = $app->notes->add($ids[0], $name, $lawyer_id, 'for lawyers only', 1);
+  is $app->notes->relevant_notes([$one])->{$ids[0]}{count}, 5, 'lawyer-only note stays hidden';
+  is $app->notes->relevant_notes([$one], include_lawyer_only => 1)->{$ids[0]}{count}, 6, 'and shows up for a curator';
+
+  is $app->notes->relevant_count($name, $ids[0], 'report-a'), 5, 'single-package count agrees with the batch';
+
+  $app->notes->remove($_->{id}) for $own, $ai_only, $human, $review, $pinned, $secret;
+  $db->delete('bot_packages', {id => \@ids});
 };
 
 subtest 'CommonMark renders safely' => sub {

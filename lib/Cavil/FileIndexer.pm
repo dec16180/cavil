@@ -1,17 +1,5 @@
-# Copyright (C) 2019 SUSE Linux GmbH
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::FileIndexer;
 use Mojo::Base -base, -signatures;
@@ -92,6 +80,17 @@ sub file ($self, $meta, $path, $mime) {
       $self->{generation}
     )->array->[0];
 
+    # A licensed match can be ignored per-package by content hash. Snippets are checked in _snippet, but
+    # a licensed match never seeds a snippet, so it is checked here against the same ignored_lines set.
+    # Only pay the per-range hash when this package actually has ignores.
+    if (!$no_license && !$ignored_file && %{$self->{ignored_lines}}) {
+      my $unpacked = $self->dir->child('.unpacked', $path);
+      my (undef, $hash) = file_and_checksum($unpacked, $ls, $le);
+      if (my $ignore_id = $self->{ignored_lines}{$hash}) {
+        $self->{db}->update('pattern_matches', {ignored => 1, ignored_line => $ignore_id}, {id => $pm_id});
+      }
+    }
+
     push @matches, $no_license ? [@$match, $pm_id] : $match;
 
     # to mark an ignored file, one pattern is enough
@@ -102,18 +101,24 @@ sub file ($self, $meta, $path, $mime) {
   $self->_check_missing_snippets($file_id, $path, \@matches);
 }
 
-# A 'snippet' is a region of a source file containing keywords.
-# The +-1 area around each keyword is taking into it and possible
-# keywordless lines in between near keywords too - to form one text
 sub _check_missing_snippets ($self, $file_id, $path, $matches) {
 
-  # extract missed snippets
   my %needed_lines;
 
-  # pick the keyword matches first
+  # Line spans of the concrete (licensed) matches. A keyword whose lines fall entirely within one is
+  # already accounted for by a real license on the report, so it must not seed a snippet: the frozen
+  # matcher keeps the longest match, which for a "... is licensed under the ISC license" line is the ISC
+  # body pattern starting a couple of words past the keyword - covering the keyword's line but not its
+  # token, so the keyword survives resolution. Left to seed, that stray keyword bridges (delta below)
+  # across a whole concatenated-license file into one giant unresolved snippet. The keyword's
+  # pattern_matches row is still recorded (in file()); we only decline to seed from it here.
+  my @license_spans = map { [$_->[1], $_->[2]] } grep { !defined $_->[3] } @$matches;
+
   for my $match (@$matches) {
     my ($mid, $ls, $le, $pm_id) = @$match;
-    _mark_area(\%needed_lines, $ls - 1, $le + 1) if $pm_id;
+    next unless $pm_id;
+    next if grep { $_->[0] <= $ls && $le <= $_->[1] } @license_spans;
+    _mark_area(\%needed_lines, $ls - 1, $le + 1);
   }
 
   while (1) {
@@ -121,7 +126,6 @@ sub _check_missing_snippets ($self, $file_id, $path, $matches) {
 
     my $delta = 6;
 
-    # now check if matches get close to area 9
     for my $match (@$matches) {
       my ($mid, $ls, $le) = @$match;
       for (my $line = $ls - $delta; $line <= $ls; $line++) {
@@ -143,7 +147,6 @@ sub _check_missing_snippets ($self, $file_id, $path, $matches) {
 
   $path = $self->dir->child('.unpacked', $path);
 
-  # process snippet areas
   my $prev_line;
   my $first_snippet_line;
   for my $line (sort { $a <=> $b } keys %needed_lines) {

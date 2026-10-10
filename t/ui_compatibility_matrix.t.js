@@ -78,6 +78,55 @@ await t.test('Cavil UI - license compatibility matrix', skipUnlessOnline, async 
       t.equal(await matrix.locator('.license-matrix-detail').count(), 0, 'clicking the selected cell again closes it');
     });
 
+    await t.test('the detail panel links to the files where the two licenses co-locate', async t => {
+      const flaggedCell = matrix.locator('td.license-matrix-cell.cell-no').first();
+      await flaggedCell.click();
+
+      const where = matrix.locator('.license-matrix-where');
+      await where.waitFor();
+      t.match(await where.innerText(), /where/i, 'the detail panel gains a Where band');
+
+      // The fixture puts the two licenses in sibling files of one directory, so both are listed one per line
+      // on the dotted rail. Every file opens in the file browser in a new tab - consistent, because proximity
+      // can point at files beyond the report's display cap that have no inline preview.
+      const links = where.locator('.license-matrix-file-list li .license-matrix-file-link');
+      t.ok((await links.count()) >= 2, 'both co-located files are listed');
+      t.equal(await links.first().getAttribute('target'), '_blank', 'opens in a new tab');
+      t.match(await links.first().getAttribute('href'), /\/reviews\/file_view\/1\//, 'links into the file browser');
+    });
+
+    await t.test('the c shortcut jumps back to the compatibility box', async t => {
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(200);
+      await page.keyboard.press('c');
+      await page.waitForTimeout(400);
+      const box = await matrix.boundingBox();
+      t.ok(box && box.y < 300, 'the compatibility box is scrolled back into view');
+    });
+
+    await t.test('the Likelihood toggle recolours the grid by combination likelihood', async t => {
+      const mode = matrix.locator('.license-matrix-mode');
+      await mode.waitFor();
+
+      await matrix.locator('.license-matrix-mode-btn', {hasText: 'Likelihood'}).click();
+      t.equal(
+        await matrix.locator('.license-matrix-cell.mode-likelihood').count() > 0,
+        true,
+        'cells switch into likelihood colouring'
+      );
+      t.match(
+        await matrix.locator('.license-matrix-legend').innerText(),
+        /Same file/,
+        'the legend switches to the likelihood heat scale'
+      );
+
+      // A flagged dot carries an inline heat colour and size in this mode.
+      const mark = matrix.locator('td.license-matrix-cell.cell-no .license-matrix-mark').first();
+      t.match(await mark.getAttribute('style'), /background/, 'the dot is tinted by its heat tier');
+
+      await matrix.locator('.license-matrix-mode-btn', {hasText: 'Verdict'}).click();
+    });
+
     assertNoUnexpectedConsoleErrors(t, errorLogs);
   } finally {
     delete process.env.JS_UI_FIXTURES;

@@ -1,17 +1,5 @@
-# Copyright (C) 2024 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict, -signatures;
 
@@ -465,6 +453,18 @@ subtest 'Cancelled proposal' => sub {
   };
 };
 
+subtest 'Match checksum endpoint returns a hash without creating an occurrence' => sub {
+  my $match
+    = $db->select('pattern_matches', ['file', 'pattern', 'sline'], {package => 1, generation => 0}, {limit => 1})->hash;
+  ok $match, 'have an indexed match';
+  my $before = $db->query('SELECT COUNT(*) AS c FROM file_snippets')->hash->{c};
+  $t->get_ok("/snippets/match_checksum/$match->{file}/$match->{pattern}/$match->{sline}")
+    ->status_is(200)
+    ->json_like('/hash', qr/^[0-9a-f]+$/);
+  is $db->query('SELECT COUNT(*) AS c FROM file_snippets')->hash->{c}, $before,
+    'staging an ignore creates no file_snippets row (the match stays resolved until submit)';
+};
+
 subtest 'Remove ignored match' => sub {
   $t->app->minion->perform_jobs;
   $t->app->users->add_role(2, 'admin');
@@ -473,8 +473,8 @@ subtest 'Remove ignored match' => sub {
   dec(1, 'create-ignore', {hash => 'abe8204ddebdc31a4d0e77aa647f42cd', from => 'package-with-snippets'})
     ->status_is(200)
     ->json_is('/results/0/kind', 'ignore');
-  is $t->app->minion->jobs({tasks => ['index'],   states => ['inactive']})->total, 0, 'no reindex enqueued';
-  is $t->app->minion->jobs({tasks => ['analyze'], states => ['inactive']})->total, 1, 'analyze job enqueued';
+  is $t->app->minion->jobs({tasks => ['index'],   states => ['inactive']})->total, 1, 'reindex enqueued';
+  is $t->app->minion->jobs({tasks => ['analyze'], states => ['inactive']})->total, 0, 'no direct analyze job';
   $t->get_ok('/pagination/matches/ignored')
     ->status_is(200)
     ->json_has('/page/0')
@@ -509,7 +509,7 @@ subtest 'Remove ignored match' => sub {
   is $t->app->minion->jobs({tasks => ['index'], states => ['inactive']})->total, 1, 'job created';
 };
 
-subtest 'Ignore with real snippet (analyze-only path)' => sub {
+subtest 'Ignore with real snippet (reindex path)' => sub {
   $t->app->minion->perform_jobs;
 
   # Pick a real snippet hash with at least one overlapping pattern_match
@@ -526,8 +526,8 @@ subtest 'Ignore with real snippet (analyze-only path)' => sub {
   dec(1, 'create-ignore', {hash => $hash, from => 'package-with-snippets'})
     ->status_is(200)
     ->json_is('/results/0/kind', 'ignore');
-  is $t->app->minion->jobs({tasks => ['index'],   states => ['inactive']})->total, 0, 'no reindex enqueued';
-  is $t->app->minion->jobs({tasks => ['analyze'], states => ['inactive']})->total, 1, 'analyze job enqueued';
+  is $t->app->minion->jobs({tasks => ['index'],   states => ['inactive']})->total, 1, 'reindex enqueued';
+  is $t->app->minion->jobs({tasks => ['analyze'], states => ['inactive']})->total, 0, 'no direct analyze job';
   $t->app->minion->perform_jobs;
 
   $t->get_ok('/pagination/matches/ignored?filter=with-snippets')
@@ -538,7 +538,16 @@ subtest 'Ignore with real snippet (analyze-only path)' => sub {
     ->json_is('/page/0/packages', 1);
   my $marked = $t->tx->res->json->{page}[0]{matches};
   my $id     = $t->tx->res->json->{page}[0]{id};
-  ok $marked > 0, "pattern_matches marked ignored via analyze ($marked rows)";
+  ok $marked > 0, "pattern_matches marked ignored via reindex ($marked rows)";
+
+  # Regression for the common "license header + code comment" case: ignoring the snippet region must not
+  # sweep up a licensed match whose own range differs. A licensed match is only ignored when its exact
+  # range hash is the one that was ignored (see Cavil::FileIndexer).
+  my $licensed_live = $db->query(
+    "SELECT COUNT(*) AS c FROM pattern_matches pm JOIN license_patterns lp ON lp.id = pm.pattern
+       WHERE pm.package = 1 AND lp.license != '' AND pm.ignored = FALSE"
+  )->hash->{c};
+  ok $licensed_live > 0, "licensed matches survive a snippet ignore ($licensed_live rows)";
 
   subtest 'Re-ignoring the same hash is idempotent' => sub {
     dec(1, 'create-ignore', {hash => $hash, from => 'package-with-snippets'})
@@ -685,6 +694,104 @@ subtest 'Propose ignore glob' => sub {
   };
 
   $t->app->minion->perform_jobs;
+};
+
+subtest 'New-license proposal keeps its missing-license report as a fallback' => sub {
+  my $patterns = $t->app->patterns;
+
+  # Durable record: a missing-license report for snippet 2
+  is_deeply $patterns->propose_missing(
+    snippet => 2,
+    hash    => 'nlfallback0000000000000000000001',
+    from    => 'perl-Mojolicious',
+    pattern => 'The GPL might be here',
+    package => 1,
+    owner   => 2
+    ),
+    {}, 'missing-license report filed';
+
+  # An AI proposes introducing a brand-new license for the same snippet
+  my %proposal = (
+    snippet     => 2,
+    pattern     => 'Brand New License 1.0 distinctive body wording',
+    license     => 'Brand-New-1.0',
+    risk        => 3,
+    package     => 1,
+    owner       => 2,
+    ai_assisted => 1,
+    reason      => 'AI Assistant: test rationale'
+  );
+  is_deeply $patterns->propose_new_license(%proposal), {}, 'new-license proposal filed';
+
+  # Both rows coexist: the report is NOT retired at propose time
+  my $count_for_2 = sub {
+    $db->query(
+      "SELECT count(*) AS c FROM proposed_changes
+         WHERE (data->>'snippet')::bigint = 2 AND action IN ('missing_license', 'new_license')"
+    )->hash->{c};
+  };
+  is $count_for_2->(), 2, 'report and proposal coexist in the database';
+
+  # The menu counter must count each snippet once (one card), not once per row - a coexisting report and
+  # its proposal is a single Missing Licenses entry.
+  my $missing_count = sub {
+    $t->get_ok('/licenses/proposed/stats')->status_is(200);
+    return $t->tx->res->json->{missing};
+  };
+  is $missing_count->(), 1, 'menu counter counts the report+proposal snippet once, not twice';
+
+  # The Missing Licenses page shows the snippet once - the proposal supersedes the bare report
+  my $listed = sub {
+    $t->get_ok('/licenses/proposed/meta?action=missing_license&action=new_license')->status_is(200);
+    return [grep { ($_->{data}{snippet} // '') eq '2' } @{$t->tx->res->json->{changes}}];
+  };
+  my $shown = $listed->();
+  is scalar(@$shown),     1,             'snippet listed once while the proposal exists';
+  is $shown->[0]{action}, 'new_license', 'the proposal is shown, not the bare report';
+
+  # Dismiss the (bad) proposal - the missing-license report must survive and re-surface. The remove
+  # response returns the un-hidden report as `fallback` so the page can swap it into place without a reload.
+  $t->post_ok("/licenses/proposed/remove/$shown->[0]{token_hexsum}")
+    ->status_is(200)
+    ->json_is('/removed',               1)
+    ->json_is('/fallback/action',       'missing_license')
+    ->json_is('/fallback/data/snippet', 2);
+  my $after = $listed->();
+  is scalar(@$after),     1,                 'the report re-surfaces after dismissing the proposal';
+  is $after->[0]{action}, 'missing_license', 'the bare report is shown again, not lost';
+
+  # Approving instead retires the report for good (create a pattern from a fresh proposal)
+  is_deeply $patterns->propose_new_license(%proposal), {}, 're-proposed';
+  my $reproposed = $listed->();
+  dec(2, 'create-pattern',
+    {license => 'Brand-New-1.0', pattern => $proposal{pattern}, risk => 3, checksum => $reproposed->[0]{token_hexsum}})
+    ->status_is(200)
+    ->json_is('/ok',             true)
+    ->json_is('/results/0/kind', 'pattern');
+  is $count_for_2->(),   0, 'approving the proposal retires both the proposal and the report';
+  is $missing_count->(), 0, 'menu counter clears once the proposal is approved';
+};
+
+subtest 'Markdown reasons on every proposal type' => sub {
+  my $patterns = $t->app->patterns;
+  is_deeply $patterns->propose_create(
+    snippet     => 2,
+    pattern     => 'Brand New License 1.0 markdown reason wording',
+    license     => 'Brand-New-1.0',
+    risk        => 3,
+    package     => 1,
+    owner       => 2,
+    ai_assisted => 1,
+    reason      => "AI Assistant: **Brand-New-1.0, risk 3.**\n\n- deciding clause<script>alert(1)</script>"
+    ),
+    {}, 'pattern proposal filed';
+
+  $t->get_ok('/licenses/proposed/meta?action=create_pattern&filter=markdown')->status_is(200);
+  my $html = $t->tx->res->json->{changes}[0]{reason_html};
+  like $html,   qr{<strong>Brand-New-1\.0, risk 3\.</strong>}, 'markdown rendered for create_pattern';
+  like $html,   qr{<li>deciding clause},                       'list rendered';
+  unlike $html, qr{<script},                                   'html sanitised';
+  unlike $html, qr{AI Assistant},                              'prefix stripped';
 };
 
 done_testing();

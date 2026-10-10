@@ -46,6 +46,92 @@ t.test('Cavil UI - admin browsing', skipUnlessOnline, async t => {
       t.equal(await page.innerText('title'), 'List licenses');
     });
 
+    await t.test('Products (grouping and curator annotation)', async t => {
+      // Report metadata collapses a package's codestreams into the curated product name (pristine state,
+      // checked before any mutation below so it does not depend on test ordering)
+      await page.goto(url);
+      await page.click('text=Artistic');
+      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
+      await page.waitForSelector('#license-chart');
+      t.ok(
+        (await page.locator('.report-metadata-list a', {hasText: 'Multi-Linux Manager'}).count()) > 0,
+        'report shows the curated product name'
+      );
+
+      // The annotated codestreams collapse into one deliverable row; the unannotated one stays a singleton
+      await page.goto(url);
+      await page.click('text=Products');
+      t.equal(await page.innerText('title'), 'List products');
+      await page.waitForSelector('#known-products tbody > tr');
+      const mlm = page.locator('#known-products tbody > tr').filter({hasText: 'Multi-Linux Manager'}).first();
+      await mlm.waitFor();
+      t.match(await mlm.innerText(), /codestreams/, 'annotated codestreams collapse into one group');
+      t.equal(
+        await page.locator('#known-products tbody > tr').filter({hasText: 'openSUSE:Factory'}).count(),
+        1,
+        'unannotated codestream stays a singleton'
+      );
+
+      // Product links navigate in-page, not in a new tab
+      t.equal(await mlm.locator('a[target="_blank"]').count(), 0, 'listing links stay in the same tab');
+
+      // Toggling the grouping chip off switches to a flat view with each codestream's product exposed
+      await Promise.all([
+        page.waitForResponse(
+          resp => /\/pagination\/products\/known/.test(resp.url()) && resp.url().includes('grouped=false')
+        ),
+        page.click('#cavil-products-grouped')
+      ]);
+      const flatRow = page.locator('#known-products tbody > tr').filter({hasText: 'MLM51:Update'}).first();
+      await flatRow.waitFor();
+      t.match(await flatRow.innerText(), /Multi-Linux Manager/, 'flat view exposes each codestream product');
+
+      // Back to the default grouped view for the drill-down
+      await page.goto(url);
+      await page.click('text=Products');
+      await page.waitForSelector('#known-products tbody > tr');
+      const grouped = page.locator('#known-products tbody > tr').filter({hasText: 'Multi-Linux Manager'}).first();
+      await grouped.waitFor();
+
+      // Drilling into the group: the aggregate page has no annotation form but lists its member codestreams
+      await grouped.locator('a').first().click();
+      await page.waitForSelector('#product-reviews .cavil-codestreams');
+      t.equal(await page.locator('#cavil-product-annotation').count(), 0, 'group page has no annotation form');
+      await page.click('.cavil-codestreams > summary');
+      t.equal(await page.locator('.cavil-codestreams a').count(), 2, 'group lists its member codestreams');
+
+      // From a member codestream the annotation is editable and pre-filled with the current product
+      await page.locator('.cavil-codestreams a').filter({hasText: 'MLM51:Update'}).first().click();
+      await page.waitForSelector('#cavil-product-annotation');
+      t.equal(await page.inputValue('#cavil-product-annotation'), 'Multi-Linux Manager', 'annotation is pre-filled');
+
+      // Clearing the annotation returns the codestream to the listing as its own row (no dead end)
+      await page.fill('#cavil-product-annotation', '');
+      await Promise.all([
+        page.waitForResponse(resp => /\/products\/.*\/annotation/.test(resp.url())),
+        page.click('#cavil-save-annotation')
+      ]);
+      await page.waitForSelector('#cavil-save-annotation .fa-check');
+      await page.goto(url);
+      await page.click('text=Products');
+      await page.waitForSelector('#known-products tbody > tr');
+      t.equal(
+        await page.locator('#known-products tbody > tr').filter({hasText: 'MLM51:Update'}).count(),
+        1,
+        'cleared codestream reappears as its own row'
+      );
+
+      // A curator can also set an annotation on a standalone codestream
+      await page.goto(`${url}/products/openSUSE:Factory`);
+      await page.waitForSelector('#cavil-product-annotation');
+      await page.fill('#cavil-product-annotation', 'Tumbleweed Family');
+      await Promise.all([
+        page.waitForResponse(resp => /\/products\/.*\/annotation/.test(resp.url())),
+        page.click('#cavil-save-annotation')
+      ]);
+      await page.waitForSelector('#cavil-save-annotation .fa-check');
+    });
+
     await t.test('Open reviews (logged in)', async t => {
       await page.goto(url);
       t.equal(await page.innerText('title'), 'List open reviews');
@@ -57,7 +143,7 @@ t.test('Cavil UI - admin browsing', skipUnlessOnline, async t => {
 
       await page.click('text=Next');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(2)'), 'test#7');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), '', 'no import time yet');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(4)'), 'perl-UI-Test7');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(5)'), 'not yet imported');
 
@@ -66,6 +152,174 @@ t.test('Cavil UI - admin browsing', skipUnlessOnline, async t => {
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), /ago/);
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(4)'), 'perl-Mojolicious');
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(5)'), /Artistic/);
+    });
+
+    await t.test('CVE badge next to the external link', async t => {
+      await page.route('**/pagination/reviews/open*', async route => {
+        const response = await route.fetch();
+        const data = await response.json();
+        // A bare "CVE" tag counts too, and a hostile tag proves the badge escapes tag content.
+        if (data.page && data.page[0]) data.page[0].tags = ['CVE', 'CVE-<img src=x onerror=alert(1)>'];
+        await route.fulfill({response, json: data});
+      });
+
+      await page.goto(url);
+      const badge = page.locator('#open-reviews tbody > tr:nth-child(1) .cavil-list-link .cavil-cve-badge');
+      await badge.waitFor();
+      t.equal(await badge.innerText(), 'CVE', 'CVE badge sits in the link cell for a CVE-tagged review');
+      t.match(await badge.getAttribute('title'), /security fixes/, 'badge explains the CVE');
+      t.equal(
+        await page.locator('#open-reviews tbody > tr:nth-child(1) img').count(),
+        0,
+        'hostile tag content is escaped, not rendered as HTML'
+      );
+
+      await page.unroute('**/pagination/reviews/open*');
+    });
+
+    await t.test('CVE badge on recent reviews', async t => {
+      // ui_fixtures has no reviewed packages, so inject a synthetic recent row to exercise the wiring.
+      const now = Date.now() / 1000;
+      await page.route('**/pagination/reviews/recent*', async route => {
+        const response = await route.fetch();
+        const data = await response.json();
+        data.page = [
+          {
+            id: 999999,
+            name: 'cve-recent-test',
+            external_link: 'ibs#4321',
+            imported_epoch: now,
+            reviewed_epoch: now,
+            unpacked_epoch: now,
+            indexed_epoch: now,
+            checksum: 'deadbeefdeadbeefdeadbeefdeadbeef',
+            unresolved_matches: 0,
+            priority: 5,
+            result: 'ok',
+            state: 'acceptable',
+            login: 'tester',
+            tags: ['CVE']
+          }
+        ];
+        data.total = 1;
+        data.start = 1;
+        data.end = 1;
+        await route.fulfill({response, json: data});
+      });
+
+      await page.goto(url);
+      await page.click('text=Recently Reviewed');
+      const badge = page.locator('#recent-reviews tbody > tr:nth-child(1) .cavil-list-link .cavil-cve-badge');
+      await badge.waitFor();
+      t.equal(await badge.innerText(), 'CVE', 'CVE badge sits in the recent-reviews link cell');
+
+      // A fresh click (no filter typed first) must refetch with the tag filter, not the stale empty one
+      await Promise.all([
+        page.waitForResponse(
+          resp => /\/pagination\/reviews\/recent/.test(resp.url()) && /filter=tag(%3A|%3D|:|=)CVE/i.test(resp.url())
+        ),
+        badge.click()
+      ]);
+      t.equal(
+        await page.inputValue('#recent-reviews-filter-input'),
+        'tag=CVE',
+        'badge click fills the recent filter box and refetches with it'
+      );
+
+      await page.unroute('**/pagination/reviews/recent*');
+    });
+
+    await t.test('Filter reviews by CVE tag', async t => {
+      await page.goto(url);
+      await page.waitForSelector('#open-reviews tbody > tr:nth-child(1)');
+
+      // Typing a tag:field token narrows to the one CVE-tagged fixture (harbor-helm)
+      await Promise.all([
+        page.waitForResponse(
+          resp => /\/pagination\/reviews\/open/.test(resp.url()) && /filter=tag(%3A|%3D|:|=)CVE/i.test(resp.url())
+        ),
+        (async () => {
+          await page.fill('#open-reviews-filter-input', 'tag:CVE');
+          await page.press('#open-reviews-filter-input', 'Enter');
+        })()
+      ]);
+      await page.waitForFunction(() => document.querySelectorAll('#open-reviews tbody > tr').length === 1);
+      const row = page.locator('#open-reviews tbody > tr').first();
+      t.match(await row.innerText(), /harbor-helm/, 'only the CVE-tagged review remains');
+      t.equal(await row.locator('.cavil-cve-badge').count(), 1, 'the surviving row keeps its CVE badge');
+
+      // Clicking the badge is the point-and-click path into the same filter
+      await Promise.all([
+        page.waitForResponse(
+          resp => /\/pagination\/reviews\/open/.test(resp.url()) && /filter=tag(%3A|%3D|:|=)CVE/i.test(resp.url())
+        ),
+        row.locator('.cavil-cve-badge').click()
+      ]);
+      t.equal(await page.inputValue('#open-reviews-filter-input'), 'tag=CVE', 'badge click fills the filter box');
+    });
+
+    await t.test('Note icons and the Annotated filter', async t => {
+      await page.goto(url);
+      await page.waitForSelector('#open-reviews tbody > tr:nth-child(10)');
+
+      // One fixture package per state: perl-UI-Test1 an agent review, perl-Mojolicious a human one
+      // (it also has an AI-assisted note, untagged, which must not promote it), harbor-helm a plain note
+      const mojo1 = page.locator('#open-reviews tbody > tr').filter({hasText: 'mojo#1'}).first();
+      const mojo2 = page.locator('#open-reviews tbody > tr').filter({hasText: 'mojo#2'}).first();
+      const harbor = page.locator('#open-reviews tbody > tr').filter({hasText: 'harbor-helm'}).first();
+      const agent = page.locator('#open-reviews tbody > tr').filter({hasText: 'perl-UI-Test1'}).first();
+      t.equal(await agent.locator('.cavil-list-notes.is-review .fa-robot').count(), 1, 'robot for an agent review');
+      t.equal(
+        await mojo1.locator('.cavil-list-notes.is-review .fa-note-sticky').count(),
+        1,
+        'filled note for a human review, an untagged AI note does not make it an agent review'
+      );
+      t.equal(await harbor.locator('.cavil-list-notes:not(.is-review)').count(), 1, 'muted note for a plain note');
+      t.equal(await mojo2.locator('.cavil-list-notes').count(), 0, 'no icon without a relevant note');
+
+      await Promise.all([
+        page.waitForResponse(
+          resp => /\/pagination\/reviews\/open/.test(resp.url()) && resp.url().includes('annotated=true')
+        ),
+        page.click('#cavil-pkg-annotated')
+      ]);
+      await page.waitForFunction(() => document.querySelectorAll('#open-reviews tbody > tr').length === 3);
+      t.equal(await page.locator('#open-reviews tbody > tr .cavil-list-notes').count(), 3, 'only annotated reviews');
+
+      // The icon is a shortcut into the Notes tab of the report, scrolled to, not just switched to
+      await page.locator('#open-reviews tbody > tr').first().locator('.cavil-list-notes').click();
+      await page.waitForSelector('#report-notes-pane.is-active .report-note');
+      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
+      await page.waitForFunction(() => document.getElementById('report-tabs').getBoundingClientRect().top < 80);
+      t.pass('tab strip scrolled to the top of the viewport');
+    });
+
+    await t.test('Note icons and the Annotated filter on a product', async t => {
+      // openSUSE:Factory ships the annotated perl-Mojolicious review
+      await page.goto(`${url}/products/openSUSE:Factory`);
+      await page.waitForSelector('#product-reviews tbody > tr');
+      t.equal(await page.locator('.cavil-list-notes.is-review').count(), 1, 'review note icon on the product listing');
+      await Promise.all([
+        page.waitForResponse(
+          resp => /\/pagination\/products\//.test(resp.url()) && resp.url().includes('annotated=true')
+        ),
+        page.click('#cavil-pkg-annotated')
+      ]);
+      await page.waitForSelector('#product-reviews tbody > tr .cavil-list-notes');
+      t.equal(await page.locator('#product-reviews tbody > tr').count(), 1, 'annotated review survives the filter');
+
+      // The other codestream ships the review nobody has annotated
+      await page.goto(`${url}/products/${encodeURIComponent('SUSE:SLE-15-SP7:Update:Products:MLM51:Update')}`);
+      await page.waitForSelector('#product-reviews tbody > tr');
+      t.equal(await page.locator('.cavil-list-notes').count(), 0, 'no icon there');
+      await Promise.all([
+        page.waitForResponse(
+          resp => /\/pagination\/products\//.test(resp.url()) && resp.url().includes('annotated=true')
+        ),
+        page.click('#cavil-pkg-annotated')
+      ]);
+      await page.waitForSelector('#all-done');
+      t.equal(await page.locator('#product-reviews tbody > tr .cavil-list-notes').count(), 0, 'filtered away');
     });
 
     await t.test('Reports', async t => {
@@ -84,6 +338,7 @@ t.test('Cavil UI - admin browsing', skipUnlessOnline, async t => {
       await page.goto(url);
       await page.click('text=Licenses');
       t.equal(await page.innerText('title'), 'List licenses');
+
       await page.click('text=Artistic-2.0');
       t.equal(await page.innerText('title'), 'License details of Artistic-2.0');
       await page.waitForSelector('#license-details .license-pattern-card');
@@ -105,18 +360,19 @@ t.test('Cavil UI - admin browsing', skipUnlessOnline, async t => {
         initialCards
       );
 
-      const spdx = await page.locator('#license-details input[name="spdx"]').inputValue();
-      await page.locator('#license-details input[name="spdx"]').fill(spdx);
-      await page.locator('#license-details .license-spdx-form button[type="submit"]').click();
+      const spdxInput = page.locator('#license-details #license-edit-spdx');
+      await spdxInput.fill(await spdxInput.inputValue());
+      page.once('dialog', dialog => dialog.accept());
+      await page.locator('#license-details #license-edit-form button[type="submit"]').click();
       await page.waitForSelector('#license-details .toast-item.toast-success');
       t.match(await page.innerText('#license-details .toast-item'), /patterns updated/);
     });
 
     await t.test('Search (logged in)', async t => {
       await page.goto(url);
-      await page.locator('[placeholder="Search packages"]').click();
-      await page.locator('[placeholder="Search packages"]').fill('perl-Mojolicious');
-      await page.locator('[placeholder="Search packages"]').press('Enter');
+      await page.click('#cavil-package-search .cavil-package-search-trigger');
+      await page.locator('#cavil-package-search-input').fill('perl-Mojolicious');
+      await page.locator('#cavil-package-search-input').press('Enter');
       await page.waitForURL(`${url}/search?q=perl-Mojolicious`);
       t.equal(await page.innerText('title'), 'Search Results');
       await page.waitForFunction(() => {
@@ -144,23 +400,13 @@ t.test('Cavil UI - admin browsing', skipUnlessOnline, async t => {
 
       const apache = page.locator('#risk-5 > li').filter({hasText: 'Apache-2.0'}).first();
       t.match(await apache.innerText(), /102 files/);
+      t.equal(await apache.locator('a.file-link').count(), 3, 'every license shows its first 3 files');
+      await apache.locator('button.risk-file-more').click();
       t.equal(await apache.locator('a.file-link').count(), 21);
       t.match(await apache.textContent(), /81 more/);
     });
 
-    await t.test('Large unresolved report omits inline preview indicator', async t => {
-      // mojo#1 has only a handful of unresolved matches, well under the
-      // max_expanded_files cap - the indicator must stay out of the DOM.
-      await page.goto(url);
-      await page.click('text=Artistic');
-      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
-      await page.waitForSelector('#license-chart');
-      t.equal(
-        await page.locator('#hidden-previews-notice').count(),
-        0,
-        'no indicator when missed-file count is under the cap'
-      );
-
+    await t.test('Large unresolved report loads no sources until a file is opened', async t => {
       // synthetic-many-unresolved is a fixture package with 110 files, each
       // containing one unresolved keyword match (real index pipeline, real
       // sources). Navigate via the priority-1 open-reviews page -> row link
@@ -182,20 +428,24 @@ t.test('Cavil UI - admin browsing', skipUnlessOnline, async t => {
       t.equal(await page.innerText('title'), 'Report for synthetic-many-unresolved');
       await page.waitForSelector('#unmatched-files');
       t.match(await page.innerText('#unmatched-files'), /110 files/);
-      t.equal(await page.locator('#hidden-previews-notice').count(), 0, 'inline preview indicator is not shown');
+      t.equal(await page.locator('.report-match-panel').count(), 0, 'no match panel is open');
+      await page.locator('#filelist-snippets .file-link').first().click();
+      await page.waitForSelector('.report-match-panel table.snippet');
+      t.equal(await page.locator('.report-match-panel tr.match-start').count(), 1, 'the file opens inline');
     });
 
     await t.test('Missing Licenses', async t => {
+      // ui_fixtures seeds one new-license proposal, so the landing page renders that card (the full
+      // approve/dismiss/edit flow lives in ui_patterns). This is a read-only presence check.
       await page.goto(url);
       await openAccountMenu(page);
       await page.click('text=Missing Licenses');
       t.equal(await page.innerText('title'), 'Missing Licenses');
-      await page.waitForFunction(() =>
-        /All caught up!\s+No missing licenses have been flagged/.test(document.body.innerText)
-      );
+      await page.waitForSelector('#missing-licenses .change-container');
       t.match(
-        await page.innerText('#missing-licenses > div > div:nth-child(2)'),
-        /All caught up!\s+No missing licenses have been flagged/
+        await page.innerText('#missing-licenses .change-header'),
+        /Proposed license by/,
+        'renders the seeded proposal card'
       );
     });
 

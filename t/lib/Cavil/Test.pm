@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Test;
 use Mojo::Base -base, -signatures;
@@ -61,7 +49,6 @@ sub default_config ($self) {
     max_worker_rss                           => 100000,
     max_expanded_files                       => 100,
     max_file_browser_size                    => 1_000_000,
-    always_generate_spdx_reports             => 0,
     spdx                                     => {
       namespace             => 'http://legaldb.suse.de/spdx/',
       creator               => {name => 'SUSE LLC', email => 'security@suse.de'},
@@ -108,7 +95,6 @@ sub just_patterns_fixtures ($self, $app) {
 sub mojo_fixtures ($self, $app) {
   $self->no_fixtures($app);
 
-  # Create checkout directory
   my $dir       = $self->checkout_dir;
   my @src       = ('perl-Mojolicious', 'c7cfdab0e71b0bebfdf8b2dc3badfecd');
   my $mojo      = $dir->child(@src)->make_path;
@@ -118,7 +104,6 @@ sub mojo_fixtures ($self, $app) {
   $mojo = $dir->child(@src)->make_path;
   $_->copy_to($mojo->child($_->basename)) for $legal_bot->child(@src)->list->each;
 
-  # Create fixtures
   my $usr_id = $app->pg->db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
   my $pkgs   = $app->packages;
   my $pkg_id = $pkgs->add(
@@ -180,13 +165,13 @@ sub mojo_fixtures ($self, $app) {
 sub components_fixtures ($self, $app) {
   $self->no_fixtures($app);
 
-  # Checkout whose source archive vendors npm and cargo modules under obscured directory names
+  # Obscured paths require content-based component detection.
   my @src       = ('vendored', 'da39a3ee5e6b4b0d3255bfef95601890');
   my $checkout  = $self->checkout_dir->child(@src)->make_path;
   my $legal_bot = path(__FILE__)->dirname->dirname->dirname->child('legal-bot');
   $_->copy_to($checkout->child($_->basename)) for $legal_bot->child(@src)->list->each;
 
-  # A license pattern so Cavil can detect the license of the vendored module whose metadata omits one
+  # Backfill a component whose metadata omits its license.
   my $patterns = $app->patterns;
   $patterns->create(pattern => 'Permission is hereby granted to use this fixture component', license => 'MIT');
   $app->pg->db->query('UPDATE license_patterns SET spdx = $1 WHERE license = $1', 'MIT');
@@ -210,9 +195,7 @@ sub components_fixtures ($self, $app) {
 
 sub go_vendor_fixtures ($self, $app) {
 
-  # A Go project that vendors its modules at the source root: the tarball's only top-level entry is
-  # vendor/, so vendor/modules.txt lands at the root of the unpacked tree. Reuses the schema/user set up
-  # by an earlier fixture in the same test (no migration here).
+  # Root-level dependency listings must not be mistaken for primary manifests.
   my @src       = ('go-vendor', 'b6d767d2f8ed5d21a44b0e5886680cb9');
   my $checkout  = $self->checkout_dir->child(@src)->make_path;
   my $legal_bot = path(__FILE__)->dirname->dirname->dirname->child('legal-bot');
@@ -239,10 +222,7 @@ sub go_vendor_fixtures ($self, $app) {
 
 sub multiarchive_fixtures ($self, $app) {
 
-  # A checkout that ships several archives side by side (the main source plus a separately-vendored
-  # crate). With archive_name_as_dir off they unpack directly under .unpacked, so it has multiple
-  # top-level directories and a vendored manifest (serde-1.0.197/Cargo.toml) lands at depth 1. Reuses the
-  # schema/user from an earlier fixture in the same test.
+  # Multiple top-level archives make a depth-one manifest vendored, not primary.
   my @src       = ('multiarchive', 'c4ca4238a0b923820dcc509a6f75849b');
   my $checkout  = $self->checkout_dir->child(@src)->make_path;
   my $legal_bot = path(__FILE__)->dirname->dirname->dirname->child('legal-bot');
@@ -287,14 +267,12 @@ sub no_fixtures ($self, $app) {
 sub package_with_snippets_fixtures ($self, $app) {
   $self->no_fixtures($app);
 
-  # Create checkout directory
   my $dir = $self->checkout_dir;
   my @src = ('package-with-snippets', '2a0737e27a3b75590e7fab112b06a76fe7573615');
   my $src = $dir->child(@src)->make_path;
   $_->copy_to($src->child($_->basename))
     for path(__FILE__)->dirname->dirname->dirname->child('legal-bot', @src)->list->each;
 
-  # Create fixtures
   my $usr_id = $app->pg->db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
   my $pkgs   = $app->packages;
   my $pkg_id = $pkgs->add(
@@ -322,9 +300,7 @@ sub package_with_snippets_fixtures ($self, $app) {
   );
 }
 
-# Synthetic fixture for the snippet fold-in UI test: index a package, make every snippet a
-# confident, current-version GPL match, and regenerate the report so it folds. Requires the app to
-# be built with snippet_fold enabled.
+# Confident, current, low-risk GPL matches must fold into the cached report.
 sub snippet_fold_fixtures ($self, $app) {
   $self->package_with_snippets_fixtures($app);
   $app->minion->enqueue(unpack => [1]);
@@ -342,10 +318,7 @@ sub snippet_fold_fixtures ($self, $app) {
   $app->minion->perform_jobs;
 }
 
-# Synthetic fixture for the boilerplate-clear UI test: index a package, then make every snippet a
-# high-containment but zero-margin match of a synthetic license so it can only *clear* (never fold).
-# The synthetic license cannot appear from any real match, so its absence proves clearing asserts
-# nothing. Requires the app to be built with snippet_fold clear_threshold enabled.
+# Zero-margin matches may clear boilerplate but must never assert a license.
 sub snippet_clear_fixtures ($self, $app) {
   $self->package_with_snippets_fixtures($app);
   $app->minion->enqueue(unpack => [1]);
@@ -364,9 +337,7 @@ sub snippet_clear_fixtures ($self, $app) {
   $app->minion->perform_jobs;
 }
 
-# Synthetic fixture for the overlap-clear UI test: index a package, make every snippet classifier-legal
-# but unscored (so similarity can never resolve it), and add a real GPL match on each snippet's first
-# line so the snippet's region overlaps a curated license match. Requires snippet_fold overlap_clear on.
+# Curated overlap may clear unscored legal snippets without similarity resolution.
 sub snippet_overlap_fixtures ($self, $app) {
   $self->package_with_snippets_fixtures($app);
   $app->minion->enqueue(unpack => [1]);
@@ -386,10 +357,7 @@ sub snippet_overlap_fixtures ($self, $app) {
   $app->minion->perform_jobs;
 }
 
-# Synthetic fixture for the Classify Snippets triage UI test: a controlled mix of snippets with known
-# fold/clear status and distinct, searchable text - 12 would-fold (wide margin, one of them a
-# Non-Commercial stemming case), 1 would-clear (zero margin), 1 neither (low similarity). Requires the
-# app to be built with snippet_fold thresholds (and clear_threshold) set.
+# Controlled fold, clear, and unresolved cases exercise triage filters.
 sub snippet_triage_fixtures ($self, $app) {
   $self->package_with_snippets_fixtures($app);
   my $db    = $app->pg->db;
@@ -475,12 +443,33 @@ sub spdx_line_shift_fixtures ($self, $app) {
 
   # Line 3 is a minified blob that the line-wrapper breaks in two, so the declaration on line 4
   # is scanned as line 5
+  # The trailing notice is appended, not prepended: the line numbers above are what this fixture exists
+  # to pin. It repeats verbatim in helper.js below, which is how a header notice behaves in a real tree
+  # and what the notices being stored once per package with the files they cover has to survive.
   $dir->child('bundle.js')->spew(<<"JS");
 /* generated bundle, do not edit */
 var a = 1;
 @{['x' x 200]} @{['y' x 50]}
 /* Permission is hereby granted under the Cavil Fixture License */
 var b = 2;
+/* Copyright (c) 2019 Cavil Fixture Authors */
+JS
+
+  $dir->child('helper.js')->spew(<<'JS');
+/* Copyright (c) 2019 Cavil Fixture Authors */
+var c = 3;
+JS
+
+  # A non-ASCII filename, in the bytes a real checkout carries. Every lookup between the indexer and the
+  # SBOM keys on this name, so decoding it anywhere along the way drops the file out of the document.
+  $dir->child("b\xc3\xbccher.c")->spew(<<'JS');
+/* Copyright (c) 2019 Umlaut Authors */
+/* Permission is hereby granted under the Cavil Fixture License */
+JS
+
+  # Text a curator has looked at and declined to identify, which is what a catch-all license name means
+  $dir->child('unclear.c')->spew(<<'JS');
+/* Redistribution of this fixture is permitted under terms nobody has named */
 JS
 
   # Markup is stripped to its text, so the declaration on line 6 is scanned as line 2
@@ -521,6 +510,13 @@ HTML
   );
   $db->query('UPDATE license_patterns SET spdx = $1 WHERE license = $1', 'MIT');
 
+  # Cavil::Model::Patterns derives catch_all from the license name, so this one arrives flagged
+  $app->patterns->create(
+    pattern   => 'Redistribution of this fixture is permitted under terms nobody has named',
+    license   => 'Any Permissive',
+    unique_id => '413430b9-8f04-49d8-93ef-953b68835d61'
+  );
+
   return $pkg_id;
 }
 
@@ -528,6 +524,17 @@ sub ui_fixtures ($self, $app) {
   $app->pg->migrations->migrate;
 
   $self->mojo_fixtures($app);
+
+  # A grab-bag license for the license list to show next to the identified ones. Its text deliberately
+  # appears in none of the fixture packages: the reports here are navigated by file id and risk bucket,
+  # and one more match would renumber the files and put one file in two buckets.
+  $app->patterns->create(
+    pattern   => 'distributed under the same license as the accompanying package, see its LICENSE file',
+    license   => 'Any reference local',
+    risk      => 3,
+    unique_id => '413430b9-8f04-49d8-93ef-953b68835d56'
+  );
+
   my $pkgs = $app->packages;
   $pkgs->unpack($_) for 1 .. 2;
 
@@ -567,6 +574,9 @@ sub ui_fixtures ($self, $app) {
   $pkgs->update($harbor);
   $pkgs->unpack($pkg_id);
 
+  # One open review with a CVE tag so the tag filter (tag:CVE) has real data to match
+  $pkgs->add_tags($pkg_id, ['CVE']);
+
   # Synthetic package with many unresolved keyword matches. Built from a real
   # tarball and indexed by the regular unpack + analyze pipeline so the
   # missed_files collection is genuine (no bot_reports surgery). Drives the
@@ -600,6 +610,17 @@ sub ui_fixtures ($self, $app) {
   my $bot_id = $app->users->find(login => 'test_bot')->{id};
   my $notes  = $app->notes;
 
+  # One package per note-icon state in the review listings: harbor-helm a plain note, perl-UI-Test1
+  # an agent review, perl-Mojolicious a human review (note 24 below). Seeded before the
+  # perl-Mojolicious block so that package keeps the newest note.
+  $notes->add($app->packages->find_by_name_and_md5('harbor-helm', '4fcfdab0e71b0bebfdf8b5cc3badfec4')->{id},
+    'harbor-helm', $bot_id, 'Chart bundles upstream manifests, worth a look.', 0);
+  $notes->add(
+    $app->packages->find_by_name_and_md5('perl-UI-Test1', 'doesnotexist')->{id},
+    'perl-UI-Test1', $bot_id, 'Recommend accepting, MIT throughout.',
+    0,               1,       ['review']
+  );
+
   # 25 seeded notes so endless scroll must fetch a second page (default
   # page size is 20). The oldest entry doubles as a lawyer-only fixture so
   # the lawyer-only highlighting + tab-badge tinting always have data when
@@ -610,15 +631,54 @@ sub ui_fixtures ($self, $app) {
       = $i == 25
       ? "Latest review notes.\n\n* check Apache-2.0 obligations\n* verify shipped LICENSE"
       : "Seed note #$i for **perl-Mojolicious**.";
-    $notes->add(1, 'perl-Mojolicious', $bot_id, $body, $lawyer, $i == 25 ? 1 : 0);
+    $notes->add(1, 'perl-Mojolicious', $bot_id, $body, $lawyer, $i == 25 ? 1 : 0, $i == 24 ? ['review'] : []);
   }
+
+  # Product codestreams: two annotated to one deliverable (so the listing collapses them and the report
+  # for perl-Mojolicious shows a single product name) plus one unannotated codestream (raw-name fallback)
+  my $products = $app->products;
+  my $mlm1     = $products->find_or_create('SUSE:SLE-15-SP7:Update:Products:MLM51')->{id};
+  my $mlm2     = $products->find_or_create('SUSE:SLE-15-SP7:Update:Products:MLM51:Update')->{id};
+  my $factory  = $products->find_or_create('openSUSE:Factory')->{id};
+  $products->update($mlm1,    [1]);
+  $products->update($mlm2,    [2]);
+  $products->update($factory, [1]);
+  $products->set_annotation('SUSE:SLE-15-SP7:Update:Products:MLM51',        'Multi-Linux Manager');
+  $products->set_annotation('SUSE:SLE-15-SP7:Update:Products:MLM51:Update', 'Multi-Linux Manager');
+
+  # A brand-new-license proposal exactly as the cavil-refine agent files it: an unresolved
+  # mojo#2 snippet, researched to a license Cavil does not know yet, at a chosen risk. No web flow creates
+  # a new_license action (only the MCP propose path does), so the lawyer's ratify journey on the Missing
+  # Licenses page legitimately starts from a seeded proposal.
+  my $reported = $db->query(
+    'SELECT s.id, s.text FROM file_snippets fs JOIN snippets s ON s.id = fs.snippet
+       WHERE fs.package = 2 AND fs.resolution IS NULL AND fs.generation = 0 LIMIT 1'
+  )->hash;
+  $db->insert(
+    'proposed_changes',
+    {
+      action       => 'new_license',
+      token_hexsum => 'uinewlicense00000000000000000001',
+      owner        => $bot_id,
+      data         => {
+        -json => {
+          snippet     => $reported->{id},
+          pattern     => $reported->{text},
+          from        => 'perl-Mojolicious',
+          package     => 2,
+          license     => 'UI-New-License-1.0',
+          risk        => 2,
+          ai_assisted => 1,
+          reason      => "AI Assistant: **UI New License 1.0 (no SPDX id) - risk 2.** A permissive license.\n\n"
+            . "**Risk rationale**\nThe only condition is preserving the attribution notice, so risk 2.\n\n"
+            . "**Double-check before accepting**\nNot on the SPDX list; confirm the license name first."
+        }
+      }
+    }
+  );
 }
 
-# Builds a real, indexable test package whose files each contain one
-# distinctive keyword that matches a license-less pattern. The result is a
-# fully analyzed package with one unresolved snippet per file, comfortably
-# more than `max_expanded_files`. Generates the tarball + spec on disk so
-# the regular unpack pipeline can process it; no bot_reports surgery.
+# Real pipeline fixture with more distinct unresolved files than the preview cap.
 sub _synthetic_many_unresolved_fixture ($self, $app, $usr_id) {
   my $checkout_md5 = 'cafefeed00000000000000000000abcd';
   my $synth_dir    = $self->checkout_dir->child('synthetic-many-unresolved', $checkout_md5)->make_path;
@@ -640,10 +700,7 @@ registered as a keyword pattern with no license, so every file becomes
 an unresolved match after indexing.
 SPEC
 
-  # Each file gets a unique marker adjacent to the keyword so the snippet
-  # hash (which includes ~5 words of context around the keyword) is distinct
-  # per file. Without this, all 110 files would share one snippet and only
-  # one missed-file would be reported.
+  # Unique context prevents cross-file snippet deduplication.
   my $stage = tempdir;
   my $src   = $stage->child('synthetic-many-unresolved-1.0')->make_path;
   for my $i (1 .. 110) {
@@ -687,11 +744,7 @@ FILE
   );
 }
 
-# Two synthetic versions of the same package, run through the regular unpack +
-# analyze pipeline, so version 2 gets a genuine "New unresolved matches in N
-# files" notice diffed against the accepted version 1. Drives the clickable
-# file list in the "why this needs review" box on the report UI. Version 2 (id
-# 2) has eight new unresolved files, exercising the five-file cap + "more".
+# Two real pipeline versions exercise notice diffs and the five-file display cap.
 sub report_notice_fixtures ($self, $app) {
   $app->pg->migrations->migrate;
 
@@ -769,8 +822,7 @@ FILE
     return $pkg_id;
   };
 
-  # Version 1: the closest previous review, marked acceptable so it is a genuine
-  # "old review" for version 2 to diff against.
+  # Only accepted versions qualify as comparison baselines.
   my $v1   = $build->('a0000000000000000000000000000001', [1, 2]);
   my $pkg1 = $pkgs->find($v1);
   $pkg1->{reviewing_user}   = $usr_id;
@@ -779,20 +831,14 @@ FILE
   $pkg1->{review_timestamp} = 1;
   $pkgs->update($pkg1);
 
-  # Version 2: eight brand-new files → eight new unresolved matches, plus one
-  # file resolving to a brand-new Apache-2.0 license, so analyze writes a diff
-  # report with both new_unresolved and new_licenses.
+  # Version 2 adds eight unresolved files and one license.
   $build->(
     'b0000000000000000000000000000002',
     [101 .. 108],
     {'LICENSE-APACHE.txt' => "report-notice distinctive apache license marker\n"}
   );
 
-  # A second package (ids 3 and 4) for the other notice shape that names an
-  # older review by id. Its own name keeps it out of the closest-match lookups
-  # above. Version 2 drops one of version 1's files: the report checksum
-  # changes (so no review is inherited) but the delta gains nothing, and
-  # analyze writes "Not found any significant difference against 3".
+  # A separate name isolates the no-significant-difference history.
   my $other = 'report-notice-same';
   my $same1 = $build->('c0000000000000000000000000000003', [1, 2], {}, $other);
   my $pkg3  = $pkgs->find($same1);
@@ -802,6 +848,52 @@ FILE
   $pkg3->{review_timestamp} = 1;
   $pkgs->update($pkg3);
   $build->('d0000000000000000000000000000004', [1], {}, $other);
+}
+
+# A file that exceeds the (test-lowered) max_file_browser_size, so the standalone file browser pages through
+# it in windows. It repeats its license match past the first window. The wrapper sets max_file_browser_size
+# to 2000 bytes.
+sub large_file_fixtures ($self, $app) {
+  $app->pg->migrations->migrate;
+
+  my $pkgs   = $app->packages;
+  my $usr_id = $app->pg->db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
+
+  # A distinctive licensed marker so each occurrence is a real risk-3 pattern match
+  $app->patterns->create(
+    pattern   => 'large file lab license marker',
+    license   => 'MIT',
+    risk      => 3,
+    unique_id => '00000000-0000-0000-0000-0000000000aa'
+  );
+  $app->pg->db->query('UPDATE license_patterns SET spdx = $1 WHERE license = $1', 'MIT');
+
+  my $md5 = 'aa00000000000000000000000000aa01';
+  my $dir = $self->checkout_dir->child('large-file', $md5)->make_path;
+
+  # ~46 bytes per filler line, so hidden-match repeats the marker at line 82 (~3.7 KB in), past the first window
+  my $filler = sub {
+    join '', map { sprintf "large file lab filler line %03d padding padding\n", $_ } $_[0] .. $_[1];
+  };
+  $dir->child('hidden-match.txt')
+    ->spew(
+    "large file lab license marker\n" . $filler->(1, 80) . "large file lab license marker\n" . $filler->(81, 150));
+
+  my $pkg_id = $pkgs->add(
+    name            => 'large-file',
+    checkout_dir    => $md5,
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => 'large-file',
+    srcmd5          => $md5,
+    priority        => 5
+  );
+  $pkgs->imported($pkg_id);
+  $pkgs->unpack($pkg_id);
+  $app->minion->perform_jobs;
+
+  return $pkg_id;
 }
 
 sub compatibility_fixtures ($self, $app) {
@@ -859,6 +951,196 @@ SPEC
   return $pkg_id;
 }
 
+sub legal_documents_fixtures ($self, $app) {
+  $app->pg->migrations->migrate;
+
+  my $pkgs   = $app->packages;
+  my $usr_id = $app->pg->db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
+
+  for my $license ('MIT', 'Apache-2.0', 'ISC') {
+    $app->patterns->create(pattern => "SPDX-License-Identifier: $license", license => $license);
+  }
+  $app->pg->db->query('UPDATE license_patterns SET spdx = license WHERE license IN (?, ?, ?)',
+    'MIT', 'Apache-2.0', 'ISC');
+
+  # A body pattern, so a fully recognised document can be longer than a one-line SPDX stub
+  my $mit_body = <<'MIT';
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+MIT
+  $app->patterns->create(pattern => $mit_body, license => 'MIT');
+
+  # A package carrying one of each thing the documents list has to get right: a LICENSE whose terms are
+  # only partly recognised, a vendored dependency's own license that must not bury it, and a Go source
+  # file named after a license word that is not a document at all.
+  my $name = 'legal-docs';
+  my $md5  = 'd0000000000000000000000000000001';
+  my $dir  = $self->checkout_dir->child($name, $md5)->make_path;
+  $dir->child("$name.spec")->spew(<<"SPEC");
+Name:           $name
+Version:        1.0
+Release:        0
+Summary:        Synthetic package with a partly unrecognised license file for UI testing
+License:        MIT
+Group:          Development/Libraries/Perl
+Source0:        $name-1.0.tar.gz
+BuildArch:      noarch
+
+%description
+Synthetic package whose LICENSE carries terms Cavil does not recognise.
+SPEC
+
+  my $stage = tempdir;
+  my $src   = $stage->child("$name-1.0")->make_path;
+  $src->child('LICENSE')->spew(<<'LICENSE');
+SPDX-License-Identifier: MIT
+
+You may not use this software for evil.
+You may not use this software commercially without a separate agreement.
+Contact sales@example.com for enterprise terms.
+LICENSE
+
+  # A second, much longer document, so the list has two rows whose counts differ in width. The panel
+  # aligns its numbers into a column and a single-row fixture could never show that.
+  $src->child('COPYING')->spew(join "\n", '# SPDX-License-Identifier: Apache-2.0',
+    '', (map {"Clause $_ of some unrecognised terms."} 1 .. 119), '');
+
+  # Lines over 115 characters trip the line-wrapper, so Cavil indexes its own COPYRIGHT.processed copy
+  # and the report has a name carrying that marker. Only the keyword pattern matches it, and keywords are
+  # not recognition, so it is also the document with nothing recognised in it at all.
+  $app->patterns->create(pattern => 'a distinctly unrecognised clause');
+  $src->child('COPYRIGHT')->spew(('a distinctly unrecognised clause ' x 12) . "\n");
+
+  # Nothing left over, and between two documents that have some, where a collapsing slot would show
+  $src->child('LICENSE.MIT')->spew($mit_body);
+
+  # The case the whole panel exists for: a couple of novel lines on an otherwise stock license body
+  $src->child('LICENSE.enterprise')
+    ->spew($mit_body
+      . "\nYou may not use this software commercially without a separate agreement.\n"
+      . "Contact sales\@example.com for enterprise terms.\n");
+
+  # Buried the way TeX Live buries them, so the list has a path long enough for the directory to recede
+  $src->child('fonts', 'tex-gyre', 'META-INF')->make_path->child('LICENSE')
+    ->spew("# SPDX-License-Identifier: Apache-2.0\n\nTerms nobody recognises.\n");
+
+  # The only ISC in the package, so the license list can say it is vendored and nothing else
+  $src->child('vendor', 'helper')->make_path->child('LICENSE')
+    ->spew("# SPDX-License-Identifier: ISC\n\nA bundled dependency's own terms.\n");
+  $src->child('src')->make_path->child('license.go')->spew("# SPDX-License-Identifier: MIT\n\npackage main\n");
+
+  my $tarball = $dir->child("$name-1.0.tar.gz")->to_string;
+  system('tar', '-czf', $tarball, '-C', $stage->to_string, "$name-1.0") == 0
+    or die "Failed to create synthetic tarball: $?";
+
+  my $pkg_id = $pkgs->add(
+    name            => $name,
+    checkout_dir    => $md5,
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => $name,
+    srcmd5          => $md5,
+    priority        => 5
+  );
+  $pkgs->imported($pkg_id);
+  $pkgs->unpack($pkg_id);
+
+  # A package of its own, because a panel with no remainder anywhere is a different panel
+  my $clean_name = 'legal-docs-clean';
+  my $clean_md5  = 'd0000000000000000000000000000002';
+  my $clean_dir  = $self->checkout_dir->child($clean_name, $clean_md5)->make_path;
+  $clean_dir->child("$clean_name.spec")->spew(<<"SPEC");
+Name:           $clean_name
+Version:        1.0
+Release:        0
+Summary:        Synthetic package whose license files Cavil fully recognises
+License:        MIT
+Group:          Development/Libraries/Perl
+Source0:        $clean_name-1.0.tar.gz
+BuildArch:      noarch
+
+%description
+Synthetic package carrying nothing but stock license text.
+SPEC
+
+  my $clean_stage = tempdir;
+  my $clean_src   = $clean_stage->child("$clean_name-1.0")->make_path;
+  $clean_src->child('COPYING')->spew($mit_body);
+  $clean_src->child('LICENSE')->spew("SPDX-License-Identifier: MIT\n");
+  my $clean_tarball = $clean_dir->child("$clean_name-1.0.tar.gz")->to_string;
+  system('tar', '-czf', $clean_tarball, '-C', $clean_stage->to_string, "$clean_name-1.0") == 0
+    or die "Failed to create synthetic tarball: $?";
+
+  my $clean_id = $pkgs->add(
+    name            => $clean_name,
+    checkout_dir    => $clean_md5,
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => $clean_name,
+    srcmd5          => $clean_md5,
+    priority        => 5
+  );
+  $pkgs->imported($clean_id);
+  $pkgs->unpack($clean_id);
+
+  # More documents than the panel lists, so the count of what it leaves out has something to report
+  my $many_name = 'legal-docs-many';
+  my $many_md5  = 'd0000000000000000000000000000003';
+  my $many_dir  = $self->checkout_dir->child($many_name, $many_md5)->make_path;
+  $many_dir->child("$many_name.spec")->spew(<<"SPEC");
+Name:           $many_name
+Version:        1.0
+Release:        0
+Summary:        Synthetic package with more license files than the list shows
+License:        MIT
+Group:          Development/Libraries/Perl
+Source0:        $many_name-1.0.tar.gz
+BuildArch:      noarch
+
+%description
+Synthetic package carrying one license file per bundled component.
+SPEC
+
+  my $many_stage = tempdir;
+  my $many_src   = $many_stage->child("$many_name-1.0")->make_path;
+  $many_src->child(sprintf 'LICENSE.%02d', $_)->spew("SPDX-License-Identifier: MIT\n") for 1 .. 30;
+  my $many_tarball = $many_dir->child("$many_name-1.0.tar.gz")->to_string;
+  system('tar', '-czf', $many_tarball, '-C', $many_stage->to_string, "$many_name-1.0") == 0
+    or die "Failed to create synthetic tarball: $?";
+
+  my $many_id = $pkgs->add(
+    name            => $many_name,
+    checkout_dir    => $many_md5,
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $usr_id,
+    project         => 'devel:test',
+    package         => $many_name,
+    srcmd5          => $many_md5,
+    priority        => 5
+  );
+  $pkgs->imported($many_id);
+  $pkgs->unpack($many_id);
+
+  $app->minion->perform_jobs;
+  return $pkg_id;
+}
+
 sub obligations_fixtures ($self, $app) {
   $app->pg->migrations->migrate;
 
@@ -889,6 +1171,11 @@ sub obligations_fixtures ($self, $app) {
   # FSF libre); MPL-1.0 is the one the FSF has never ruled on, so its panel must show no FSF row at all.
   $app->patterns->create(pattern => 'SPDX-License-Identifier: CC-BY-4.0', license => 'CC-BY-4.0');
   $app->patterns->create(pattern => 'SPDX-License-Identifier: MPL-1.0',   license => 'MPL-1.0');
+
+  # A grab-bag license, which names nothing identifiable and so carries neither an SPDX expression nor a
+  # panel. The report marks it as a placeholder instead. It shares the risk of the licenses above and
+  # sorts before "Apache-2.0" by name, so it also pins the "placeholders last" ordering.
+  $app->patterns->create(pattern => 'License: see the accompanying LICENSE file', license => 'Any reference local');
 
   $app->pg->db->query(
     'UPDATE license_patterns SET spdx = license WHERE license IN (?, ?, ?, ?, ?, ?)',
@@ -927,6 +1214,7 @@ SPEC
     ->spew("# SPDX-License-Identifier: GPL-2.0-or-later WITH Classpath-exception-2.0\n\nBase plus an exception.\n");
   $src->child('details_file.txt')->spew("# SPDX-License-Identifier: CC-BY-4.0\n\nDocumentation, not code.\n");
   $src->child('no_fsf_file.txt')->spew("# SPDX-License-Identifier: MPL-1.0\n\nThe FSF never ruled on this one.\n");
+  $src->child('reference_file.txt')->spew("# License: see the accompanying LICENSE file\n\nNothing is named here.\n");
   my $tarball = $dir->child("$name-1.0.tar.gz")->to_string;
   system('tar', '-czf', $tarball, '-C', $stage->to_string, "$name-1.0") == 0
     or die "Failed to create synthetic tarball: $?";
@@ -950,7 +1238,6 @@ SPEC
 sub unpack_fixtures ($self, $app) {
   $self->no_fixtures($app);
 
-  # Create checkout directory
   my $dir       = $self->checkout_dir;
   my $legal_bot = path(__FILE__)->dirname->dirname->dirname->child('legal-bot');
   my $good      = $dir->child('buildah-synthetic-good', 'c7cfdab0e71b0bebfdf8b2dc3badfecf')->make_path;
@@ -960,7 +1247,6 @@ sub unpack_fixtures ($self, $app) {
   my $broken = $dir->child('buildah-synthetic-broken', 'da3e32a3cce8bada03c6a9d63c08cd59')->make_path;
   $_->copy_to($broken->child($_->basename)) for $legal_bot->child('buildah-synthetic-broken')->list->each;
 
-  # Create fixtures
   my $usr_id = $app->pg->db->insert('bot_users', {login => 'test_bot'}, {returning => 'id'})->hash->{id};
   my $pkgs   = $app->packages;
   my $pkg_id = $pkgs->add(

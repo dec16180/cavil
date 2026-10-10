@@ -38,7 +38,8 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
 
       // Use menu to select a pattern (the action line shifts after each extend, so
       // use a position-stable selector rooted at the file's source container).
-      const actionTrigger = '#file-details-1 a[data-bs-toggle="dropdown"]';
+      await expandFileDetails(page, 1);
+      const actionTrigger = '#file-details-1 .source a[data-bs-toggle="dropdown"]';
       const actionMenuItem = label => `#file-details-1 .dropdown-menu :has-text("${label}")`;
       await page.locator(actionTrigger).click();
       await page.locator(actionMenuItem('Extend one line above')).click();
@@ -56,6 +57,9 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       await page.locator('#inline-snippet-editor input[name="trademark"]').check();
       await page.locator('#inline-snippet-editor input[name="cla"]').check();
       await page.locator('#inline-snippet-editor input[name="eula"]').check();
+
+      // Selecting a whole license file in the viewer is how a curator produces terms a NOTICE can print
+      await page.locator('#inline-snippet-editor input[name="full_license_text"]').check();
 
       // Queue the create-pattern action (editor closes, indicator + widget appear)
       await page.locator('#inline-snippet-editor button[data-action="create-pattern"]').click();
@@ -95,6 +99,126 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       t.ok(flagChips.includes('Trademark'), 'Trademark flag chip rendered');
       t.ok(flagChips.includes('CLA'), 'CLA flag chip rendered');
       t.ok(flagChips.includes('EULA'), 'EULA flag chip rendered');
+      t.ok(flagChips.includes('Full license text'), 'the full-text claim is visible on the pattern');
+
+      // Which is what lets a license with no SPDX identifier resolve to terms at all
+      const meta = await page.evaluate(async () => {
+        const res = await fetch('/licenses/text_meta?license=Made-Up-License-1.0');
+        return {status: res.status, body: await res.text()};
+      });
+      t.equal(meta.status, 200, 'the license text viewer can now serve it');
+      t.match(JSON.parse(meta.body).text, /\S/, 'with the curated text');
+
+      // The license list is where reviewers research, so a curated text has to be reachable there without
+      // opening the individual patterns. It has no identifier to hang the link on, hence the shared column.
+      await page.click('text=Licenses');
+      const row = page.locator('.cavil-list-table tbody tr', {hasText: 'Made-Up-License-1.0'});
+      await row.waitFor();
+      const opener = row.locator('button.license-link');
+      t.equal(await opener.innerText(), 'Curated text', 'the row offers its text under a shared column');
+      t.equal(await opener.getAttribute('data-license'), 'Made-Up-License-1.0', 'keyed by the license itself');
+
+      await opener.click();
+      await page.locator('.license-modal [data-license-text]').waitFor({timeout: 15000});
+      t.match(
+        await page.locator('.license-modal [data-license-text]').innerText(),
+        /\S/,
+        'and opens the same overlay the report uses'
+      );
+      t.equal(
+        await page.locator('.license-modal .license-source').count(),
+        0,
+        'with no spdx.org link, since there is no canonical page for it'
+      );
+      // Bootstrap only hands the overlay focus once its show transition ends, and Escape is ignored until then
+      await page.waitForFunction(() => document.activeElement.classList.contains('modal-body'));
+      await page.keyboard.press('Escape');
+      await page.locator('.license-modal').waitFor({state: 'hidden'});
+    });
+
+    await t.test('Ignore a resolved license match from the file preview', async t => {
+      await page.goto(url);
+      await page.click('text=Artistic');
+      t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
+      await page.waitForSelector('#license-chart');
+
+      // Open a file listed under a concrete license (not the risk-9 unresolved bucket)
+      const section = page.locator('.risk-license-section:not(.risk-license-section-unresolved)').first();
+      const fileLink = section.locator('ul.risk-file-list a.file-link').first();
+      const fileId = (await fileLink.getAttribute('href')).replace('#file-', '');
+      await fileLink.click();
+      await page.waitForSelector(`#file-details-${fileId} table.snippet`);
+
+      // A resolved license match (risk 1-8, never the unresolved risk-9) offers "Ignore this match"
+      await page.locator(`#file-details-${fileId} tr:not(.risk-9) a[data-bs-toggle="dropdown"]`).first().click();
+      const ignoreItem = page
+        .locator(`#file-details-${fileId} .dropdown-menu.show a.dropdown-item`)
+        .filter({hasText: 'Ignore this match'});
+      t.equal(await ignoreItem.count(), 1, 'a resolved license match offers "Ignore this match"');
+
+      // One click stages the ignore for an admin - no editor step in between
+      await ignoreItem.click();
+      await page.waitForSelector('#pending-actions-widget');
+      t.equal(await page.locator('#inline-snippet-editor').count(), 0, 'no editor step for a one-click ignore');
+      await page.locator('#pending-actions-widget .pending-actions-toggle').click();
+      t.match(
+        await page.innerText('#pending-actions-widget'),
+        /Create ignore/,
+        'the ignore is staged as a pending action'
+      );
+      t.equal(
+        await page.locator(`#file-details-${fileId} .pending-action-badge`).count(),
+        1,
+        'the pending-change marker shows on the match line'
+      );
+
+      // Drop it again so the shared report state is left untouched for later subtests
+      await page.locator('#pending-actions-widget [data-action-control="remove"]').first().click();
+      await page.waitForSelector('#pending-actions-widget', {state: 'detached'});
+      t.equal(
+        await page.locator(`#file-details-${fileId} .pending-action-badge`).count(),
+        0,
+        'the marker clears when the pending change is dropped'
+      );
+    });
+
+    await t.test('A picked selection extends itself, in the report preview and the file browser', async t => {
+      const extendSelection = async (t, root, fileId) => {
+        const table = root.locator('table.snippet');
+        const pickable = table.locator('tr:has(.select-line-btn)');
+        const lineNumber = async row => Number((await row.locator('td.linenumber').innerText()).trim());
+        const start = await lineNumber(pickable.nth(1));
+        const end = await lineNumber(pickable.nth(2));
+        await pickable.nth(1).locator('.select-line-btn').click();
+        await pickable.nth(2).hover();
+        await pickable.nth(2).locator('.select-line-btn').click();
+
+        const menu = table.locator('.dropdown-menu.show a.dropdown-item');
+        await table.locator('tr.line-selected a[data-bs-toggle="dropdown"]').click();
+        t.equal(await menu.filter({hasText: 'Extend one line above'}).count(), 1, 'the menu extends upwards');
+        t.equal(await menu.filter({hasText: 'Extend one line below'}).count(), 1, 'and downwards');
+
+        await menu.filter({hasText: 'Extend one line below'}).click();
+        const pen = table.locator(`td.quick-actions a[href^="/snippets/from_file/${fileId}/${start}/${end + 1}?"]`);
+        await pen.waitFor();
+        t.pass('the selection grew by one line');
+        t.equal(await table.locator('tr.line-selected').count(), 0, 'and became a range like an extended match');
+      };
+
+      await page.goto(url);
+      await page.click('text=Artistic');
+      await page.waitForSelector('#license-chart');
+      const section = page.locator('.risk-license-section:not(.risk-license-section-unresolved)').first();
+      const fileLink = section.locator('ul.risk-file-list a.file-link').first();
+      const fileId = (await fileLink.getAttribute('href')).replace('#file-', '');
+      await fileLink.click();
+      await page.waitForSelector(`#file-details-${fileId} table.snippet`);
+      await t.test('report preview', t => extendSelection(t, page.locator(`#file-details-${fileId}`), fileId));
+
+      const viewUrl = await page.locator(`.dropdown-menu a.dropdown-item:has-text("View file")`).getAttribute('href');
+      await page.goto(`${url}${viewUrl}`);
+      await page.waitForSelector('.file-browser-source table.snippet');
+      await t.test('file browser', t => extendSelection(t, page.locator('.file-browser-source'), fileId));
     });
 
     await t.test('Propose pattern: CLA/EULA flow through proposals page to accepted pattern', async t => {
@@ -113,6 +237,7 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       await fillInlinePatternBasics(page, 'Made-Up-License-1.0');
       await page.locator('#inline-snippet-editor input[name="cla"]').check();
       await page.locator('#inline-snippet-editor input[name="eula"]').check();
+      await page.locator('#inline-snippet-editor input[name="full_license_text"]').check();
       await page.locator('#inline-snippet-editor button[aria-label="More actions"]').click();
       await page.locator('#inline-snippet-editor .dropdown-menu a[data-action="propose-pattern"]').click();
       await waitForInlineSnippetEditorClosed(page);
@@ -124,6 +249,10 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       ]);
       t.equal(proposeResp.status(), 200, 'propose-pattern submission succeeds');
 
+      // A successful submit reloads the report page; let that navigation settle before leaving, otherwise
+      // the goto below races it and aborts (net::ERR_ABORTED).
+      await page.waitForLoadState('load');
+
       // Proposal arrives on the change proposals page with CLA/EULA pre-checked
       await page.goto(`${url}/licenses/proposed`);
       t.equal(await page.innerText('title'), 'Change Proposals');
@@ -133,6 +262,13 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       const eulaCheckbox = proposal.locator('.form-check', {hasText: 'EULA'}).locator('input[type=checkbox]');
       t.equal(await claCheckbox.isChecked(), true, 'CLA checkbox pre-checked in proposal row');
       t.equal(await eulaCheckbox.isChecked(), true, 'EULA checkbox pre-checked in proposal row');
+
+      // The proposal round-trip stores flags as JSON 0/1 and reads them back, so a flag added later has to
+      // survive both hops rather than being dropped between propose and accept
+      const fullTextCheckbox = proposal
+        .locator('.form-check', {hasText: 'Full license text'})
+        .locator('input[type=checkbox]');
+      t.equal(await fullTextCheckbox.isChecked(), true, 'full license text pre-checked in proposal row');
 
       // Accept the proposal and capture the resulting pattern id
       const [acceptResp] = await Promise.all([
@@ -154,6 +290,11 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       await page.waitForSelector('#edit-pattern input[name=cla]');
       t.equal(await page.locator('#edit-pattern input[name=cla]').isChecked(), true, 'CLA checked on pattern editor');
       t.equal(await page.locator('#edit-pattern input[name=eula]').isChecked(), true, 'EULA checked on pattern editor');
+      t.equal(
+        await page.locator('#edit-pattern input[name=full_license_text]').isChecked(),
+        true,
+        'and the full-text claim survived propose -> accept'
+      );
     });
 
     await t.test('Batch: queue multiple actions, dismiss one, submit the rest', async t => {
@@ -365,8 +506,9 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       await page.waitForSelector('#pending-actions-widget');
 
       // Collapse the file again so we can verify the widget link re-expands it
-      await page.locator(`#expand-link-${fileId} ~ div .file-preview-close`).click();
-      t.same(await page.isVisible(`#file-details-${fileId}`), false, 'file collapsed before jump');
+      await page.locator(`#filelist-snippets a[href="#file-${fileId}"]`).click();
+      await page.waitForSelector(`#file-details-${fileId}`, {state: 'detached'});
+      t.pass('file collapsed before jump');
 
       // Expand widget and click the location link
       await page.locator('#pending-actions-widget .pending-actions-toggle').click();
@@ -532,7 +674,31 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       t.equal(await page.innerText('.toast-message'), 'Reviewed perl-Mojolicious as acceptable', 'toast');
       await page.waitForFunction(() => document.querySelector('#pkg-state').innerText.trim() === 'acceptable');
       t.equal(await page.innerText('#pkg-state'), 'acceptable', 'state badge updated in place');
+      t.match(
+        await page.innerText('.comment-editor-footer .metadata-review-status'),
+        /Review finalized/i,
+        'comment footer confirms the finalized decision'
+      );
+      t.equal(
+        await page.locator('.comment-editor-footer .cavil-meta-badge').count(),
+        0,
+        'comment footer does not repeat the selected decision'
+      );
+      t.equal(await page.locator('#acceptable').getAttribute('aria-pressed'), 'true', 'chosen decision is pressed');
+      t.equal(
+        await page.locator('#unacceptable').getAttribute('aria-pressed'),
+        'false',
+        'alternative decision is not pressed'
+      );
       t.equal(await page.innerText('title'), 'Report for perl-Mojolicious', 'still on the report');
+
+      await page.reload();
+      await page.waitForSelector('.comment-editor-footer .metadata-review-status');
+      t.match(
+        await page.innerText('.comment-editor-footer .metadata-review-status'),
+        /Review finalized/i,
+        'finalized decision remains explicit after reload'
+      );
 
       await page.click('text=Recently Reviewed');
       t.equal(await page.innerText('title'), 'List recent reviews');
@@ -557,6 +723,12 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       t.equal(await page.innerText('title'), 'Report for perl-Mojolicious');
       await page.waitForSelector('#license-chart');
 
+      // An open panel survives the reindex, although every file id changes
+      const row = page.locator('#filelist-snippets a.file-link').first();
+      const path = await row.innerText();
+      await row.click();
+      await page.waitForSelector('.report-match-panel table.snippet');
+
       // Wait for the reindex POST to complete before triggering job processing -
       // otherwise page2.goto(performJobs) can race ahead of the job being queued.
       const page2 = await context.newPage();
@@ -570,6 +742,43 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
 
       await page.waitForSelector('#license-chart');
       t.match(await page.innerText('ul#risk-3 li'), /Made-Up-License-1.0/);
+      const reopened = page.locator('#filelist-snippets a.file-link[aria-expanded="true"]');
+      t.equal(await reopened.innerText(), path, 'the same file is still open');
+      await page.waitForSelector('.report-match-panel table.snippet');
+    });
+
+    await t.test('Missing Licenses page: approve a proposed new license', async t => {
+      // The cavil-refine agent files new-license proposals (action=new_license); a lawyer
+      // ratifies one with a single click. ui_fixtures seeds one against an unresolved mojo#2 snippet, so
+      // this runs before the report/dismiss subtests below and consumes that seeded card.
+      await openAccountMenu(page);
+      await page.click('text=Missing Licenses');
+      t.equal(await page.innerText('title'), 'Missing Licenses');
+      await page.waitForSelector('#missing-licenses .change-container');
+
+      const card = page.locator('#missing-licenses .change-container', {hasText: 'UI-New-License-1.0'});
+      const header = await card.locator('.change-header').innerText();
+      t.match(header, /Proposed license by/, 'framed as a proposal, not a bare report');
+      t.match(header, /UI-New-License-1\.0/, 'shows the proposed license identifier');
+      t.match(header, /risk 2/, 'shows the researched risk');
+      const rationale = await card.locator('.change-rationale').innerText();
+      t.match(rationale, /attribution notice/, 'shows the plain-language rationale');
+      t.notMatch(rationale, /AI Assistant:/, 'strips the AI Assistant prefix from the rationale');
+
+      const [resp] = await Promise.all([
+        page.waitForResponse(r => /\/snippet\/batch_decision/.test(r.url())),
+        card.locator('button:has-text("Approve")').click()
+      ]);
+      t.equal(resp.status(), 200, 'one-click Approve posts a create-pattern decision');
+      await card.waitFor({state: 'detached'});
+      t.match(await page.innerText('#missing-licenses .toast-item'), /Pattern created/, 'approval confirmed via toast');
+
+      // Drain the reindex queued by the new pattern, then confirm the introduced license now exists.
+      const drain = await context.newPage();
+      await drain.goto(performJobs, {timeout: 120000});
+      await drain.close();
+      await page.goto(`${url}/licenses/UI-New-License-1.0`);
+      t.equal(await page.innerText('title'), 'License details of UI-New-License-1.0', 'the introduced license exists');
     });
 
     await t.test('Propose missing license -> page -> dismiss', async t => {
@@ -855,6 +1064,41 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       t.equal(await page.innerText('title'), 'Edit license pattern');
     });
 
+    await t.test('Edit pattern page (Vue) - license autocomplete predicts risk', async t => {
+      // The dropdown is fed by /licenses/autocomplete.json on mount; wait for that
+      // fetch so the suggestions are in place before we start typing.
+      await Promise.all([
+        page.waitForResponse(resp => /\/licenses\/autocomplete\.json/.test(resp.url())),
+        page.goto(`${url}/licenses/edit_pattern/1`)
+      ]);
+      t.equal(await page.innerText('title'), 'Edit license pattern');
+      await page.waitForSelector('#edit-pattern input[name=license]');
+
+      // Force a risk that differs from the license we will pick, so a successful
+      // prediction visibly overwrites it (Made-Up-License-1.0 was created at risk 3).
+      await page.locator('#edit-pattern select[name=risk]').selectOption('9');
+
+      const licenseInput = page.locator('#edit-pattern input[name=license]');
+      await licenseInput.click();
+      await licenseInput.fill('Made-Up');
+
+      // Typing filters the dropdown down to the matching license.
+      const suggestion = page.locator('#edit-pattern .autocomplete-item', {hasText: 'Made-Up-License-1.0'});
+      await suggestion.first().waitFor();
+
+      // Picking a suggestion fills the license name and predicts its risk.
+      await suggestion.first().click();
+      t.equal(await licenseInput.inputValue(), 'Made-Up-License-1.0', 'autocomplete fills the license name');
+      t.equal(
+        await page.locator('#edit-pattern select[name=risk]').inputValue(),
+        '3',
+        'autocomplete predicts the license risk'
+      );
+
+      // Navigate away without submitting so pattern 1 keeps its Apache-2.0 fixture state.
+      await page.goto(url);
+    });
+
     await t.test('New pattern page (Vue) - create form posts to /licenses/create_pattern', async t => {
       // Drive the same Vue mount with no pattern.id so it switches to "create" mode.
       await page.goto(`${url}/licenses/new_pattern?license-name=Vue-Create-Test-License`);
@@ -929,6 +1173,64 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       t.match(await page.innerText('#license-details .license-pattern-card'), /Risk 4/);
     });
 
+    await t.test('License details page (Vue) - combined edit renames, sets risk, clears SPDX', async t => {
+      // Give Vue-Create-Test-License a second pattern at a different risk so it has mixed risks (its
+      // first pattern was set to risk 4 by the inline-edit subtest above).
+      await page.goto(`${url}/licenses/new_pattern?license-name=Vue-Create-Test-License`);
+      await page.waitForSelector('#edit-pattern .cm-editor');
+      await page.locator('#edit-pattern select[name=risk]').selectOption('7');
+      await page.evaluate(() => {
+        const view = document.querySelector('#edit-pattern .cm-editor').cmView;
+        view.dispatch({changes: {from: 0, insert: 'second unique pattern body for the combined edit test'}});
+      });
+      await Promise.all([
+        page.waitForURL(/\/licenses\/edit_pattern\/\d+/),
+        page.locator('#edit-pattern button[type=submit]').click()
+      ]);
+
+      await page.goto(`${url}/licenses/Vue-Create-Test-License`);
+      await page.waitForSelector('#license-edit-form');
+      t.equal(await page.locator('.license-edit-warning').count(), 1, 'danger notice shown for mixed risks');
+      t.equal(await page.inputValue('#license-edit-risk'), '', 'risk defaults to "Keep current" when risks are mixed');
+
+      // First, set an SPDX in place (no rename) so the later clear is meaningful.
+      await page.locator('#license-edit-spdx').fill('MIT');
+      page.once('dialog', dialog => dialog.accept());
+      await Promise.all([
+        page.waitForResponse(resp => /\/licenses\/meta\//.test(resp.url()) && resp.request().method() === 'POST'),
+        page.locator('#license-edit-form button[type="submit"]').click()
+      ]);
+      await page.waitForSelector('#license-details .toast-item');
+      t.equal(await page.inputValue('#license-edit-spdx'), 'MIT', 'SPDX set in place without a reload');
+
+      // Now rename + flatten the risk + clear the SPDX in one combined save; the page reloads under the
+      // new name because the whole view keys on it.
+      await page.locator('#license-edit-name').fill('Vue-Combined-Renamed');
+      await page.locator('#license-edit-risk').selectOption('6');
+      await page.locator('#license-edit-spdx').fill('');
+      page.once('dialog', dialog => dialog.accept());
+      await Promise.all([
+        page.waitForURL(/\/licenses\/Vue-Combined-Renamed$/),
+        page.locator('#license-edit-form button[type="submit"]').click()
+      ]);
+
+      t.equal(await page.innerText('title'), 'License details of Vue-Combined-Renamed', 'reloaded under the new name');
+      await page.waitForSelector('#license-details .license-pattern-card');
+      const cards = await page.locator('#license-details .license-pattern-card').allInnerTexts();
+      t.equal(cards.length, 2, 'both patterns carried over to the new name');
+      t.ok(
+        cards.every(text => /Risk 6/.test(text)),
+        'every pattern flattened to the chosen risk'
+      );
+      t.equal(await page.inputValue('#license-edit-spdx'), '', 'SPDX cleared by the combined edit');
+      t.equal(await page.locator('.license-edit-warning').count(), 0, 'no danger notice once risks are uniform');
+
+      // Drain the reindex jobs the rename queued so later subtests see a settled queue.
+      const drainPage = await context.newPage();
+      await drainPage.goto(performJobs, {timeout: 120000});
+      await drainPage.close();
+    });
+
     await t.test('Edit pattern page (Vue) - delete redirects to /licenses', async t => {
       // Use the throwaway pattern created in the classify-snippets subtest
       // above so we can exercise the destructive DELETE path without breaking
@@ -951,6 +1253,50 @@ t.test('Cavil UI - pattern workflows', skipUnlessOnline, async t => {
       page.once('dialog', dialog => dialog.accept());
       await Promise.all([page.waitForURL(/\/licenses\/?(\?|#|$)/), page.locator('#edit-pattern .del-pattern').click()]);
       t.equal(await page.innerText('title'), 'List licenses', 'redirected to license list after delete');
+    });
+
+    await t.test('Change Proposals: evidence panel and family label', async t => {
+      await page.goto(`${url}/test/evidence_proposals`);
+      await page.goto(`${url}/licenses/proposed`);
+      await page.waitForSelector('#proposed-patterns .pattern-evidence');
+
+      const families = page.locator('#proposed-patterns .change-family');
+      t.equal(await families.count(), 2, 'each proposal of the family is labelled');
+      t.match(await families.first().innerText(), /Evidence Corp spec notice/);
+      t.equal(await page.locator('#proposed-patterns button', {hasText: 'Reject all'}).count(), 0, 'no bulk buttons');
+
+      const card = n => page.locator('#proposed-patterns .change-container').nth(n);
+      const evidence = page.locator('#proposed-patterns .pattern-evidence').first();
+      t.equal(await evidence.locator('.evidence-skip').innerText(), '2024 evidence corp', 'skipped words shown greyed');
+      t.match(
+        await evidence.locator('.evidence-source').innerText(),
+        /snippet lines 1-1, exactly as in the file; \$SKIP swallowed:\s*2024 evidence corp\s+Copyright 2024 Evidence Corp spec notice 2\. All rights reserved\./,
+        'exact source shown'
+      );
+      t.equal(await evidence.locator('.evidence-text').count(), 1, 'source shown once, no second pattern view');
+      t.match(await evidence.innerText(), /follows Any Proprietary risk 7/);
+      t.equal(await evidence.locator('.evidence-precedent details[open]').count(), 0, 'agreeing precedent collapsed');
+      t.equal(await card(0).locator('.change-footer').count(), 0, 'no closest-similarity footer next to evidence');
+      t.equal(await evidence.locator('tr.evidence-agree').count(), 1, 'agreeing precedent marked');
+      t.equal(await evidence.locator('tr.evidence-differ').count(), 1, 'differing precedent marked');
+      t.match(await evidence.innerText(), /matches 3 snippets in 2 packages/);
+      await evidence.locator('.evidence-impact summary').click();
+      t.match(await evidence.innerText(), /evidence-pkg a\/NOTICE:4 · unresolved/, 'samples on demand');
+
+      // The raw $SKIP pattern stays behind a toggle
+      t.equal(await card(0).locator('.change-source').count(), 0, 'raw pattern hidden by default');
+      await card(0).locator('.change-raw-toggle a').click();
+      t.match(await card(0).locator('.change-source').innerText(), /\$SKIP5 Evidence Corp/, 'raw pattern on demand');
+
+      for (let n = 0; n < 2; n++) {
+        await page
+          .locator('#proposed-patterns .change-container')
+          .first()
+          .locator('button', {hasText: 'Reject'})
+          .click();
+      }
+      await page.waitForFunction(() => document.querySelectorAll('#proposed-patterns .pattern-evidence').length === 0);
+      t.pass('proposals rejected one by one');
     });
 
     await t.test('Pattern Performance', async t => {

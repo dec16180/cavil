@@ -1,5 +1,6 @@
-# Copyright SUSE LLC
+# SPDX-FileCopyrightText: SUSE LLC
 # SPDX-License-Identifier: GPL-2.0-or-later
+
 use Mojo::Base -strict, -signatures;
 
 use FindBin;
@@ -11,17 +12,28 @@ use Cavil::Test;
 use Cavil::Model::Notes qw(NOTE_BODY_MAX_LENGTH);
 use Mojo::File          qw(path);
 use Mojo::Date;
-use Mojo::Util qw(encode);
+use Mojo::Util qw(encode md5_sum);
 use Mojo::JSON qw(true false);
 use MCP::Client;
 
 plan skip_all => 'set TEST_ONLINE to enable this test' unless $ENV{TEST_ONLINE};
 
+# Bridge MCP 0.12 (stateful: initialize_session opens a session, serverInfo in the result) and 0.15 (stateless:
+# discover advertises capabilities, serverInfo rides in the result _meta). Temporary until 0.15 is everywhere.
+sub mcp_server_info ($client) {
+  if ($client->can('discover')) {
+    my $result = $client->discover;
+    my $info   = $result->{_meta}{'io.modelcontextprotocol/serverInfo'};
+    return {name => $info->{name}, version => $info->{version}, capabilities => $result->{capabilities}};
+  }
+  my $result = $client->initialize_session;
+  return {%{$result->{serverInfo}}, capabilities => $result->{capabilities}};
+}
+
 my $cavil_test = Cavil::Test->new(online => $ENV{TEST_ONLINE}, schema => 'mcp_api_test');
 my $t          = Test::Mojo->new(Cavil => $cavil_test->default_config);
 $cavil_test->mojo_fixtures($t->app);
 
-# Add patterns for known incompatible licenses
 $t->app->patterns->create(pattern => 'SPDX-License-Identifier: Apache-2.0', license => 'Apache-2.0');
 $t->app->patterns->create(
   pattern => 'SPDX-License-Identifier: GPL-2.0-only',
@@ -31,13 +43,11 @@ $t->app->patterns->create(
 );
 $t->app->pg->db->query('UPDATE license_patterns SET spdx = $1 WHERE license = $1', $_) for qw(Apache-2.0 GPL-2.0-only);
 
-# Add files with incompatible licenses
 my $pkg = $t->app->packages->find(1);
 my $dir = path($cavil_test->checkout_dir, $pkg->{name}, $pkg->{checkout_dir});
 $dir->child('apache_file.txt')->spurt("# SPDX-License-Identifier: Apache-2.0\n\nThis is a test file.\n");
 $dir->child('gpl2_file.txt')->spurt("# SPDX-License-Identifier: GPL-2.0-only\n\nThis is another test file.\n");
 
-# Unpack and index
 $t->app->minion->enqueue(unpack => [1]);
 $t->app->minion->perform_jobs;
 
@@ -76,7 +86,7 @@ subtest 'MCP' => sub {
 
     subtest 'Authentication' => sub {
       $t->get_ok('/mcp')
-        ->status_is(403)
+        ->status_is(401)
         ->json_is({error => 'It appears you have insufficient permissions for accessing this resource'});
 
       $t->ua->on(start => sub ($ua, $tx) { $tx->req->headers->authorization("Bearer $key") });
@@ -85,18 +95,16 @@ subtest 'MCP' => sub {
 
     my $client = MCP::Client->new(ua => $t->ua, url => $t->ua->server->url->path('/mcp'));
 
-    subtest 'Start session' => sub {
-      is $client->session_id, undef, 'no session id';
-      my $result = $client->initialize_session;
-      is $result->{serverInfo}{name},    'Cavil', 'server name';
-      is $result->{serverInfo}{version}, '1.0.0', 'server version';
-      ok $result->{capabilities}, 'has capabilities';
-      ok $client->session_id,     'session id set';
+    subtest 'Discover server' => sub {
+      my $info = mcp_server_info($client);
+      is $info->{name},    'Cavil', 'server name';
+      is $info->{version}, '1.0.0', 'server version';
+      ok $info->{capabilities}, 'has capabilities';
     };
 
     subtest 'List tools' => sub {
       my $result = $client->list_tools;
-      is scalar @{$result->{tools}}, 7,                        'seven tools available';
+      is scalar @{$result->{tools}}, 9,                        'nine tools available';
       is $result->{tools}[0]{name},  'cavil_get_open_reviews', 'right tool name';
       is $result->{tools}[1]{name},  'cavil_search_packages',  'right tool name';
       is $result->{tools}[2]{name},  'cavil_get_report',       'right tool name';
@@ -104,6 +112,8 @@ subtest 'MCP' => sub {
       is $result->{tools}[4]{name},  'cavil_list_files',       'right tool name';
       is $result->{tools}[5]{name},  'cavil_get_notes',        'right tool name';
       is $result->{tools}[6]{name},  'cavil_search_snippets',  'right tool name';
+      is $result->{tools}[7]{name},  'cavil_search_patterns',  'right tool name';
+      is $result->{tools}[8]{name},  'cavil_test_pattern',     'right tool name';
     };
 
     subtest 'cavil_search_snippets tool' => sub {
@@ -145,6 +155,52 @@ subtest 'MCP' => sub {
         like $text, qr/# Snippets \(group=none\)/, 'header';
         like $text, qr/snippet $sid .+unresolved/, 'per-occurrence header';
         like $text, qr/text \@10-13 \(verbatim\)/, 'verbatim line-numbered body';
+      };
+
+      subtest 'resolution=reported surfaces snippets with a missing-license report' => sub {
+        my $sdb = $t->app->pg->db;
+
+        # No report yet: the ZZMCP snippet is not in the reported set
+        my $before = $client->call_tool('cavil_search_snippets',
+          {package_id => 1, group => 'text', search => 'ZZMCP', resolution => 'reported'});
+        ok !$before->{isError}, 'not an error';
+        unlike $before->{content}[0]{text}, qr/snippet $sid\b/, 'snippet absent before a report exists';
+
+        # File a missing-license report against it (keyed on the snippet id in data)
+        my $pc = $sdb->insert(
+          'proposed_changes',
+          {
+            action       => 'missing_license',
+            token_hexsum => 'zzmcp-reported',
+            owner        => 2,
+            data         => {-json => {snippet => $sid, package => 1}}
+          },
+          {returning => 'id'}
+        )->hash->{id};
+
+        my $after = $client->call_tool('cavil_search_snippets',
+          {package_id => 1, group => 'text', search => 'ZZMCP', resolution => 'reported'});
+        ok !$after->{isError}, 'not an error';
+        like $after->{content}[0]{text}, qr/Filters: resolution=reported/, 'echoes reported filter';
+        like $after->{content}[0]{text}, qr/snippet $sid\b/,               'snippet present once reported';
+
+        # A report is a correction: even after Cavil auto-resolves the snippet (fold) AND the classifier
+        # rejects it as non-license, resolution=reported must still surface it - otherwise a wrongly
+        # auto-resolved new license would be hidden. It is correctly absent from the plain unresolved set.
+        $sdb->query('UPDATE file_snippets SET resolution = ? WHERE snippet = ?', 'fold', $sid);
+        $sdb->query('UPDATE snippets SET license = false, classified = true WHERE id = ?', $sid);
+        my $corrected = $client->call_tool('cavil_search_snippets',
+          {package_id => 1, group => 'text', search => 'ZZMCP', resolution => 'reported'});
+        like $corrected->{content}[0]{text}, qr/snippet $sid\b/,
+          'reported surfaces an auto-resolved, classifier-rejected snippet';
+        my $unresolved = $client->call_tool('cavil_search_snippets',
+          {package_id => 1, group => 'text', search => 'ZZMCP', resolution => 'unresolved'});
+        unlike $unresolved->{content}[0]{text}, qr/snippet $sid\b/,
+          'the same snippet is absent from unresolved (it is resolved and classifier-rejected)';
+
+        $sdb->query('UPDATE file_snippets SET resolution = NULL WHERE snippet = ?',       $sid);
+        $sdb->query('UPDATE snippets SET license = true, classified = true WHERE id = ?', $sid);
+        $sdb->query('DELETE FROM proposed_changes WHERE id = ?',                          $pc);
       };
 
       subtest 'fleet-wide search never exposes embargoed snippets' => sub {
@@ -204,6 +260,108 @@ subtest 'MCP' => sub {
       };
     };
 
+    subtest 'cavil_search_patterns tool' => sub {
+      my $patterns = $t->app->patterns;
+      my $vendor   = 'This specification contains material proprietary to Zzvendor Inc and may not be reproduced';
+      $patterns->create(pattern => $vendor, license => 'Any Proprietary', risk => 7);
+      $patterns->create(
+        pattern => 'This specification contains material proprietary to Zzvendor Inc and may be freely reproduced',
+        license => 'Any specification license',
+        risk    => 3
+      );
+      $patterns->expire_cache;
+
+      subtest 'Precedent for a text: contained match wins, variant dissents' => sub {
+        my $result = $client->call_tool('cavil_search_patterns', {text => "Header\n$vendor in any form\n"});
+        ok !$result->{isError}, 'not an error';
+        my $text = $result->{content}[0]{text};
+        like $text, qr/Verdict: consensus \(patterns matching inside the text\)/, 'consensus from containment';
+        like $text, qr/Any Proprietary, risk 7: #\d+/,                            'consensus class';
+        like $text, qr/Dissent .*Any specification license risk 3/,               'variant dissents';
+        like $text, qr/Any Proprietary · risk 7 · CONTAINED lines 2-2/,           'contained row with lines';
+      };
+
+      subtest 'No precedent' => sub {
+        my $result = $client->call_tool('cavil_search_patterns', {text => 'Completely unrelated banana words'});
+        like $result->{content}[0]{text}, qr/Verdict: none/, 'no precedent';
+      };
+
+      subtest 'Similar to a pattern' => sub {
+        my $id
+          = $t->app->pg->db->query("SELECT id FROM license_patterns WHERE license = 'Any Proprietary'")->hash->{id};
+        my $result = $client->call_tool('cavil_search_patterns', {pattern_id => $id});
+        my $text   = $result->{content}[0]{text};
+        like $text,   qr/similar|matching pattern $id \(Any Proprietary, risk 7\)/, 'subject named';
+        like $text,   qr/Any specification license · risk 3 · pattern_cov/,         'variant found';
+        unlike $text, qr/^#$id /m,                                                  'subject excluded';
+      };
+
+      subtest 'Filters and report' => sub {
+        my $result = $client->call_tool('cavil_search_patterns', {license => 'Apache-2.0'});
+        like $result->{content}[0]{text}, qr/SPDX-License-Identifier: Apache-2\.0/, 'license filter';
+        $result = $client->call_tool('cavil_search_patterns', {flag => 'cla'});
+        like $result->{content}[0]{text},   qr/GPL-2\.0-only · risk 5 · patent,cla/, 'flag filter';
+        unlike $result->{content}[0]{text}, qr/Apache-2\.0 ·/,                       'others filtered out';
+        $result = $client->call_tool('cavil_search_patterns', {catch_all => true, search => 'zzvendor'});
+        like $result->{content}[0]{text}, qr/\(2\)/, 'catch-all substring search';
+        $result = $client->call_tool('cavil_search_patterns', {report => 'inconsistent_risk'});
+        like $result->{content}[0]{text}, qr/# Report: licenses whose patterns disagree on risk/, 'report runs';
+        $result = $client->call_tool('cavil_search_patterns', {catch_all => false, search => 'zzvendor'});
+        like $result->{content}[0]{text}, qr/\(0\)/, 'catch-all excluded';
+        $result = $client->call_tool('cavil_search_patterns', {search => 'zzvendor', risk => 3});
+        like $result->{content}[0]{text},   qr/Any specification license · risk 3/, 'risk filter';
+        unlike $result->{content}[0]{text}, qr/Any Proprietary ·/,                  'other risk filtered out';
+
+        my $skip
+          = $patterns->create(pattern => 'Zzvendor $SKIP17 grants rights', license => 'Any Proprietary', risk => 7);
+        $result = $client->call_tool('cavil_search_patterns', {min_skip => 17});
+        like $result->{content}[0]{text}, qr/^#$skip->{id} .*\n.*widest \$SKIP17/m, 'min_skip finds the wide skip';
+        $result = $client->call_tool('cavil_search_patterns', {min_skip => 18});
+        unlike $result->{content}[0]{text}, qr/^#$skip->{id} /m, 'narrower skips filtered out';
+        $patterns->remove($skip->{id});
+
+        $result = $client->call_tool('cavil_search_patterns', {search => 'zzvendor', limit => 1});
+        my $text = $result->{content}[0]{text};
+        is scalar(() = $text =~ /^#\d+ /mg), 1, 'one row';
+        like $text, qr/limit=1, offset=0, next_offset=1/, 'next page offered';
+        $result = $client->call_tool('cavil_search_patterns', {search => 'zzvendor', limit => 1, offset => 1});
+        like $result->{content}[0]{text}, qr/limit=1, offset=1, next_offset=none/, 'last page';
+
+        $result = $client->call_tool('cavil_search_patterns', {report => 'inconsistent_risk', license => 'Apache-2.0'});
+        unlike $result->{content}[0]{text}, qr/^GPL/m, 'report filtered by license';
+      };
+
+      subtest 'Precedent for a snippet' => sub {
+        my $result = $client->call_tool('cavil_search_patterns', {package_id => 1, snippet_id => 5});
+        ok !$result->{isError}, 'not an error';
+        like $result->{content}[0]{text}, qr/# Patterns matching snippet 5 /, 'snippet is the subject';
+        like $result->{content}[0]{text}, qr/Verdict: /,                      'verdict given';
+
+        $result = $client->call_tool('cavil_search_patterns', {package_id => 99999, snippet_id => 5});
+        like $result->{content}[0]{text}, qr/Package not found/, 'unknown package';
+        $result = $client->call_tool('cavil_search_patterns', {package_id => 1, snippet_id => 99999});
+        like $result->{content}[0]{text}, qr/Snippet not found/, 'unknown snippet';
+        $result = $client->call_tool('cavil_search_patterns', {pattern_id => 99999});
+        like $result->{content}[0]{text}, qr/Pattern not found/, 'unknown pattern';
+
+        $t->app->pg->db->update('bot_packages', {embargoed => 1}, {id => 1});
+        $result = $client->call_tool('cavil_search_patterns', {package_id => 1, snippet_id => 5});
+        like $result->{content}[0]{text}, qr/embargoed/, 'embargoed package refused';
+        $t->app->pg->db->update('bot_packages', {embargoed => 0}, {id => 1});
+      };
+
+      subtest 'Invalid arguments' => sub {
+        my $result = $client->call_tool('cavil_search_patterns', {snippet_id => 1});
+        like $result->{content}[0]{text}, qr/package_id is required/, 'snippet needs package';
+        $result = $client->call_tool('cavil_search_patterns', {flag => 'bogus'});
+        like $result->{content}[0]{text}, qr/Unknown flag: bogus/, 'bad flag';
+        for my $bad ({limit => 0}, {limit => 101}, {offset => -1}, {risk => 10}, {min_skip => 0}, {report => 'bogus'}) {
+          eval { $client->call_tool('cavil_search_patterns', $bad) };
+          like $@, qr/Invalid arguments/, "rejected: @{[%$bad]}";
+        }
+      };
+    };
+
     subtest 'cavil_get_open_reviews tool' => sub {
       subtest 'No matches' => sub {
         my $result = $client->call_tool('cavil_get_open_reviews', {search => 'NonExistentPackage'});
@@ -224,7 +382,37 @@ subtest 'MCP' => sub {
         like $text, qr/External-Link:.+mojo/,                              'contains external link';
         like $text, qr/Priority:.+5/,                                      'contains priority';
         like $text, qr/Unresolved-Matches:.+6/,                            'contains unresolved matches';
+        like $text, qr/Review-Note: no/,                                   'nothing annotated yet';
         note $text;
+
+        $t->app->packages->set_tags(1, ['CVE-2024-3654']);
+        my $tagged = $client->call_tool('cavil_get_open_reviews', {search => 'Mojolicious'})->{content}[0]{text};
+        like $tagged, qr/Tags: CVE-2024-3654/, 'CVE tag shown in open reviews listing';
+        $t->app->packages->set_tags(1, []);
+      };
+
+      subtest 'Review note presence and filter' => sub {
+        my $notes = $t->app->notes;
+        my $human = $notes->add(1, 'perl-Mojolicious', 2, 'Human note, not a review', 0);
+
+        my $text = $client->call_tool('cavil_get_open_reviews', {search => 'Mojolicious'})->{content}[0]{text};
+        like $text, qr/Id:.+1,.+Review-Note: no/, 'an untagged note is not a review note';
+
+        $text = $client->call_tool('cavil_get_open_reviews', {search => 'Mojolicious', without_review_note => true})
+          ->{content}[0]{text};
+        like $text, qr/Filters: min_priority=1, without_review_note=true/, 'filter is echoed back';
+        like $text, qr/Id:.+1/, 'a review that only has a human note still needs one';
+
+        my $review = $notes->add(1, 'perl-Mojolicious', 2, 'Agent review note', 0, 1, ['review']);
+        $text = $client->call_tool('cavil_get_open_reviews', {search => 'Mojolicious'})->{content}[0]{text};
+        like $text, qr/Id:.+1,.+Review-Note: yes/, 'review note reported';
+
+        $text = $client->call_tool('cavil_get_open_reviews', {search => 'Mojolicious', without_review_note => true})
+          ->{content}[0]{text};
+        unlike $text, qr/Id:.+1,/, 'annotated review drops out of the sweep';
+        like $text,   qr/Id:.+2,/, 'the sibling review is still waiting for one';
+
+        $notes->remove($_->{id}) for $human, $review;
       };
 
       subtest 'With search' => sub {
@@ -397,6 +585,16 @@ subtest 'MCP' => sub {
     };
 
     subtest 'cavil_get_report tool' => sub {
+      subtest 'Target and tags' => sub {
+        $t->app->pg->db->update('bot_packages', {target => 'openSUSE:Factory/perl-Mojolicious'}, {id => 1});
+        $t->app->packages->set_tags(1, ['CVE-2024-3654', 'needs-second-opinion']);
+        my $text = $client->call_tool('cavil_get_report', {package_id => 1})->{content}[0]{text};
+        like $text, qr{Target:.+openSUSE:Factory/perl-Mojolicious}, 'contains target';
+        like $text, qr/Tags:.+CVE-2024-3654.+needs-second-opinion/, 'contains tags';
+        $t->app->pg->db->update('bot_packages', {target => undef}, {id => 1});
+        $t->app->packages->set_tags(1, []);
+      };
+
       subtest 'Embargoed package' => sub {
         $t->app->pg->db->update('bot_packages', {embargoed => 1}, {id => 1});
         my $result = $client->call_tool('cavil_get_report', {package_id => 1});
@@ -477,15 +675,17 @@ subtest 'MCP' => sub {
         my $result = $client->call_tool('cavil_get_report', {package_id => 1});
         ok !$result->{isError}, 'not an error';
         my $text = $result->{content}[0]{text};
-        like $text,   qr/Package:.+perl-Mojolicious/,                                          'package name';
-        like $text,   qr/Id:.+1/,                                                              'package id';
-        like $text,   qr/State:.+new/,                                                         'state';
-        like $text,   qr/External-Link:.+mojo/,                                                'external link';
-        like $text,   qr/Version:.+7\.25/,                                                     'version';
-        like $text,   qr/Declared-License:.+Artistic-2\.0/,                                    'declared license';
-        like $text,   qr/Summary:.+Real-time web framework/,                                   'summary';
-        like $text,   qr/Group:.+Development\/Libraries\/Perl/,                                'group';
-        like $text,   qr/URL:.+search\.cpan\.org/,                                             'url';
+        like $text, qr/Package:.+perl-Mojolicious/,                                        'package name';
+        like $text, qr/Id:.+1/,                                                            'package id';
+        like $text, qr/State:.+new/,                                                       'state';
+        like $text, qr/External-Link:.+mojo/,                                              'external link';
+        like $text, qr/Version:.+7\.25/,                                                   'version';
+        like $text, qr/Declared-License: Artistic-2\.0 \(from perl-Mojolicious\.spec\)$/m, 'declared license';
+        like $text, qr/Summary:.+Real-time web framework/,                                 'summary';
+        like $text, qr/URL:.+search\.cpan\.org/,                                           'url';
+        like $text,
+          qr/## Package Declarations\n\n\* `perl-Mojolicious\.spec` \(spec\): perl-Mojolicious\@7\.25, Artistic-2\.0/,
+          'declarations';
         like $text,   qr/Shortname:./,                                                         'shortname';
         like $text,   qr/Checkout:.+c7cfdab0e71b0bebfdf8b2dc3badfecd/,                         'checkout';
         like $text,   qr/Unpacked:.+ files/,                                                   'unpacked';
@@ -494,9 +694,13 @@ subtest 'MCP' => sub {
         like $text,   qr/Manual review is required because no previous reports are available/, 'system notice';
         like $text,   qr/Upstream project maintained by SUSE employee/,                        'legal review notice';
         like $text,   qr/### Incompatible Licenses/,                                           'compatibility section';
-        like $text,   qr/OSADL flags these pairs as incompatible in both directions/,          'compatibility note';
-        unlike $text, qr/Elevated risk/,                                  'no elevated-risk framing';
-        like $text,   qr/\* Apache-2\.0 and GPL-2\.0-only/,               'lists the incompatible pair';
+        like $text,   qr/OSADL flags these pairs as incompatible when combined into one work/, 'compatibility note';
+        unlike $text, qr/Elevated risk/, 'no elevated-risk framing';
+
+        # The two licenses sit in separate files at the package root (aggregation, not a combined work), so
+        # the pair is summarised under "lower priority", not surfaced for investigation.
+        like $text, qr/only at the package root \(aggregation\)/,
+          'aggregated pair summarised, not flagged for investigation';
         like $text,   qr/\* GPL-2.0-only: 1 file \[flags: Patent, CLA\]/, 'license summary with flags';
         like $text,   qr/^### Risk 5$/m,                                  'bare numeric risk heading';
         unlike $text, qr/### Risk \d+ \((?:Low|Medium|High)\)/,           'no low/medium/high labels';
@@ -717,7 +921,7 @@ subtest 'MCP' => sub {
     subtest 'Authentication' => sub {
       $t->ua->unsubscribe('start');
       $t->get_ok('/mcp')
-        ->status_is(403)
+        ->status_is(401)
         ->json_is({error => 'It appears you have insufficient permissions for accessing this resource'});
 
       $t->ua->on(start => sub ($ua, $tx) { $tx->req->headers->authorization("Bearer $write_key") });
@@ -726,18 +930,16 @@ subtest 'MCP' => sub {
 
     my $client = MCP::Client->new(ua => $t->ua, url => $t->ua->server->url->path('/mcp'));
 
-    subtest 'Start session' => sub {
-      is $client->session_id, undef, 'no session id';
-      my $result = $client->initialize_session;
-      is $result->{serverInfo}{name},    'Cavil', 'server name';
-      is $result->{serverInfo}{version}, '1.0.0', 'server version';
-      ok $result->{capabilities}, 'has capabilities';
-      ok $client->session_id,     'session id set';
+    subtest 'Discover server' => sub {
+      my $info = mcp_server_info($client);
+      is $info->{name},    'Cavil', 'server name';
+      is $info->{version}, '1.0.0', 'server version';
+      ok $info->{capabilities}, 'has capabilities';
     };
 
     subtest 'List tools' => sub {
       my $result = $client->list_tools;
-      is scalar @{$result->{tools}}, 15,                              'fifteen tools available';
+      is scalar @{$result->{tools}}, 17,                              'seventeen tools available';
       is $result->{tools}[0]{name},  'cavil_get_open_reviews',        'right tool name';
       is $result->{tools}[1]{name},  'cavil_search_packages',         'right tool name';
       is $result->{tools}[2]{name},  'cavil_get_report',              'right tool name';
@@ -760,7 +962,7 @@ subtest 'MCP' => sub {
       $t->app->users->remove_role(2, 'manager');
 
       my $result = $client->list_tools;
-      is scalar @{$result->{tools}}, 8,                        'eight tools available';
+      is scalar @{$result->{tools}}, 10,                       'ten tools available';
       is $result->{tools}[0]{name},  'cavil_get_open_reviews', 'right tool name';
       is $result->{tools}[1]{name},  'cavil_search_packages',  'right tool name';
       is $result->{tools}[2]{name},  'cavil_get_report',       'right tool name';
@@ -779,7 +981,7 @@ subtest 'MCP' => sub {
       $t->app->users->remove_role(2, 'admin');
 
       my $result = $client->list_tools;
-      is scalar @{$result->{tools}}, 9,                        'nine tools available';
+      is scalar @{$result->{tools}}, 11,                       'eleven tools available';
       is $result->{tools}[0]{name},  'cavil_get_open_reviews', 'right tool name';
       is $result->{tools}[1]{name},  'cavil_search_packages',  'right tool name';
       is $result->{tools}[2]{name},  'cavil_get_report',       'right tool name';
@@ -799,7 +1001,7 @@ subtest 'MCP' => sub {
       $t->app->users->add_role(2, 'contributor');
 
       my $result = $client->list_tools;
-      is scalar @{$result->{tools}}, 13,                              'thirteen tools available';
+      is scalar @{$result->{tools}}, 15,                              'fifteen tools available';
       is $result->{tools}[0]{name},  'cavil_get_open_reviews',        'right tool name';
       is $result->{tools}[1]{name},  'cavil_search_packages',         'right tool name';
       is $result->{tools}[2]{name},  'cavil_get_report',              'right tool name';
@@ -824,7 +1026,7 @@ subtest 'MCP' => sub {
       $t->app->users->add_role(2, 'contributor');
 
       my $result = $client->list_tools;
-      is scalar @{$result->{tools}}, 14,                              'fourteen tools available';
+      is scalar @{$result->{tools}}, 16,                              'sixteen tools available';
       is $result->{tools}[0]{name},  'cavil_get_open_reviews',        'right tool name';
       is $result->{tools}[1]{name},  'cavil_search_packages',         'right tool name';
       is $result->{tools}[2]{name},  'cavil_get_report',              'right tool name';
@@ -1277,6 +1479,28 @@ subtest 'MCP' => sub {
           ->json_is('/ai_assisted', 1);
         $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
       };
+
+      subtest 'Accept and reject review (limitations apply)' => sub {
+        $t->app->pg->db->update('bot_packages', {state => 'new', reviewing_user => undef, ai_assisted => 0}, {id => 1});
+        my $note = $t->app->notes->add(2, 'perl-Mojolicious', 2, 'Only with approval', 0, 0, undef, 1)->{id};
+
+        my $text = $client->call_tool('cavil_get_notes', {package_id => 1})->{content}[0]{text};
+        like $text, qr/## Note #${note}\b[^\n]*\[limitation\]/, 'limitation note is marked [limitation]';
+
+        my $error  = 'Limitations apply to this package, it needs a human review';
+        my $result = $client->call_tool('cavil_accept_review', {package_id => 1});
+        ok $result->{isError}, 'is error';
+        is $result->{content}[0]{text},         $error, 'limitation message';
+        is $t->app->packages->find(1)->{state}, 'new',  'not accepted';
+        $result = $client->call_tool('cavil_reject_review', {package_id => 1, reason => 'No'});
+        ok $result->{isError}, 'is error';
+        is $result->{content}[0]{text},         $error, 'limitation message';
+        is $t->app->packages->find(1)->{state}, 'new',  'not rejected';
+
+        $t->app->notes->remove($note);
+        $result = $client->call_tool('cavil_accept_review', {package_id => 1});
+        ok !$result->{isError}, 'accepted once the limitation is removed';
+      };
     };
 
     subtest 'cavil_propose_ignore_snippet tool' => sub {
@@ -1485,7 +1709,8 @@ subtest 'MCP' => sub {
           }
         );
         ok !$result->{isError}, 'not an error';
-        is $result->{content}[0]{text}, 'Proposal for new license pattern has been successfully submitted',
+        is $result->{content}[0]{text},
+          'Proposal for new license pattern has been successfully submitted (license "Artistic-2.0", risk 5)',
           'proposal message';
 
         $t->get_ok('/login')->status_is(302)->header_is(Location => '/');
@@ -1529,7 +1754,8 @@ subtest 'MCP' => sub {
           }
         );
         ok !$result->{isError}, 'not an error';
-        is $result->{content}[0]{text}, 'Proposal for new license pattern has been successfully submitted',
+        is $result->{content}[0]{text},
+          'Proposal for new license pattern has been successfully submitted (license "Artistic-2.0", risk 5)',
           'proposal message';
 
         $t->get_ok('/login')->status_is(302)->header_is(Location => '/');
@@ -1551,6 +1777,7 @@ subtest 'MCP' => sub {
           ->json_like('/changes/0/data/pattern', qr/terms of the Artistic License version 2.0/)
           ->json_like('/changes/0/data/reason',  qr/AI Assistant: Just a test pattern proposal/)
           ->json_is('/changes/0/data/snippet', 5);
+        like $t->tx->res->body, qr/"$_":"1"/, "$_ stored as string" for qw(patent trademark export_restricted cla eula);
         $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
       };
 
@@ -1568,6 +1795,164 @@ subtest 'MCP' => sub {
         ok $result->{isError}, 'is an error';
         is $result->{content}[0]{text}, 'Conflicting license pattern proposal already exists', 'conflict message';
         $t->app->pg->db->delete('proposed_changes');
+      };
+
+      subtest 'Propose license pattern (license with several risk levels)' => sub {
+        my $db    = $t->app->pg->db;
+        my $extra = $db->insert(
+          'license_patterns',
+          {
+            pattern      => 'Artistic example at another risk level',
+            token_hexsum => md5_sum('Artistic example at another risk level'),
+            license      => 'Artistic-2.0',
+            risk         => 2,
+            patent       => 0
+          },
+          {returning => 'id'}
+        )->hash->{id};
+        my %args = (
+          package_id => 1,
+          snippet_id => 5,
+          pattern    => 'terms of the Artistic License version 2.0',
+          license    => 'Artistic-2.0',
+          reason     => 'Just a test pattern proposal'
+        );
+
+        my $result = $client->call_tool('cavil_propose_license_pattern', \%args);
+        ok $result->{isError}, 'is an error';
+        like $result->{content}[0]{text}, qr/License "Artistic-2.0" has patterns at several risk levels/,
+          'asks for a risk';
+        like $result->{content}[0]{text},
+          qr/^\* risk 2 \(1 patterns\), e\.g\. "Artistic example at another risk level"$/m, 'lists risk 2 with example';
+        like $result->{content}[0]{text}, qr/^\* risk 5 \(\d+ patterns\), e\.g\. "/m, 'lists risk 5';
+        is $db->query('SELECT COUNT(*) FROM proposed_changes')->array->[0], 0, 'nothing proposed';
+
+        $result = $client->call_tool('cavil_propose_license_pattern', {%args, risk => 7});
+        ok $result->{isError}, 'is an error';
+        like $result->{content}[0]{text}, qr/License "Artistic-2.0" has no patterns at risk 7/, 'rejects unused risk';
+        like $result->{content}[0]{text}, qr/^\* risk 2 /m,                                     'lists valid risks';
+
+        $result = $client->call_tool('cavil_propose_license_pattern', {%args, risk => 2});
+        ok !$result->{isError}, 'not an error';
+        is $result->{content}[0]{text},
+          'Proposal for new license pattern has been successfully submitted (license "Artistic-2.0", risk 2)',
+          'proposal message with chosen risk';
+        my $change = $db->query('SELECT data FROM proposed_changes')->expand->hash->{data};
+        is $change->{risk},   2, 'chosen risk';
+        is $change->{patent}, 0, 'flags from the chosen risk level, not the risk 5 ones';
+
+        $db->delete('proposed_changes');
+        $db->delete('license_patterns', {id => $extra});
+      };
+
+      subtest 'Precedent gate, impact gate and stored evidence' => sub {
+        my $db       = $t->app->pg->db;
+        my $patterns = $t->app->patterns;
+        $db->delete('proposed_changes');
+        my $curated
+          = $patterns->create(pattern => 'of the Artistic License version 2.0', license => 'Any Proprietary', risk => 7)
+          ->{id};
+        $patterns->expire_cache;
+        my %args = (
+          package_id => 1,
+          snippet_id => 5,
+          pattern    => 'terms of the Artistic License version 2.0',
+          license    => 'Artistic-2.0',
+          reason     => 'Contradicts precedent'
+        );
+
+        my $result = $client->call_tool('cavil_propose_license_pattern', \%args);
+        ok $result->{isError}, 'is an error';
+        like $result->{content}[0]{text},
+          qr/already classify this wording as Any Proprietary risk 7 \(#$curated\)\. File it with the same/,
+          'contradicting precedent is refused';
+        is $db->query('SELECT COUNT(*) FROM proposed_changes')->array->[0], 0, 'nothing proposed';
+
+        $result = $client->call_tool('cavil_propose_license_pattern',
+          {%args, license => 'Any Proprietary', risk => 7, family => 'Artistic notice', reason => 'Follows precedent'});
+        ok !$result->{isError}, 'following precedent is accepted' or diag explain $result;
+        my $data = $db->query('SELECT data FROM proposed_changes')->expand->hash->{data};
+        is $data->{family},                               'Artistic notice', 'family stored';
+        is $data->{evidence}{precedent}{verdict}{status}, 'consensus',       'precedent stored';
+        is $data->{evidence}{precedent}{rows}[0]{id},     $curated,          'precedent row';
+        is_deeply $data->{evidence}{alignment}{skips}, [], 'no skips to explain';
+        ok $data->{evidence}{alignment}{lines}[0],      'aligned lines';
+        ok defined $data->{evidence}{impact}{snippets}, 'impact stored';
+        $db->delete('proposed_changes');
+
+        # A pattern everyone matches: fake the corpus breadth by pointing the snippet at many packages
+        no warnings qw(once redefine);
+        local *Cavil::Model::Patterns::test_pattern = sub { {packages => 30, snippets => 40, samples => []} };
+        $result = $client->call_tool('cavil_propose_license_pattern', {%args, license => 'Any Proprietary', risk => 7});
+        ok $result->{isError}, 'is an error';
+        like $result->{content}[0]{text}, qr/reach is 29 other packages, limit 20/, 'too broad';
+        $result = $client->call_tool('cavil_propose_license_pattern',
+          {%args, license => 'Any Proprietary', risk => 7, broad_ok => true});
+        ok !$result->{isError}, 'broad_ok overrides';
+        $db->delete('proposed_changes');
+
+        # A capped or failed dry run is only a lower bound, so it never counts as narrow
+        local *Cavil::Model::Patterns::test_pattern
+          = sub { {packages => 3, snippets => 1000, capped => 1, samples => []} };
+        $result = $client->call_tool('cavil_propose_license_pattern', {%args, license => 'Any Proprietary', risk => 7});
+        ok $result->{isError}, 'is an error';
+        like $result->{content}[0]{text}, qr/reach is at least 2 other packages \(dry run capped/,
+          'capped is not narrow';
+        local *Cavil::Model::Patterns::test_pattern = sub { {error => 'Dry run timed out'} };
+        $result = $client->call_tool('cavil_propose_license_pattern', {%args, license => 'Any Proprietary', risk => 7});
+        ok $result->{isError}, 'is an error';
+        like $result->{content}[0]{text}, qr/reach could not be measured/, 'timeout is not narrow';
+        $result = $client->call_tool('cavil_propose_license_pattern',
+          {%args, license => 'Any Proprietary', risk => 7, broad_ok => true});
+        ok !$result->{isError}, 'broad_ok overrides an unmeasured reach';
+
+        $db->delete('proposed_changes');
+        $db->delete('license_patterns', {id => $curated});
+        $patterns->expire_cache;
+      };
+
+      subtest 'cavil_test_pattern tool' => sub {
+        my $result = $client->call_tool('cavil_test_pattern', {pattern => 'terms of the Artistic License version 2.0'});
+        ok !$result->{isError}, 'not an error';
+        like $result->{content}[0]{text}, qr/Would match \d+ snippets/, 'impact summary';
+        like $result->{content}[0]{text}, qr/Prefiltered on: /,         'prefilter words';
+
+        $result = $client->call_tool('cavil_test_pattern', {});
+        like $result->{content}[0]{text}, qr/pattern or pattern_id is required/, 'needs a pattern';
+        $result = $client->call_tool('cavil_test_pattern', {pattern => '  '});
+        like $result->{content}[0]{text}, qr/pattern or pattern_id is required/, 'blank pattern';
+        $result = $client->call_tool('cavil_test_pattern', {pattern => 'a b'});
+        like $result->{content}[0]{text}, qr/Pattern has no searchable words/, 'nothing to prefilter on';
+
+        # The $SKIP report shows what the gap swallowed in each sample
+        $result = $client->call_tool('cavil_test_pattern', {pattern => 'terms of the $SKIP3 License version 2.0'});
+        like $result->{content}[0]{text}, qr/Would match [1-9]\d* snippets/, 'matches the fixture';
+        like $result->{content}[0]{text}, qr/\$SKIP3 swallowed: artistic/,   'swallowed words';
+
+        $result = $client->call_tool('cavil_test_pattern',
+          {pattern => 'terms of the $SKIP3 License version 2.0', package_id => 1});
+        like $result->{content}[0]{text}, qr/in 1 packages/, 'scoped to one package';
+        $result = $client->call_tool('cavil_test_pattern', {pattern => 'terms of the Artistic', package_id => 99999});
+        like $result->{content}[0]{text}, qr/Package not found/, 'unknown package';
+        $t->app->pg->db->update('bot_packages', {embargoed => 1}, {id => 1});
+        $result = $client->call_tool('cavil_test_pattern', {pattern => 'terms of the Artistic', package_id => 1});
+        like $result->{content}[0]{text}, qr/embargoed/, 'embargoed package refused';
+        $t->app->pg->db->update('bot_packages', {embargoed => 0}, {id => 1});
+
+        my $id
+          = $t->app->pg->db->query("SELECT id FROM license_patterns WHERE license = 'Apache-2.0' LIMIT 1")->hash->{id};
+        $result = $client->call_tool('cavil_test_pattern', {pattern_id => $id});
+        ok !$result->{isError}, 'existing pattern';
+        unlike $result->{content}[0]{text}, qr/^  #$id /m, 'pattern is not its own neighbour';
+        $result = $client->call_tool('cavil_test_pattern', {pattern_id => 99999});
+        like $result->{content}[0]{text}, qr/Pattern not found/, 'unknown pattern';
+
+        no warnings 'redefine';
+        local *Cavil::Model::Patterns::_test_pattern_queries
+          = sub { die "DBD::Pg::st execute failed: ERROR:  canceling statement due to statement timeout\n" };
+        $result = $client->call_tool('cavil_test_pattern', {pattern => 'terms of the Artistic'});
+        ok $result->{isError}, 'is an error';
+        like $result->{content}[0]{text}, qr/Dry run timed out/, 'timeout reported';
       };
 
       subtest 'Propose license pattern (conflicting license pattern)' => sub {
@@ -1629,8 +2014,9 @@ subtest 'MCP' => sub {
           }
         );
         ok $result->{isError}, 'is an error';
-        is $result->{content}[0]{text}, 'License expression is not in the list of known licenses',
-          'unknown license message';
+        is $result->{content}[0]{text},
+          'License expression is not in the list of known licenses. To introduce it as a new license, call again'
+          . ' with an integer "risk" (1-9).', 'unknown license message';
       };
 
       subtest 'Propose license pattern (unknown license with suggestions)' => sub {
@@ -1646,8 +2032,69 @@ subtest 'MCP' => sub {
         );
         ok $result->{isError}, 'is an error';
         is $result->{content}[0]{text},
-          "License expression is not in the list of known licenses, closest matches are:\n* Artistic-2.0 (69% match)",
+          "License expression is not in the list of known licenses. To introduce it as a new license, call again"
+          . " with an integer \"risk\" (1-9). Closest existing matches:\n* Artistic-2.0 (69% match)",
           'unknown license message';
+      };
+
+      subtest 'Introduce a new license and keep its missing-license report as a fallback' => sub {
+
+        # A missing-license report exists for snippet 5
+        my $reported = $client->call_tool('cavil_report_missing_license',
+          {package_id => 1, snippet_id => 5, reason => 'unknown license text'});
+        ok !$reported->{isError}, 'missing license reported';
+        is $t->app->pg->db->query(
+          "SELECT COUNT(*) AS c FROM proposed_changes WHERE action = 'missing_license' AND (data->>'snippet')::bigint = 5"
+        )->hash->{c}, 1, 'one missing-license report for snippet 5';
+
+        # A LicenseRef-* name would pass as a real SPDX id
+        my $ref = $client->call_tool(
+          'cavil_propose_license_pattern',
+          {
+            package_id => 1,
+            snippet_id => 5,
+            pattern    => 'terms of the Artistic License version 2.0',
+            license    => 'LicenseRef-scancode-artistic-9.9',
+            risk       => 7,
+            reason     => 'Researched'
+          }
+        );
+        ok $ref->{isError}, 'LicenseRef name refused';
+        like $ref->{content}[0]{text}, qr/not as a "LicenseRef-\*" identifier/, 'plain name requested';
+
+        # An unknown license plus an explicit risk files a new_license proposal (not an error) ...
+        my $result = $client->call_tool(
+          'cavil_propose_license_pattern',
+          {
+            package_id => 1,
+            snippet_id => 5,
+            pattern    => 'terms of the Artistic License version 2.0',
+            license    => 'Artistic-9.9-only',
+            risk       => 3,
+            reason     => 'Researched: a brand new license'
+          }
+        );
+        ok !$result->{isError}, 'not an error';
+        like $result->{content}[0]{text}, qr/Proposal to introduce new license "Artistic-9\.9-only" \(risk 3\)/,
+          'new license proposal submitted';
+
+        my $row
+          = $t->app->pg->db->query(
+          "SELECT * FROM proposed_changes WHERE action = 'new_license' AND (data->>'snippet')::bigint = 5")
+          ->expand->hash;
+        ok $row, 'new_license proposal created';
+        is $row->{data}{license}, 'Artistic-9.9-only', 'right license carried through';
+        is $row->{data}{risk},    3,                   'right researched risk carried through';
+
+        # ... but KEEPS the missing-license report as the durable fallback (retired only on approval), so
+        # dismissing a bad proposal does not throw the report away.
+        is $t->app->pg->db->query(
+          "SELECT COUNT(*) AS c FROM proposed_changes WHERE action = 'missing_license' AND (data->>'snippet')::bigint = 5"
+        )->hash->{c}, 1, 'missing-license report preserved alongside the proposal';
+
+        $t->app->pg->db->query(
+          "DELETE FROM proposed_changes WHERE (data->>'snippet')::bigint = 5 AND action IN ('new_license', 'missing_license')"
+        );
       };
 
       subtest 'Propose ignore (non-existent package)' => sub {
@@ -1740,7 +2187,8 @@ subtest 'MCP' => sub {
             }
           );
           ok !$propose->{isError}, 'not an error';
-          is $propose->{content}[0]{text}, 'Proposal for new license pattern has been successfully submitted',
+          like $propose->{content}[0]{text},
+            qr/^Proposal for new license pattern has been successfully submitted \(license "GPL-2\.0-only", risk \d\)$/,
             'proposal submitted from the newly created snippet';
 
           $t->get_ok('/login')->status_is(302)->header_is(Location => '/');
@@ -1754,13 +2202,27 @@ subtest 'MCP' => sub {
         };
       };
 
-      subtest 'File not in matched files' => sub {
-
-        # File exists on disk under .unpacked but was never indexed/matched
+      # A file with no matches has no row of its own, and is exactly the file whose license text nobody has
+      # a pattern for yet
+      subtest 'File that was never indexed' => sub {
         my $result = $client->call_tool('cavil_create_snippet',
           {package_id => 1, file_path => 'mcp_get_file_dir/mcp_get_file.txt', start_line => 1, end_line => 2});
+        ok !$result->{isError}, 'the snippet is created anyway';
+        like $result->{content}[0]{text}, qr/^Snippet \d+ created:/, 'and reported back with its text';
+      };
+
+      subtest 'File outside the package' => sub {
+        my $result = $client->call_tool('cavil_create_snippet',
+          {package_id => 1, file_path => '../../../../../../etc/hostname', start_line => 1, end_line => 1});
+        ok $result->{isError}, 'a path climbing out of the checkout is refused';
+        is $result->{content}[0]{text}, 'File not found in package', 'and says so like any other bad path';
+      };
+
+      subtest 'File that is not in the checkout' => sub {
+        my $result = $client->call_tool('cavil_create_snippet',
+          {package_id => 1, file_path => 'no/such/file.txt', start_line => 1, end_line => 2});
         ok $result->{isError}, 'is an error';
-        is $result->{content}[0]{text}, 'File not found in matched files', 'not a matched file message';
+        is $result->{content}[0]{text}, 'File not found in package', 'not found message';
       };
 
       subtest 'Non-existent package' => sub {
@@ -1811,7 +2273,7 @@ subtest 'MCP' => sub {
       $t->ua->on(start => sub ($ua, $tx) { $tx->req->headers->authorization("Bearer $note_only_key->{api_key}") });
 
       my $client = MCP::Client->new(ua => $t->ua, url => $t->ua->server->url->path('/mcp'));
-      $client->initialize_session;
+      mcp_server_info($client);
 
       my $result = $client->list_tools;
       my %names  = map { $_->{name} => 1 } @{$result->{tools}};

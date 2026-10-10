@@ -12,9 +12,11 @@ import CavilMenu from './vue/CavilMenu.vue';
 import CavilStatistics from './vue/CavilStatistics.vue';
 import ClassifySnippets from './vue/ClassifySnippets.vue';
 import CommentTemplates from './vue/CommentTemplates.vue';
+import LicenseDialog from './vue/components/LicenseDialog.vue';
 import PackageSearch from './vue/components/PackageSearch.vue';
 import EditPattern from './vue/EditPattern.vue';
 import EditSnippet from './vue/EditSnippet.vue';
+import EphemeralReviews from './vue/EphemeralReviews.vue';
 import FileBrowser from './vue/FileBrowser.vue';
 import IgnoredFiles from './vue/IgnoredFiles.vue';
 import IgnoredMatches from './vue/IgnoredMatches.vue';
@@ -65,6 +67,7 @@ window.cavil = {
       currentUser: el.dataset.currentUser,
       canCurate: el.dataset.canCurate === '1',
       canInfra: el.dataset.canInfra === '1',
+      canUpload: el.dataset.canUpload === '1',
       initialStats: parseJsonData(el, 'stats', {missing: 0, proposals: 0}),
       roles: parseJsonData(el, 'roles', []),
       urls: parseJsonData(el, 'urls', {})
@@ -136,10 +139,31 @@ window.cavil = {
     app.mount('#license-details');
   },
 
+  // Some license-links are rendered with v-html by the server, so there is no component to hang a click
+  // handler on; one delegated listener covers every producer
+  setupSpdxViewer() {
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const viewer = createApp(LicenseDialog).mount(el);
+
+    document.addEventListener('click', event => {
+      const link = event.target.closest('.license-link');
+      if (link === null) return;
+      viewer.open(link.dataset.license, link.classList.contains('spdx'));
+    });
+    document.addEventListener('cavil:obligations', event =>
+      viewer.open(event.detail.label, false, event.detail.entries)
+    );
+  },
+
   setupRecentPatterns(hasAdminRole) {
     const app = createApp(RecentPatterns);
     app.config.globalProperties.hasAdminRole = hasAdminRole;
     app.mount('#recent-patterns');
+  },
+
+  setupEphemeralReviews() {
+    createApp(EphemeralReviews).mount('#ephemeral-reviews');
   },
 
   setupOpenReviews() {
@@ -159,8 +183,13 @@ window.cavil = {
 
   setupProductReviews(product) {
     const app = createApp(ProductReviews);
+    const el = document.querySelector('#product-reviews');
     app.config.globalProperties.currentProduct = product;
-    app.mount('#product-reviews');
+    app.config.globalProperties.canCurate = el.dataset.canCurate === '1';
+    app.config.globalProperties.isCodestream = el.dataset.codestream === '1';
+    app.config.globalProperties.annotation = el.dataset.annotation ?? '';
+    app.config.globalProperties.members = JSON.parse(el.dataset.members || '[]');
+    app.mount(el);
   },
 
   setupRecentReviews() {
@@ -214,9 +243,10 @@ window.cavil = {
     createApp(CavilStatistics).mount('#statistics');
   },
 
-  setupArchiveUpload(storeUrl) {
+  setupArchiveUpload(storeUrl, ephemeralOnly) {
     const app = createApp(ArchiveUpload);
     app.config.globalProperties.storeUrl = storeUrl;
+    app.config.globalProperties.ephemeralOnly = ephemeralOnly;
     app.mount('#archive-upload');
   },
 

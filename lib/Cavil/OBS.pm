@@ -1,27 +1,14 @@
-# Copyright (C) 2018 SUSE Linux GmbH
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::OBS;
 use Mojo::Base -base, -signatures;
 
-use Carp qw(croak);
-use Digest::MD5;
+use Carp       qw(croak);
 use Mojo::File qw(path);
 use Mojo::UserAgent;
 use Mojo::URL;
-use Cavil::Util qw(obs_ssh_auth);
+use Cavil::Util qw(md5_file obs_ssh_auth);
 
 has config => sub { {} };
 has ua     => sub {
@@ -39,12 +26,12 @@ has ua     => sub {
   return $ua;
 };
 
-sub check_for_embargo ($self, $api, $request) {
+sub check_for_embargo ($self, $api, $request, $bugrefs = undef) {
   my $host = _url($api)->host;
   return 0 unless my $config = $self->config->{$host};
   return 0 unless $config->{embargoed_bugs};
 
-  my $bugrefs = $self->get_bugrefs_for_request($api, $request);
+  $bugrefs //= $self->get_bugrefs_for_request($api, $request);
   return 0 unless @$bugrefs;
 
   my $embargoed_bugrefs = $self->get_embargoed_bugrefs($api);
@@ -54,6 +41,25 @@ sub check_for_embargo ($self, $api, $request) {
   }
 
   return 0;
+}
+
+sub cves_for_request ($self, $api, $request, $bugrefs = undef) {
+  $bugrefs //= $self->get_bugrefs_for_request($api, $request);
+  return [grep {/^CVE-/i} @$bugrefs];
+}
+
+sub request_target ($self, $api, $request) {
+  my $res = $self->_request(_url($api, 'request', $request));
+  return undef unless $res->is_success;
+
+  my (@targets, %seen);
+  for my $target ($res->dom->find('action > target[project]')->each) {
+    my $name = $target->{project};
+    $name .= "/$target->{package}" if defined $target->{package};
+    push @targets, $name unless $seen{$name}++;
+  }
+
+  return @targets ? join(', ', @targets) : undef;
 }
 
 sub get_bugrefs_for_request ($self, $api, $request) {
@@ -99,7 +105,6 @@ sub get_embargoed_bugrefs ($self, $api) {
 sub download_source ($self, $api, $project, $pkg, $dir, $options = {}) {
   $dir = path($dir)->make_path;
 
-  # List files
   my $url = _url($api, 'source', $project, $pkg)->query(expand => 1);
   $url->query([rev => $options->{rev}]) if defined $options->{rev};
   my $res = $self->_request($url);
@@ -108,7 +113,6 @@ sub download_source ($self, $api, $project, $pkg, $dir, $options = {}) {
   my $srcmd5 = $dom->at('directory')->{srcmd5};
   my @files  = $dom->find('entry')->map('attr')->each;
 
-  # Download files
   for my $file (@files) {
 
     # We've actually seen this in IBS (usually a checksum mismatch)
@@ -120,7 +124,7 @@ sub download_source ($self, $api, $project, $pkg, $dir, $options = {}) {
     croak "$url: " . $res->code unless $res->is_success;
     my $target = $dir->child($file->{name});
     $res->content->asset->move_to($target);
-    my $md5 = _md5($target);
+    my $md5 = md5_file($target);
     croak qq/$url: Corrupted file "$file->{name}": checksum $md5 != $file->{md5}/ unless $md5 eq $file->{md5};
   }
 }
@@ -134,7 +138,6 @@ sub package_info ($self, $api, $project, $pkg, $options = {}) {
   my $source = $res->dom->at('sourceinfo');
   my $info   = {srcmd5 => $source->{srcmd5}, verifymd5 => $source->{verifymd5}, package => $pkg};
 
-  # Find the deepest link
   my $linfo = $self->_find_link_target($api, $project, $pkg, $options->{rev} || $source->{srcmd5});
   $info->{package} = $linfo->{package} if $linfo;
   return $info;
@@ -148,7 +151,7 @@ sub _find_link_target ($self, $api, $project, $pkg, $lrev) {
   my $res = $self->_request($url);
   return undef unless $res->is_success;
 
-  # Check if we're on track
+  # Prefer the deepest linked package that still has its matching spec file.
   my $match = grep { $_->{name} eq "$pkg.spec" } $res->dom->find('entry')->map('attr')->each;
 
   if (my $link = $res->dom->at('linkinfo')) {
@@ -168,12 +171,6 @@ sub _find_link_target ($self, $api, $project, $pkg, $lrev) {
   my %linfo = (project => $project, package => $pkg, lrev => $lrev, match => $match);
   return \%linfo unless my $rn = $res->dom->at('releasename');
   return {%linfo, package => $rn->text};
-}
-
-sub _md5 ($file) {
-  my $md5 = Digest::MD5->new;
-  $md5->addfile(path($file)->open('r'));
-  return $md5->hexdigest;
 }
 
 sub _request ($self, $url, $method = 'GET') {

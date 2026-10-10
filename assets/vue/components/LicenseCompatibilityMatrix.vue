@@ -2,11 +2,31 @@
   <section id="license-compatibility" class="license-matrix-card mb-3">
     <header class="license-matrix-header">
       <h3>License compatibility</h3>
-      <button v-if="canShrink" type="button" class="license-matrix-toggle" @click="showAll = !showAll">
-        <span class="license-matrix-toggle-verb">{{ toggleVerb }}</span>
-        <strong class="license-matrix-toggle-count">{{ toggleCount }}</strong>
-        <span class="license-matrix-toggle-unit">{{ toggleUnit }}</span>
-      </button>
+      <div class="license-matrix-controls">
+        <div v-if="hasProximity" class="license-matrix-mode" role="group" aria-label="Grid colouring">
+          <button
+            type="button"
+            class="license-matrix-mode-btn"
+            :class="{'is-on': colorMode === 'verdict'}"
+            @click="colorMode = 'verdict'"
+          >
+            Verdict
+          </button>
+          <button
+            type="button"
+            class="license-matrix-mode-btn"
+            :class="{'is-on': colorMode === 'likelihood'}"
+            @click="colorMode = 'likelihood'"
+          >
+            Likelihood
+          </button>
+        </div>
+        <button v-if="canShrink" type="button" class="license-matrix-toggle" @click="showAll = !showAll">
+          <span class="license-matrix-toggle-verb">{{ toggleVerb }}</span>
+          <strong class="license-matrix-toggle-count">{{ toggleCount }}</strong>
+          <span class="license-matrix-toggle-unit">{{ toggleUnit }}</span>
+        </button>
+      </div>
     </header>
 
     <div class="license-matrix-body">
@@ -38,7 +58,11 @@
                 class="license-matrix-cell"
                 :class="[
                   cellClass(row, col),
-                  {'is-active': isActive(row, col), 'is-mutual': isMutual(row, col)},
+                  {
+                    'is-active': isActive(row, col),
+                    'is-mutual': isMutual(row, col),
+                    'mode-likelihood': colorMode === 'likelihood'
+                  },
                   mutualCornerClass(i, j)
                 ]"
                 :aria-label="cellTitle(row, col)"
@@ -47,7 +71,9 @@
                 @pointerleave="hideMatrixTooltip"
                 @click="selectCell(row, col)"
               >
-                <span class="license-matrix-mark" aria-hidden="true">{{ cellMark(row, col) }}</span>
+                <span class="license-matrix-mark" aria-hidden="true" :style="markStyle(row, col)">{{
+                  cellMark(row, col)
+                }}</span>
               </td>
             </tr>
           </tbody>
@@ -71,28 +97,41 @@
         <span class="license-matrix-detail-title">
           <strong class="license-matrix-verdict">{{ verdictLabel(selected.compatibility) }}</strong>
           <span class="license-matrix-connector">using</span>
-          <a
-            class="spdx-link license-matrix-detail-name"
-            :href="spdxLicenseUrl(selected.inbound)"
-            target="_blank"
-            rel="noopener noreferrer"
-            >{{ selected.inbound }}</a
-          >
+          <button
+            type="button"
+            class="license-link license-matrix-detail-name"
+            :data-license="selected.inbound"
+            v-text="selected.inbound"
+          ></button>
           <span class="license-matrix-connector">in a work under</span>
-          <a
-            class="spdx-link license-matrix-detail-name"
-            :href="spdxLicenseUrl(selected.outbound)"
-            target="_blank"
-            rel="noopener noreferrer"
-            >{{ selected.outbound }}</a
-          >
+          <button
+            type="button"
+            class="license-link license-matrix-detail-name"
+            :data-license="selected.outbound"
+            v-text="selected.outbound"
+          ></button>
         </span>
         <span class="license-matrix-detail-label">OSADL verdict</span>
       </div>
       <p class="license-matrix-detail-body">{{ selected.explanation }}</p>
+      <div class="license-matrix-where">
+        <span class="license-matrix-where-head">
+          <span class="license-matrix-where-label">Where</span>
+          <span class="license-matrix-where-verdict">{{ whereSummary }}</span>
+          <span v-if="whereTag" class="license-matrix-where-tag">{{ whereTag }}</span>
+          <span v-if="scopeTag" class="license-matrix-where-tag">{{ scopeTag }}</span>
+        </span>
+        <ul v-if="selectedFiles.length" class="license-matrix-file-list">
+          <li v-for="f in selectedFiles" :key="f">
+            <a class="license-matrix-file-link" :href="fileHref(f)" target="_blank" rel="noopener noreferrer"
+              ><FilePath :path="f"
+            /></a>
+          </li>
+        </ul>
+      </div>
     </div>
 
-    <div class="license-matrix-legend" aria-label="Compatibility verdict legend">
+    <div v-if="colorMode === 'verdict'" class="license-matrix-legend" aria-label="Compatibility verdict legend">
       <span class="license-matrix-legend-item"><i class="license-matrix-swatch cell-no"></i> Incompatible</span>
       <span class="license-matrix-legend-item"
         ><i class="license-matrix-swatch swatch-mutual"></i> Both directions</span
@@ -101,18 +140,42 @@
       <span class="license-matrix-legend-item"><i class="license-matrix-swatch cell-unknown"></i> Unknown</span>
       <span class="license-matrix-legend-item"><i class="license-matrix-swatch cell-yes"></i> Compatible</span>
     </div>
+    <div v-else class="license-matrix-legend" aria-label="Combination likelihood legend">
+      <span class="license-matrix-legend-item"><i class="license-matrix-swatch swatch-file"></i> Same file</span>
+      <span class="license-matrix-legend-item"
+        ><i class="license-matrix-swatch swatch-deep"></i> Deep shared directory</span
+      >
+      <span class="license-matrix-legend-item"
+        ><i class="license-matrix-swatch swatch-shared"></i> Shared directory</span
+      >
+      <span class="license-matrix-legend-item"
+        ><i class="license-matrix-swatch swatch-root"></i> Package root only</span
+      >
+      <span class="license-matrix-legend-item"
+        ><i class="license-matrix-swatch swatch-peripheral"></i> Tests / docs / vendored</span
+      >
+    </div>
   </section>
 </template>
 
 <script>
+import FilePath from './FilePath.vue';
+import {fileViewUrl} from '../helpers/links.js';
+
 export default {
   name: 'LicenseCompatibilityMatrix',
+  components: {FilePath},
   props: {
     licenses: {type: Array, default: () => []},
-    matrix: {type: Object, default: () => ({})}
+    matrix: {type: Object, default: () => ({})},
+    // Symmetric per-pair proximity {a: {b: {confidence, same_file, lca_depth, tier, files}}} (keyed
+    // a < b) - drives the "Likelihood" colour mode and the detail panel's "Where" block. pkgId builds the
+    // file-browser links.
+    proximity: {type: Object, default: () => ({})},
+    pkgId: {type: [Number, String], default: null}
   },
   data() {
-    return {selected: null, showAll: false, hovered: null};
+    return {selected: null, showAll: false, hovered: null, colorMode: 'verdict'};
   },
   created() {
     // Default to the focused (conflicts-only) view for large matrices; show everything when the grid
@@ -185,9 +248,86 @@ export default {
     },
     toggleUnit() {
       return this.showAll ? 'conflicts' : 'licenses';
+    },
+    // The mode toggle only appears when there is proximity data to colour by.
+    hasProximity() {
+      return Object.keys(this.proximity || {}).length > 0;
+    },
+    selectedProximity() {
+      return this.selected ? this.pairProximity(this.selected.outbound, this.selected.inbound) : null;
+    },
+    // The representative files for the selected pair, de-duplicated (a same-file hit lists one path twice).
+    selectedFiles() {
+      const p = this.selectedProximity;
+      if (!p || !Array.isArray(p.files)) return [];
+      return [...new Set(p.files.filter(Boolean))];
+    },
+    whereSummary() {
+      const p = this.selectedProximity;
+      if (!p) return '';
+      // The two never share a file: one license is present only as an unresolved-snippet guess. We still
+      // link that unresolved match's file below so the reviewer can open and judge it.
+      if (p.no_colocation) return 'Not co-located - one license appears only as an unresolved match:';
+      if (p.same_file) return 'Both licenses in one file';
+      if ((p.lca_depth ?? 0) >= 1) return 'Closest files share a directory';
+      return 'Only co-located at the package root';
+    },
+    // A confidence caveat on a co-location - none for a real match, and none for a not-co-located pair
+    // (its summary already says "unresolved match").
+    whereTag() {
+      const p = this.selectedProximity;
+      if (!p || p.no_colocation) return null;
+      if (p.confidence === 2) return 'via a folded snippet';
+      if (p.confidence === 1) return 'via an unresolved match';
+      return null;
+    },
+    // Vendored code is named separately from tests and docs: it can be linked into the build, so it is not
+    // dismissible the way a fixture is.
+    scopeTag() {
+      const p = this.selectedProximity;
+      if (!p || p.no_colocation || !p.tier) return null;
+      return p.tier === 1 ? 'vendored' : 'tests / docs / examples';
     }
   },
   methods: {
+    // Proximity is stored once per unordered pair (a < b); look it up regardless of which axis is outbound.
+    pairProximity(a, b) {
+      const [x, y] = a < b ? [a, b] : [b, a];
+      return this.proximity?.[x]?.[y] ?? null;
+    },
+    isFlagged(outbound, inbound) {
+      return outbound !== inbound && this.cell(outbound, inbound) !== null;
+    },
+    // Every "Where" file opens in the file browser in a new tab. Consistency matters more than an inline
+    // preview here: proximity can point at files beyond the report's per-license display cap that have no
+    // inline block, and mixing inline-for-some with dead-for-others is worse than one predictable behaviour.
+    fileHref(path) {
+      return fileViewUrl(this.pkgId, path);
+    },
+    // Likelihood colouring: a categorical heat scale (distinct hues, not shades of one colour - those blur
+    // into a soup on a big grid) plus a size cue, so the genuinely-combined pairs stand out of a cool/grey
+    // mass. same-file is a large red dot, a deep shared directory hot orange, a shallow one amber, root-only
+    // a small cool grey-blue, and peripheral (tests/docs/vendored) a small neutral grey out of the ramp.
+    markStyle(outbound, inbound) {
+      if (this.colorMode !== 'likelihood' || !this.isFlagged(outbound, inbound)) return null;
+      const p = this.pairProximity(outbound, inbound);
+      let color, size;
+      // Heat ramp, hottest first: same-file, then deeper shared dir, then shallow. One hue stepped by
+      // lightness, so the tier order is legible as a ramp rather than as three colours to memorise; size
+      // grows with the tier as a second encoding. Package-root-only and peripheral stay neutral grey,
+      // because those are absence of evidence rather than a cooler tier.
+      // Defensive: a flagged cell with no proximity entry at all (only if a license has no file evidence).
+      if (p === null) [color, size] = ['var(--cavil-grey-2)', 0.48];
+      else if (p.tier) [color, size] = ['var(--cavil-edge-7)', 0.48];
+      else if (p.same_file) [color, size] = ['var(--cavil-heat-1)', 0.85];
+      else if ((p.lca_depth ?? 0) >= 3) [color, size] = ['var(--cavil-heat-2)', 0.7];
+      else if ((p.lca_depth ?? 0) >= 1) [color, size] = ['var(--cavil-heat-3)', 0.58];
+      else [color, size] = ['var(--cavil-grey-2)', 0.48];
+      // Confidence dims the dot: a real match is solid, a fold muted, an unresolved guess faint - so the
+      // trustworthy co-locations read strongest even at the same proximity tier.
+      const opacity = p ? ({3: 1, 2: 0.7, 1: 0.5}[p.confidence] ?? 1) : 0.5;
+      return {background: color, height: `${size}rem`, width: `${size}rem`, opacity};
+    },
     cell(outbound, inbound) {
       return this.matrix?.[outbound]?.[inbound] ?? null;
     },
@@ -285,9 +425,6 @@ export default {
         return;
       }
       this.selected = {outbound, inbound, compatibility: cell.compatibility, explanation: cell.explanation};
-    },
-    spdxLicenseUrl(name) {
-      return `https://spdx.org/licenses/${encodeURIComponent(name)}.html`;
     }
   }
 };
@@ -295,16 +432,16 @@ export default {
 
 <style scoped>
 .license-matrix-card {
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
-  box-shadow: 0 1px 3px rgba(27, 31, 36, 0.08);
+  box-shadow: 0 1px 3px rgba(var(--cavil-shadow-rgb), 0.08);
   min-width: 0;
   overflow: hidden;
 }
 .license-matrix-header {
   align-items: center;
-  background: #f6f8fa;
-  border-bottom: 1px solid #d0d7de;
+  background: var(--cavil-canvas-subtle);
+  border-bottom: 1px solid var(--cavil-border);
   border-radius: 6px 6px 0 0;
   display: flex;
   gap: 1rem;
@@ -317,19 +454,19 @@ export default {
   margin: 0;
 }
 .license-matrix-body {
-  background: #fff;
+  background: var(--cavil-canvas);
   padding: 1rem;
 }
 
-/* Heatmap grid — GitHub contribution-graph aesthetic */
+/* Heatmap grid - GitHub contribution-graph aesthetic */
 .license-matrix-grid-wrap {
   overflow-x: auto;
 }
 .license-matrix-tooltip {
-  background: #24292f;
+  background: var(--cavil-inverse-bg);
   border-radius: 6px;
-  box-shadow: 0 8px 24px rgba(140, 149, 159, 0.22);
-  color: #ffffff;
+  box-shadow: 0 8px 24px rgba(var(--cavil-neutral-rgb), 0.22);
+  color: var(--cavil-inverse-fg);
   display: grid;
   font-size: 12px;
   font-weight: 600;
@@ -347,7 +484,7 @@ export default {
 }
 .license-matrix-tooltip::after {
   border: 6px solid transparent;
-  border-top-color: #24292f;
+  border-top-color: var(--cavil-inverse-bg);
   content: '';
   left: 50%;
   position: absolute;
@@ -364,7 +501,7 @@ export default {
   grid-template-columns: minmax(3.1rem, auto) minmax(0, 1fr);
 }
 .license-matrix-tooltip-label {
-  color: #c9d1d9;
+  color: var(--cavil-inverse-fg-muted);
   font-weight: 700;
   white-space: nowrap;
 }
@@ -376,13 +513,13 @@ export default {
   font-size: 12px;
 }
 .license-matrix-corner {
-  background: #fff;
+  background: var(--cavil-canvas);
   left: 0;
   position: sticky;
   z-index: 2;
 }
 .license-matrix-colhead {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   font-weight: 600;
@@ -398,11 +535,11 @@ export default {
 .license-matrix-colhead.is-selected,
 .license-matrix-rowhead.is-selected .license-matrix-rowhead-index,
 .license-matrix-rowhead.is-selected .license-matrix-rowhead-name {
-  -webkit-text-stroke: 0.4px #1f2328;
-  color: #1f2328;
+  -webkit-text-stroke: 0.4px var(--cavil-fg);
+  color: var(--cavil-fg);
 }
 .license-matrix-rowhead {
-  background: #fff;
+  background: var(--cavil-canvas);
   left: 0;
   padding: 0.15rem 0.85rem 0.15rem 0;
   position: sticky;
@@ -412,7 +549,7 @@ export default {
   z-index: 1;
 }
 .license-matrix-rowhead-index {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   display: inline-block;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -422,7 +559,7 @@ export default {
   text-align: right;
 }
 .license-matrix-rowhead-name {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 12px;
   font-weight: 500;
 }
@@ -447,29 +584,29 @@ export default {
   vertical-align: middle;
   width: 0.7rem;
 }
-/* Colour classes — shared by the grid cells and the legend swatches (colour only, no behaviour) */
+/* Colour classes - shared by the grid cells and the legend swatches (colour only, no behaviour) */
 .cell-self {
-  background: #f6f8fa;
+  background: var(--cavil-canvas-subtle);
 }
 .cell-yes {
-  background: #ebedf0;
+  background: var(--cavil-tint-8);
 }
 .cell-no {
-  background: #ffebe9;
-  border-color: #ffcecb;
-  color: #cf222e;
+  background: var(--cavil-danger-bg);
+  border-color: var(--cavil-danger-border);
+  color: var(--cavil-danger);
   font-weight: 600;
 }
 .cell-check {
-  background: #fff8c5;
-  border-color: #9aa3ad66;
-  color: #7d4e00;
+  background: var(--cavil-attention-bg);
+  border-color: var(--cavil-edge-8);
+  color: var(--cavil-attention-deep);
   font-weight: 600;
 }
 .cell-unknown {
-  background: #eaeef2;
-  border-color: rgba(110, 119, 129, 0.25);
-  color: #57606a;
+  background: var(--cavil-neutral-bg);
+  border-color: rgba(var(--cavil-neutral-alt-rgb), 0.25);
+  color: var(--cavil-fg-muted);
 }
 /* In the grid the cell itself is a transparent tile; the colour lives in the dot (see below). The
    colour classes above are reused as-is by the legend swatches. */
@@ -487,8 +624,13 @@ export default {
    neutral slate (not red) so it marks the region without doubling up on the red dots; the red dots stay
    the severity signal. */
 .license-matrix-cell.cell-no.is-mutual {
-  background: #e7ebf1;
+  background: var(--cavil-tint-11);
   border-radius: 6px;
+}
+/* In Likelihood mode the "both directions" block is less relevant (proximity, not direction, is the point),
+   so soften its fill to a barely-there tint that still groups the region without competing with the heat. */
+.license-matrix-cell.mode-likelihood.cell-no.is-mutual {
+  background: var(--cavil-tint-1);
 }
 /* Merge a run of adjacent mutual tiles into a single block: square off (and, via border-spacing:0,
    butt up against) every side that touches another mutual tile, so only the block's outer corners
@@ -511,13 +653,13 @@ export default {
 }
 /* Solid, soft dots (no rings) - one calm mark per flagged relationship. */
 .license-matrix-cell.cell-no .license-matrix-mark {
-  background: #6f7b89;
+  background: var(--cavil-grey-3);
 }
 .license-matrix-cell.cell-check .license-matrix-mark {
-  background: #9aa3ad;
+  background: var(--cavil-grey-1);
 }
 .license-matrix-cell.cell-unknown .license-matrix-mark {
-  background: #c4c9cf;
+  background: var(--cavil-edge-6);
 }
 
 /* Only the grid cells are interactive; the legend swatches reuse the colour classes above */
@@ -534,8 +676,8 @@ export default {
 /* Selected cell: the dot lifts (grows + soft shadow with a white halo) like a tapped calendar day. */
 .license-matrix-cell.is-active .license-matrix-mark {
   box-shadow:
-    0 0 0 2px #ffffff,
-    0 1px 3px rgba(27, 31, 36, 0.28);
+    0 0 0 2px var(--cavil-canvas),
+    0 1px 3px rgba(var(--cavil-shadow-rgb), 0.28);
   transform: scale(1.3);
 }
 
@@ -543,8 +685,8 @@ export default {
    eye path. Muted swatch + text, no chip chrome, so it recedes rather than competing for attention. */
 .license-matrix-legend {
   align-items: center;
-  border-top: 1px solid #eaeef2;
-  color: #6e7781;
+  border-top: 1px solid var(--cavil-neutral-bg);
+  color: var(--cavil-fg-subtle);
   display: flex;
   flex-wrap: wrap;
   font-size: 11px;
@@ -566,22 +708,22 @@ export default {
 }
 /* Solid dots, matching the grid marks. */
 .license-matrix-swatch.cell-no {
-  background: #6f7b89;
+  background: var(--cavil-grey-3);
 }
 .license-matrix-swatch.cell-check {
-  background: #9aa3ad;
+  background: var(--cavil-grey-1);
 }
 .license-matrix-swatch.cell-unknown {
-  background: #c4c9cf;
+  background: var(--cavil-edge-6);
 }
 /* Compatible is drawn as empty space in the grid; show a faint outline here to say so. */
 .license-matrix-swatch.cell-yes {
-  background: #ffffff;
-  box-shadow: inset 0 0 0 1px #d0d7de;
+  background: var(--cavil-canvas);
+  box-shadow: inset 0 0 0 1px var(--cavil-border);
 }
 /* Both-directions: the filled tile behind the dot. */
 .license-matrix-swatch.swatch-mutual {
-  background: #e7ebf1;
+  background: var(--cavil-tint-11);
   border-radius: 3px;
 }
 
@@ -591,10 +733,10 @@ export default {
 .license-matrix-toggle {
   align-items: baseline;
   appearance: none;
-  background: #fff;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas);
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
-  color: #1f2328;
+  color: var(--cavil-fg);
   cursor: pointer;
   display: inline-flex;
   font: inherit;
@@ -605,31 +747,31 @@ export default {
   padding: 0.25rem 0.55rem;
 }
 .license-matrix-toggle:hover {
-  background: #f6f8fa;
+  background: var(--cavil-canvas-subtle);
 }
 .license-matrix-toggle-count {
-  color: #24292f;
+  color: var(--cavil-fg-emphasis);
   font-size: 1rem;
   font-variant-numeric: tabular-nums;
   font-weight: 700;
   line-height: 1;
 }
 .license-matrix-toggle-unit {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 12px;
   font-weight: 600;
 }
 
 .license-matrix-detail {
-  border-top: 1px solid #d0d7de;
+  border-top: 1px solid var(--cavil-border);
 }
 
 /* A deliberate two-band element: a verdict-tinted title bar over the explanation body. The bar's
    colour matches the cell that was clicked, tying the panel to the grid. */
 .license-matrix-detail-bar {
   align-items: center;
-  border-bottom: 1px solid #d0d7de;
-  color: #1f2328;
+  border-bottom: 1px solid var(--cavil-border);
+  color: var(--cavil-fg);
   display: flex;
   flex-wrap: wrap;
   font-size: 12px;
@@ -638,19 +780,19 @@ export default {
   padding: 0.55rem 1rem;
 }
 .bar-no {
-  background: #e8edf3;
-  border-bottom-color: #d2dce7;
+  background: var(--cavil-tint-9);
+  border-bottom-color: var(--cavil-edge-5);
 }
 .bar-check {
-  background: #eceef1;
-  border-bottom-color: #dbe0e6;
+  background: var(--cavil-tint-7);
+  border-bottom-color: var(--cavil-edge-4);
 }
 .bar-unknown {
-  background: #eef0f2;
-  border-bottom-color: #dde2e8;
+  background: var(--cavil-tint-6);
+  border-bottom-color: var(--cavil-edge-3);
 }
 .license-matrix-verdict {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-weight: 700;
 }
 .license-matrix-detail-title {
@@ -660,7 +802,7 @@ export default {
   gap: 0.4rem;
 }
 .license-matrix-detail-label {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.02em;
@@ -668,27 +810,139 @@ export default {
   text-transform: uppercase;
 }
 .license-matrix-connector {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
 }
 .license-matrix-detail-name {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-weight: 600;
 }
 .license-matrix-detail-body {
-  background: #ffffff;
-  color: #1f2328;
+  background: var(--cavil-canvas);
+  color: var(--cavil-fg);
   font-size: 13px;
   line-height: 1.5;
   margin: 0;
   padding: 0.85rem 1rem;
 }
 .bar-no + .license-matrix-detail-body {
-  box-shadow: inset 0 11px 17px -20px rgba(90, 108, 132, 0.55);
+  box-shadow: inset 0 11px 17px -20px rgba(var(--cavil-shadow-cool-rgb), 0.55);
 }
 .bar-check + .license-matrix-detail-body {
-  box-shadow: inset 0 11px 17px -20px rgba(154, 163, 173, 0.5);
+  box-shadow: inset 0 11px 17px -20px rgba(var(--cavil-neutral-soft-rgb), 0.5);
 }
 .bar-unknown + .license-matrix-detail-body {
-  box-shadow: inset 0 11px 17px -20px rgba(196, 201, 207, 0.5);
+  box-shadow: inset 0 11px 17px -20px rgba(var(--cavil-neutral-pale-rgb), 0.5);
+}
+
+/* Header controls: the colour-mode switch sits next to the show-all toggle. */
+.license-matrix-controls {
+  align-items: center;
+  display: flex;
+  gap: 0.6rem;
+}
+.license-matrix-mode {
+  background: var(--cavil-canvas);
+  border: 1px solid var(--cavil-border);
+  border-radius: 6px;
+  display: inline-flex;
+  overflow: hidden;
+}
+.license-matrix-mode-btn {
+  appearance: none;
+  background: var(--cavil-canvas);
+  border: 0;
+  color: var(--cavil-fg-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 0.25rem 0.6rem;
+}
+.license-matrix-mode-btn + .license-matrix-mode-btn {
+  border-left: 1px solid var(--cavil-border);
+}
+.license-matrix-mode-btn:hover {
+  background: var(--cavil-canvas-subtle);
+}
+.license-matrix-mode-btn.is-on {
+  background: var(--cavil-accent-emphasis);
+  color: var(--cavil-on-accent);
+}
+
+/* Detail panel "Where" band: proximity summary + file-browser links, parked under the OSADL explanation. */
+.license-matrix-where {
+  border-top: 1px solid var(--cavil-neutral-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.6rem 1rem;
+}
+.license-matrix-where-head {
+  align-items: center;
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.license-matrix-where-label {
+  color: var(--cavil-fg-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.license-matrix-where-verdict {
+  color: var(--cavil-fg);
+  font-size: 13px;
+  font-weight: 600;
+}
+.license-matrix-where-tag {
+  background: var(--cavil-tint-5);
+  border-radius: 999px;
+  color: var(--cavil-fg-muted);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0.05rem 0.5rem;
+}
+.license-matrix-file-list {
+  color: var(--cavil-fg-muted);
+  font-size: 13px;
+  list-style: none;
+  margin: 0.1rem 0 0;
+  padding: 0;
+}
+.license-matrix-file-list li {
+  line-height: 1.35;
+}
+.license-matrix-file-list li + li {
+  margin-top: 0.35rem;
+}
+.license-matrix-file-link {
+  color: var(--cavil-fg-muted);
+  overflow-wrap: anywhere;
+  text-decoration-color: transparent;
+}
+.license-matrix-file-link:hover,
+.license-matrix-file-link:focus {
+  color: var(--cavil-accent-strong);
+  text-decoration-color: currentColor;
+}
+
+/* Likelihood legend swatches: distinct hues down the heat scale, a grey for peripheral - matching
+   markStyle so the grid and the key read as one scale. */
+.license-matrix-swatch.swatch-file {
+  background: var(--cavil-heat-1);
+}
+.license-matrix-swatch.swatch-deep {
+  background: var(--cavil-heat-2);
+}
+.license-matrix-swatch.swatch-shared {
+  background: var(--cavil-heat-3);
+}
+.license-matrix-swatch.swatch-root {
+  background: var(--cavil-grey-2);
+}
+.license-matrix-swatch.swatch-peripheral {
+  background: var(--cavil-edge-7);
 }
 </style>

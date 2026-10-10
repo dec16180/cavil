@@ -20,8 +20,8 @@ export function encodePath(path) {
     .join('/');
 }
 
-export function fileViewUrl(pkgId, path) {
-  return `/reviews/file_view/${pkgId}/${encodePath(path)}`;
+export function fileViewUrl(pkgId, path, line = 0) {
+  return `/reviews/file_view/${pkgId}/${encodePath(path)}${line ? `#L${line}` : ''}`;
 }
 
 export function licenseLink(license) {
@@ -35,13 +35,12 @@ export function packageLink(review) {
   return `<a href='/search?q=${name}'>${name}</a>`;
 }
 
-export function productLink(product) {
-  let name = product.name;
-  return `<a href='/products/${name}' target='_blank' rel='noopener'>${name}</a>`;
-}
-
-export function spdxLicenseUrl(name) {
-  return `https://spdx.org/licenses/${encodeURIComponent(name)}.html`;
+// In-page navigation by default (the product listing); the report metadata opens a new tab so a reviewer
+// keeps their place, matching the other report links, by passing {blank: true}
+export function productLink(product, {blank = false} = {}) {
+  const name = product.name;
+  const attrs = blank ? " target='_blank' rel='noopener'" : '';
+  return `<a href='/products/${encodeURIComponent(name)}'${attrs}>${name}</a>`;
 }
 
 export function reportLink(review) {
@@ -60,14 +59,38 @@ export function reportLink(review) {
 
 export function setupPopover() {
   const popoverTriggerList = document.querySelectorAll('[data-bs-toggle="popover"]');
-  [...popoverTriggerList].map(popoverTriggerEl => new Popover(popoverTriggerEl));
+  // getOrCreateInstance so a re-init (e.g. a list refresh or the report metadata poll) reuses the existing
+  // popover instead of stacking a duplicate on the same element.
+  [...popoverTriggerList].map(popoverTriggerEl => Popover.getOrCreateInstance(popoverTriggerEl));
 }
 
 export function setupPopoverDelayed() {
   setTimeout(setupPopover, 1);
 }
 
+// Lawyers triage by "has a review been written yet, and by whom", so one element swaps its glyph
+// through these states. Deliberately no check mark anywhere: a review note carries findings, not a
+// verdict, and the accept/reject decision is one click away.
+const NOTE_STATES = {
+  limitation: ['fa-solid fa-triangle-exclamation', 'Limitations apply to this package'],
+  ai_review: ['fa-solid fa-robot', 'An AI-assisted review note applies to this report'],
+  review: ['fa-solid fa-note-sticky', 'A review note applies to this report'],
+  note: ['fa-regular fa-note-sticky', 'A note applies to this report, but no review note yet']
+};
+
+function notesLink(review) {
+  const state = NOTE_STATES[review.relevant_note];
+  if (!state) return '';
+  const [icon, label] = state;
+  const muted = {note: '', limitation: ' is-limitation'}[review.relevant_note] ?? ' is-review';
+  // No whitespace around the link: the gap is CSS, so the cell's text stays exactly the report name
+  return `<a class="cavil-list-notes${muted}" href="/reviews/details/${review.id}#notes"
+    title="${label}" aria-label="${label}"><i class="${icon}"></i></a>`;
+}
+
 function linkWithContext(html, review) {
+  html = `${html}${notesLink(review)}`;
+
   const unresolved = review.unresolved_matches;
   if (unresolved !== 0) html = `${html} <div class="badge cavil-risk-unknown-badge">${unresolved}</div>`;
 

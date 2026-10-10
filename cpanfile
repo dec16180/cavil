@@ -6,7 +6,7 @@ requires 'Cpanel::JSON::XS', '>= 4.09';
 requires 'File::Unpack2';
 requires 'HTML::Parser';
 requires 'IPC::Run';
-requires 'Cavil::Matcher';
+requires 'Cavil::Matcher', '>= 1.04';
 recommends 'Spooky::Patterns::XS';    # alternative pattern engine, loaded only when "matcher => 'spooky'" is configured
 requires 'Mojolicious::Plugin::OAuth2';
 requires 'Mojo::JWT';
@@ -18,7 +18,7 @@ requires 'Text::Diff';
 requires 'Text::Glob';
 requires 'Try::Tiny';
 requires 'YAML::XS';
-requires 'JSON::Validator';
+requires 'JSON::Schema::Tiny';
 requires 'Digest::SHA1';
 requires 'MCP', '>= 0.07';
 requires 'CommonMark';

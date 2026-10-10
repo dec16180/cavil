@@ -1,17 +1,5 @@
-# Copyright (C) 2024 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -168,7 +156,7 @@ subtest 'Embargoed packages' => sub {
       ->json_is('/saved/id',           3);
     $t->get_ok('/package/3/report' => {Authorization => 'Token test_token'})
       ->status_is(408)
-      ->content_like(qr/not indexed/);
+      ->json_is('/stage' => 'queued');
     $t->get_ok('/api/1.0/source' => form => $form)->status_is(200)->json_is('/review' => 3, '/history' => []);
     $t->app->minion->perform_jobs;
     my $checkout = $dir->child('perl-Mojolicious.SUSE_SLE-15-SP2_Update', '236d7b56886a0d2799c0d114eddbb7ff');
@@ -198,7 +186,7 @@ subtest 'Embargoed packages' => sub {
   };
 
   subtest 'Check embargo status on re-import' => sub {
-    $t->app->packages->obsolete_if_not_in_product(3);
+    $t->app->packages->obsolete_if_unused(3);
     is $t->app->minion->jobs({tasks => ['obs_import']})->total, 1, 'one import job';
 
     $t->post_ok('/packages' => {Authorization => 'Token test_token'} => form => $form)

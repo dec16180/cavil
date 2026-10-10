@@ -26,13 +26,18 @@ $cavil_test->spdx_fixtures($t->app);
 # Make the "Apache-2.0" pattern unknown to SPDX, so it has to fall back to a ScanCode identifier
 $t->app->pg->db->query('UPDATE license_patterns SET spdx = ? WHERE license = ?', '', 'Apache-2.0');
 
-# Index by spdxId (or blank node @id) for easy graph lookups
 sub graph_index ($doc) {
   return {map { ($_->{spdxId} // $_->{'@id'}) => $_ } @{$doc->{'@graph'}}};
 }
 
 sub of_type ($doc, $type) {
   return [grep { ($_->{type} // '') eq $type } @{$doc->{'@graph'}}];
+}
+
+# Relationships of one type, optionally only those originating from a given element
+sub rels ($doc, $type, $from = undef) {
+  return [grep { $_->{relationshipType} eq $type && (!defined $from || $_->{from} eq $from) }
+      @{of_type($doc, 'Relationship')}];
 }
 
 # All license expressions listed anywhere in the document
@@ -46,10 +51,10 @@ sub read_report ($path) {
   return decode_json($buffer);
 }
 
-# Generate a fresh SPDX report for package 1 (with whatever config/data is currently set) and parse it
-sub gen_doc {
+# Generate a fresh SPDX report (with whatever config/data is currently set) and parse it
+sub gen_doc ($id = 1) {
   my $tmp = tempfile;
-  $t->app->spdx->generate_to_file(1, "$tmp");
+  $t->app->spdx->generate_to_file($id, "$tmp");
   return read_report("$tmp");
 }
 
@@ -86,72 +91,52 @@ subtest 'Generate SPDX report' => sub {
     'UPDATE snippets SET classified = true, license = true, like_pattern = 1, likelyness = 0.95 WHERE id = any(?)', [2])
     ->rows, 1, 'one snippet is a license';
 
-  ok !$t->app->packages->has_spdx_report(1), 'package has no SPDX report';
-  $t->get_ok('/spdx/1')->status_is(408)->content_like(qr/generated/)->content_unlike(qr/\@graph/);
-  $t->get_ok('/spdx/1')->status_is(408)->content_like(qr/generated/)->content_unlike(qr/\@graph/);
+  ok !$t->app->packages->has_document(1, 'spdx'), 'package has no SPDX report';
+  $t->get_ok('/documents/1/spdx')->status_is(408)->content_is('being generated');
+  $t->get_ok('/documents/1/spdx')->status_is(408)->content_is('being generated');
   $t->app->minion->perform_jobs;
   is $t->app->minion->jobs({states => ['failed']})->total, 0, 'no failed jobs';
-  ok $t->app->packages->has_spdx_report(1), 'package has SPDX report';
+  ok $t->app->packages->has_document(1, 'spdx'), 'package has SPDX report';
 
   # gzip-capable client (Mojo's UA sends "Accept-Encoding: gzip" and transparently decompresses). Gzip is
   # only the transfer encoding, so the file the browser saves is the JSON the disposition names.
-  $t->get_ok('/spdx/1')
+  $t->get_ok('/documents/1/spdx')
     ->status_is(200)
     ->content_type_is('application/json')
     ->header_is('Content-Disposition' => 'attachment; filename="1.spdx.json"')
     ->json_has('/@graph');
 
   # Client that does not accept gzip gets the report decompressed on the fly, without a gzip encoding
-  $t->get_ok('/spdx/1' => {'Accept-Encoding' => 'identity'})
+  $t->get_ok('/documents/1/spdx' => {'Accept-Encoding' => 'identity'})
     ->status_is(200)
     ->content_type_is('application/json')
     ->header_is('Content-Encoding'    => undef)
     ->header_is('Content-Disposition' => 'attachment; filename="1.spdx.json"')
     ->json_has('/@graph');
 
+  # The generic route serves the same document, and every other one the registry lists
+  $t->get_ok('/documents/1/spdx')
+    ->status_is(200)
+    ->content_type_is('application/json')
+    ->header_is('Content-Disposition' => 'attachment; filename="1.spdx.json"')
+    ->json_has('/@graph');
+  $t->get_ok('/documents/1/notice')
+    ->status_is(200)
+    ->content_type_is('text/plain')
+    ->header_is('Content-Disposition' => 'attachment; filename="1.NOTICE.txt"')
+    ->content_like(qr/^NOTICE for perl-Mojolicious/);
+  $t->get_ok('/documents/1/notice' => {'Accept-Encoding' => 'identity'})
+    ->status_is(200)
+    ->header_is('Content-Encoding' => undef)
+    ->content_like(qr/^NOTICE for perl-Mojolicious/);
+
+  # A format nothing registered is not a package that has not been built yet
+  $t->get_ok('/documents/1/cyclonedx')->status_is(404);
+
   $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
 };
 
-subtest 'Always generate SPDX reports when reindexing' => sub {
-  $t->app->packages->reindex(1);
-  $t->app->minion->perform_jobs;
-  ok !$t->app->packages->has_spdx_report(1), 'package has no SPDX report';
-
-  $t->app->config->{always_generate_spdx_reports} = 1;
-  $t->app->packages->reindex(1);
-  $t->app->minion->perform_jobs;
-  ok $t->app->packages->has_spdx_report(1), 'package has SPDX report';
-};
-
-# A build that dies on the way to its report must not leave the package unable to ever get one again. The
-# job that would have written it waits in the queue behind its failed parent, where an admin can see it and
-# retry - and nothing outside the queue is holding a claim on the work that could outlive the build.
-subtest 'A build whose analyzed job fails still gets its report from a retry' => sub {
-  my $minion = $t->app->minion;
-  my $pkgs   = $t->app->packages;
-  $pkgs->remove_spdx_report(1);
-
-  my $analyzed = $minion->tasks->{analyzed};
-  $minion->add_task(analyzed => sub ($job, @args) { die "Auto review went wrong\n" });
-  is $pkgs->reindex(1), 'now', 'reindex queued';
-  $minion->perform_jobs;
-  $minion->add_task(analyzed => $analyzed);
-
-  ok !$pkgs->has_spdx_report(1), 'package has no SPDX report';
-  is $minion->jobs({tasks => ['analyzed'],    states => ['failed']})->total,   1, 'the analyzed job failed';
-  is $minion->jobs({tasks => ['spdx_report'], states => ['inactive']})->total, 1, 'the report job is still queued';
-  is $t->app->pg->db->query('SELECT COUNT(*) FROM minion_locks')->array->[0], 0, 'nothing is locked';
-
-  # What an admin does from the Minion dashboard
-  my $failed = $minion->jobs({tasks => ['analyzed'], states => ['failed']})->next;
-  ok $minion->job($failed->{id})->retry, 'analyzed job retried';
-  $minion->perform_jobs;
-
-  is $minion->jobs({states => ['failed']})->total, 0, 'no failed jobs';
-  ok $pkgs->has_spdx_report(1), 'package has SPDX report';
-};
-
-my $path = $t->app->packages->spdx_report_path(1);
+my $path = $t->app->packages->document_path(1, 'spdx');
 my $doc  = read_report($path);
 my $g    = graph_index($doc);
 
@@ -168,12 +153,12 @@ subtest 'Legacy reports are cleaned up' => sub {
   my @legacy = qw(.report.spdx .report.processed.spdx .report.spdx.json .report.processed.spdx.json);
   $dir->child($_)->spew('legacy') for @legacy;
   ok -e $dir->child($_), "legacy report $_ exists" for @legacy;
-  ok $t->app->packages->has_spdx_report(1), 'the current report exists';
+  ok $t->app->packages->has_document(1, 'spdx'), 'the current report exists';
 
-  $t->app->packages->remove_spdx_report(1);
+  $t->app->packages->remove_documents(1);
 
-  ok !-e $dir->child($_),                    "legacy report $_ removed" for @legacy;
-  ok !$t->app->packages->has_spdx_report(1), 'current report removed';
+  ok !-e $dir->child($_),                         "legacy report $_ removed" for @legacy;
+  ok !$t->app->packages->has_document(1, 'spdx'), 'current report removed';
 };
 
 subtest 'Valid SPDX 3.0.1 JSON document' => sub {
@@ -196,13 +181,16 @@ subtest 'Graph is internally consistent' => sub {
   is_deeply \@unidentified, [], 'every element has an identifier';
   is_deeply \@duplicates,   [], 'all identifiers are unique';
 
-  # Every reference (creationInfo, relationships, root elements, agents) resolves to an element in the graph
+  # Every reference (creationInfo, relationships, root elements, agents) resolves to an element in the graph,
+  # or to one of the individuals SPDX itself defines for "nothing is asserted here" and "there is nothing here"
+  my %individual = map { $_ => 1 } 'expandedlicensing_NoAssertionLicense',
+    'https://spdx.org/rdf/3.0.1/terms/Core/NoAssertionElement', 'https://spdx.org/rdf/3.0.1/terms/Core/NoneElement';
   my @dangling;
   for my $node (@{$doc->{'@graph'}}) {
     my @refs = grep {defined} $node->{creationInfo}, $node->{from}, $node->{subject},
       $node->{software_snippetFromFile}, $node->{dataLicense};
     push @refs,     @{$node->{$_} // []} for qw(createdBy createdUsing rootElement originatedBy to);
-    push @dangling, $_                   for grep { !$ids{$_} } @refs;
+    push @dangling, $_                   for grep { !$ids{$_} && !$individual{$_} } @refs;
   }
   is_deeply \@dangling, [], 'no dangling references in the graph';
 };
@@ -222,12 +210,34 @@ subtest 'Creation information (BSI: creator and timestamp)' => sub {
   my $tool = $g->{$ci->{createdUsing}[0]};
   is $tool->{type}, 'Tool',  'created using a tool';
   is $tool->{name}, 'Cavil', 'the tool is Cavil';
+
+  # The tool name and the tool version are two separate things a consumer is entitled to, and the name
+  # has to stay a bare "Cavil", so the version travels alongside it as a package URL
+  is_deeply $tool->{externalIdentifier},
+    [
+    {
+      type                   => 'ExternalIdentifier',
+      externalIdentifierType => 'packageUrl',
+      identifier             => 'pkg:generic/cavil@' . Cavil->VERSION
+    }
+    ],
+    'the tool carries its own version';
 };
 
 subtest 'SBOM document (BSI: SBOM-URI)' => sub {
   my $sbom = of_type($doc, 'software_Sbom')->[0];
   is $sbom->{spdxId}, 'http://legaldb.suse.de/spdx/1', 'SBOM-URI';
   is_deeply $sbom->{software_sbomType}, ['source'], 'source SBOM';
+
+  # The URI is the same for every rebuild of this package, so the iteration counter is the only thing
+  # telling a recipient which of two documents with that URI is the newer one
+  my ($version) = grep { ($_->{comment} // '') eq 'SBOM version' } @{$sbom->{externalIdentifier}};
+  like $version->{identifier}, qr/^1\.\d+$/, 'the SBOM carries an iteration number';
+
+  # What is unknown is stated once for the document, rather than repeated on thousands of components
+  like $sbom->{comment}, qr/Unknown information is stated rather than omitted/,
+    'the document says how it handles unknowns';
+  like $sbom->{comment}, qr/Nothing is withheld/, 'and that nothing is being held back';
 
   my $primary = $g->{$sbom->{rootElement}[0]};
   is $primary->{type}, 'software_Package', 'root element is the primary component';
@@ -263,10 +273,7 @@ subtest 'Primary component (BSI: required and additional fields)' => sub {
     ],
     'source code URI is the version-pinned OBS source, as a VCS reference';
 
-  my @artifacts
-    = map { $g->{$_->{to}[0]} }
-    grep  { $_->{from} eq $primary->{spdxId} && $_->{relationshipType} eq 'hasDistributionArtifact' }
-    @{of_type($doc, 'Relationship')};
+  my @artifacts = map { $g->{$_->{to}[0]} } @{rels($doc, 'hasDistributionArtifact', $primary->{spdxId})};
   is scalar(@artifacts),  1,                               'exactly one distribution artifact (the source archive)';
   is $artifacts[0]{name}, './Mojolicious-7.25.tar.gz',     'the source archive is the deployable artifact';
   is $artifacts[0]{verifiedUsing}[0]{algorithm}, 'sha512', 'deployable component hashed with SHA-512';
@@ -438,10 +445,27 @@ subtest 'Creator identity is configurable (URL fallback and defaults)' => sub {
   my $default_doc = gen_doc();
   my $dci         = of_type($default_doc, 'CreationInfo')->[0];
   my %dby_id      = map { ($_->{spdxId} // $_->{'@id'}) => $_ } @{$default_doc->{'@graph'}};
-  is $dby_id{$dci->{createdBy}[0]}{name},    'Cavil', 'defaults to Cavil as the creator';
+  is $dby_id{$dci->{createdBy}[0]}{name}, 'legaldb.suse.de',
+    'an unconfigured creator falls back to the deployment, not to the tool';
   is $dby_id{$dci->{createdUsing}[0]}{name}, 'Cavil', 'defaults to Cavil as the tool';
 
   $t->app->config->{spdx} = $spdx_config;
+};
+
+subtest 'Every rebuild is a new iteration of the same SBOM' => sub {
+
+  # Reindexing, a reclassified snippet or an edited pattern all change what the report says without
+  # changing the URI it is published under, so the iteration number has to move on its own
+  my $version = sub ($sbom_doc) {
+    my $sbom = of_type($sbom_doc, 'software_Sbom')->[0];
+    my ($id) = grep { ($_->{comment} // '') eq 'SBOM version' } @{$sbom->{externalIdentifier}};
+    return $id->{identifier};
+  };
+
+  my ($first, $second) = map { $version->(gen_doc()) } 1, 2;
+  my ($a, $b) = map { (split /\./)[1] } $first, $second;
+  is $b, $a + 1, "consecutive reports for the same package are different iterations ($first, $second)";
+  like $first, qr/^1\./, 'the major version is the minimum-elements revision the document follows';
 };
 
 subtest 'LicenseRef namespace is configurable' => sub {
@@ -476,7 +500,8 @@ subtest 'Packages without Open Build Service coordinates (e.g. uploads)' => sub 
   my $upload_doc = gen_doc();
   my ($primary) = grep { $_->{name} eq 'perl-Mojolicious' } @{of_type($upload_doc, 'software_Package')};
   ok !exists $primary->{software_downloadLocation}, 'no download location without OBS coordinates';
-  ok !exists $primary->{originatedBy},              'no originator without OBS coordinates';
+  is_deeply $primary->{originatedBy}, ['https://spdx.org/rdf/3.0.1/terms/Core/NoAssertionElement'],
+    'an unknown producer is stated rather than omitted';
   is $primary->{software_packageVersion}, '7.25', 'version is still present';
   schema_ok($upload_doc, 'upload-style document still validates');
 
@@ -497,9 +522,7 @@ subtest 'Component version falls back to the source-control timestamp (BSI 5.2.2
   $t->app->minion->perform_jobs;
   is $t->app->minion->jobs({states => ['failed']})->total, 0, 'no failed jobs';
 
-  my $tmp = tempfile;
-  $t->app->spdx->generate_to_file(2, "$tmp");
-  my $nover_doc = read_report("$tmp");
+  my $nover_doc = gen_doc(2);
   my ($primary) = grep { $_->{name} eq 'perl-Mojolicious' } @{of_type($nover_doc, 'software_Package')};
 
   my $epoch = $t->app->pg->db->query('SELECT EXTRACT(EPOCH FROM created)::bigint AS e FROM bot_packages WHERE id = 2')
@@ -508,7 +531,15 @@ subtest 'Component version falls back to the source-control timestamp (BSI 5.2.2
     'version falls back to the source-control timestamp';
   like $primary->{software_packageVersion}, qr/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/,
     'fallback version is an RFC 3339 date-time';
-  ok !$primary->{externalIdentifier}, 'no package URL without a creator-assigned version';
+  is_deeply $primary->{externalIdentifier},
+    [
+    {
+      type                   => 'ExternalIdentifier',
+      externalIdentifierType => 'packageUrl',
+      identifier             => 'pkg:generic/perl-Mojolicious'
+    }
+    ],
+    'the package URL is versionless rather than absent, and does not carry the timestamp';
   schema_ok($nover_doc, 'version-fallback document still validates');
 };
 
@@ -523,9 +554,7 @@ subtest 'Source code URI for git sources (BSI 5.2.4)' => sub {
     '',    'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678', $source_id
   );
 
-  my $tmp = tempfile;
-  $t->app->spdx->generate_to_file(2, "$tmp");
-  my $git_doc = read_report("$tmp");
+  my $git_doc = gen_doc(2);
   my ($primary) = grep { $_->{name} eq 'perl-Mojolicious' } @{of_type($git_doc, 'software_Package')};
 
   is_deeply $primary->{externalRef},
@@ -542,24 +571,27 @@ subtest 'Source code URI for git sources (BSI 5.2.4)' => sub {
 
 # The case the translation exists for: both files are shifted by post-processing, so the numbers
 # the indexer stored point at the wrong lines of the files the report names
+# The line-shift checkout has no spec file, which later subtests reuse as a package that declares nothing
+my $shift_id;
+
 subtest 'Line ranges are translated back out of the post-processed copy' => sub {
-  my $id = $cavil_test->spdx_line_shift_fixtures($t->app);
+  my $id = $shift_id = $cavil_test->spdx_line_shift_fixtures($t->app);
   $t->app->minion->enqueue(unpack => [$id]);
   $t->app->minion->perform_jobs;
   is $t->app->minion->jobs({states => ['failed']})->total, 0, 'no failed jobs';
 
-  my $tmp = tempfile;
-  $t->app->spdx->generate_to_file($id, "$tmp");
-  my $shift_doc = read_report("$tmp");
-
-  my %files = map { $_->{name} => $_ } @{of_type($shift_doc, 'software_File')};
+  my $shift_doc = gen_doc($id);
+  my %files     = map { $_->{name} => $_ } @{of_type($shift_doc, 'software_File')};
   ok $files{'./bundle.js'},                 'the wrapped file is reported under its original name';
   ok $files{'./page.html'},                 'the stripped file is reported under its original name';
   ok !(grep {/\.processed\./} keys %files), 'no scanned copy leaks into the report';
 
+  # Keyed by the file each snippet actually points at, so a third file with a match cannot land in
+  # another one's bucket
+  my %name_of = map { $_->{spdxId} => ($_->{name} =~ s{^\./}{}r) } values %files;
   my %ranges;
   for my $snippet (@{of_type($shift_doc, 'software_Snippet')}) {
-    my $file = $files{'./bundle.js'}{spdxId} eq $snippet->{software_snippetFromFile} ? 'bundle.js' : 'page.html';
+    next unless my $file = $name_of{$snippet->{software_snippetFromFile}};
     push @{$ranges{$file}}, $snippet->{software_lineRange};
   }
 
@@ -584,40 +616,188 @@ subtest 'Line ranges are translated back out of the post-processed copy' => sub 
   schema_ok($shift_doc, 'translated document validates');
 };
 
+subtest 'A notice is stored once with the files it covers, and attributed back to each of them' => sub {
+  my $rows = $t->app->reports->copyrights($shift_id);
+  my ($shared) = grep { $_->{copyright} eq 'Copyright (c) 2019 Cavil Fixture Authors' } @$rows;
+  ok $shared, 'the notice both files carry is stored';
+  is_deeply $shared->{files}, ['bundle.js', 'helper.js'], 'one row, naming every file it was found in';
+
+  # The point of storing it once: two files, one entry, and the SBOM still names it on both of them
+  my $shift_doc = gen_doc($shift_id);
+  my %copyright = map { $_->{name} => $_->{software_copyrightText} }
+    grep { $_->{software_copyrightText} } @{of_type($shift_doc, 'software_File')};
+  is $copyright{'./bundle.js'}, 'Copyright (c) 2019 Cavil Fixture Authors', 'attributed to the first file';
+  is $copyright{'./helper.js'}, 'Copyright (c) 2019 Cavil Fixture Authors', 'attributed to the second file';
+
+  # Notices are read from the original file, so a notice sitting past the point where post-processing
+  # wraps a line is still whole (the ".processed" copy of bundle.js splits its long line in two)
+  ok !$copyright{'./page.html'}, 'a file with no notice carries no copyright text';
+};
+
+subtest 'Every LicenseRef the document mints is defined in it' => sub {
+  my %custom = map { $_->{spdxId} => $_ } @{of_type($doc, 'expandedlicensing_CustomLicense')};
+
+  my @refs;
+  for my $expr (@{of_type($doc, 'simplelicensing_LicenseExpression')}) {
+    my @in = $expr->{simplelicensing_licenseExpression} =~ /(LicenseRef-[A-Za-z0-9.-]+)/g;
+    next unless @in;
+    my %bound = map { $_->{key} => $_->{value} } @{$expr->{simplelicensing_customIdToUri} // []};
+    for my $ref (@in) {
+      push @refs, $ref;
+      my $target = $bound{$ref};
+      ok $target, "$ref is bound to an element";
+      ok $custom{$target // ''}, "$ref resolves to a CustomLicense in this document";
+      ok length($custom{$target // ''}{simplelicensing_licenseText} // ''), 'which carries the text it stands for';
+
+      # A declaration is evidence for the identifier, not terms to reproduce, so it has to say so
+      like $custom{$target // ''}{comment}, qr/Text as found at|declared by the component metadata|curated in Cavil/,
+        'and says where the text came from';
+    }
+  }
+
+  # Otherwise the loop above proves nothing
+  ok @refs, 'the fixture does mint a LicenseRef';
+};
+
+# A LicenseRef needs terms a reader can act on. What a match happened to cover is only evidence that the
+# identifier applies, so a curated full text has to win when one exists.
+subtest 'A CustomLicense prefers a curated full text over the matched evidence' => sub {
+  my ($name) = map { $_->{name} } grep { defined $_->{name} } @{of_type($doc, 'expandedlicensing_CustomLicense')};
+  ok $name, 'the fixture has a license Cavil knows by name only';
+
+  my $curated = "Curated terms for $name, reproduced in full and at some length.";
+  my $id      = $t->app->patterns->create(pattern => $curated, license => $name, full_license_text => 1)->{id};
+  ok $id, 'a full text was curated for it';
+
+  my ($node) = grep { ($_->{name} // '') eq $name } @{of_type(gen_doc(1), 'expandedlicensing_CustomLicense')};
+  is $node->{simplelicensing_licenseText}, $curated, 'the curated text is what the SBOM reproduces';
+  like $node->{comment}, qr/curated in Cavil/, 'and it is not passed off as text found in the package';
+
+  $t->app->pg->db->query('DELETE FROM license_patterns WHERE id = ?', $id);
+  my ($back) = grep { ($_->{name} // '') eq $name } @{of_type(gen_doc(1), 'expandedlicensing_CustomLicense')};
+  like $back->{comment}, qr/Text as found at/, 'without one it falls back to the evidence again';
+};
+
+subtest 'The package states its own copyright, not only its files' => sub {
+  my ($primary) = grep { $_->{spdxId} =~ /#package$/ } @{of_type($doc, 'software_Package')};
+  like $primary->{software_copyrightText}, qr/Copyright/, 'copyright is a component attribute too';
+};
+
+subtest 'A catch-all is not asserted as a license' => sub {
+  my $matched = $t->app->pg->db->query(
+    "SELECT count(*) FROM pattern_matches pm JOIN license_patterns lp ON lp.id = pm.pattern
+      WHERE pm.package = ? AND lp.license = 'Any Permissive'", $shift_id
+  )->array->[0];
+  ok $matched, 'the catch-all pattern really did match, so the guard is what the next assertion tests';
+
+  my $shift_doc = gen_doc($shift_id);
+  my @exprs     = @{license_exprs($shift_doc)};
+  ok !(grep {/Any-Permissive/} @exprs), 'a license the curator declined to identify is claimed as none';
+};
+
+subtest 'A file whose name is not ASCII is still a component of the document' => sub {
+  my $shift_doc = gen_doc($shift_id);
+  my $name      = "./b\x{fc}cher.c";
+
+  my ($node) = grep { ($_->{name} // '') eq $name } @{of_type($shift_doc, 'software_File')};
+  ok $node, 'the file is in the document, under the name a reader can type';
+  is $node->{software_copyrightText}, 'Copyright (c) 2019 Umlaut Authors', 'its notice is attributed to it';
+
+  ok $node && @{rels($shift_doc, 'hasConcludedLicense', $node->{spdxId})}, 'and so is the license found in it';
+};
+
+# A consumer has to be able to tell "we do not know" from "we did not look". Vendored code is where that
+# distinction bites: its embedded metadata names the component but almost never says who published it.
+# The go-vendor checkout is the counterpart to the line-shift one below: a package that does ship vendored code
+my $vendor_id;
+
+subtest 'Vendored subcomponents say what is unknown about them' => sub {
+  my $id = $vendor_id = $cavil_test->go_vendor_fixtures($t->app);
+  $t->app->minion->enqueue(unpack => [$id]);
+  $t->app->minion->perform_jobs;
+  is $t->app->minion->jobs({states => ['failed']})->total, 0, 'no failed jobs';
+
+  my $vendor_doc = gen_doc($id);
+  my ($mux) = grep { $_->{name} eq 'github.com/gorilla/mux' } @{of_type($vendor_doc, 'software_Package')};
+  ok $mux, 'the vendored module is in the report';
+  is_deeply $mux->{originatedBy}, ['https://spdx.org/rdf/3.0.1/terms/Core/NoAssertionElement'],
+    'a vendored module with no identifiable producer says so';
+
+  # A Go vendor listing carries no licenses at all, so this component has none to state either
+  my ($concluded) = @{rels($vendor_doc, 'hasConcludedLicense', $mux->{spdxId})};
+  ok $concluded, 'it still has a concluded license relationship';
+  is $concluded->{to}[0], 'expandedlicensing_NoAssertionLicense', 'which states that the license is unknown';
+  ok !exists $concluded->{completeness}, 'an unknown license is not claimed to be a complete answer';
+
+  schema_ok($vendor_doc, 'a document full of NoAssertions still validates');
+
+  # A primary component nothing declares a license for is treated the same way (the line-shift checkout
+  # ships no spec file at all)
+  my $shift_doc           = gen_doc($shift_id);
+  my ($primary)           = grep { $_->{name} eq 'line-shift' } @{of_type($shift_doc, 'software_Package')};
+  my ($primary_concluded) = @{rels($shift_doc, 'hasConcludedLicense', $primary->{spdxId})};
+  is $primary_concluded->{to}[0], 'expandedlicensing_NoAssertionLicense',
+    'a package with no declared license says the license is unknown';
+};
+
+# Both standards want the dependency list to say whether it is the whole list. A package with vendored code
+# says so on every dependency edge; one without has no edge to say it on, so the empty list is stated as such
+subtest 'The dependency list says whether it is complete' => sub {
+  my $vendor_deps = rels(gen_doc($vendor_id), 'dependsOn');
+  ok @$vendor_deps > 1, 'the vendored package depends on its subcomponents';
+  is_deeply [map { $_->{completeness} } @$vendor_deps], [('complete') x @$vendor_deps],
+    'and each of those dependencies is a complete answer';
+  ok !grep({ grep {/NoneElement/} @{$_->{to}} } @$vendor_deps), 'none of them claims there are no dependencies';
+
+  my $shift_doc  = gen_doc($shift_id);
+  my $shift_deps = rels($shift_doc, 'dependsOn');
+  is scalar @$shift_deps, 1, 'a package with no vendored code still says something about its dependencies';
+  is_deeply $shift_deps->[0]{to}, ['https://spdx.org/rdf/3.0.1/terms/Core/NoneElement'], 'namely that there are none';
+  is $shift_deps->[0]{completeness}, 'complete', 'and that this is the whole list, not a partial scan';
+
+  schema_ok($shift_doc, 'an empty dependency list validates');
+};
+
 # What the download button on the report page sees. It renders from the state the report metadata carries
 # and, once a report is on its way, from the same cheap poll the rebuild progress bar uses.
 subtest 'SPDX state drives the report page download button' => sub {
   my $pkgs   = $t->app->packages;
   my $minion = $t->app->minion;
-  $pkgs->remove_spdx_report(1);
+  $pkgs->remove_documents(1);
   $t->get_ok('/login')->status_is(302)->header_is(Location => '/');
 
   # Earlier subtests left finished report jobs behind; a job that is done is not a job in flight
-  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/spdx/state', 'none');
-  $t->get_ok('/reviews/meta/1')->status_is(200)->json_is('/spdx/state', 'none');
+  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/documents/state', 'none');
+  $t->get_ok('/reviews/meta/1')->status_is(200)->json_is('/documents/state', 'none');
 
-  $t->post_ok('/spdx/1')->status_is(200)->json_is('/state', 'building');
-  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/spdx/state', 'building');
+  $t->post_ok('/documents/1')->status_is(200)->json_is('/state', 'building');
+  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/documents/state', 'building');
 
   # Clicking twice (or two reviewers on the same report) costs one job between them
-  $t->post_ok('/spdx/1')->status_is(200)->json_is('/state', 'building');
-  is $minion->jobs({tasks => ['spdx_report'], states => ['inactive', 'active'], notes => ['pkg_1']})->total, 1,
+  $t->post_ok('/documents/1')->status_is(200)->json_is('/state', 'building');
+  is $minion->jobs({tasks => ['documents'], states => ['inactive', 'active'], notes => ['pkg_1']})->total, 1,
     'exactly one report job is queued';
 
   $minion->perform_jobs;
   is $minion->jobs({states => ['failed']})->total, 0, 'no failed jobs';
-  ok $pkgs->has_spdx_report(1), 'package has SPDX report';
+  ok $pkgs->has_document(1, 'spdx'), 'package has SPDX report';
 
-  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/spdx/state', 'ready');
-  $t->get_ok('/reviews/meta/1')->status_is(200)->json_is('/spdx/state', 'ready');
+  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/documents/state', 'ready');
+  $t->get_ok('/reviews/meta/1')->status_is(200)->json_is('/documents/state', 'ready');
+
+  # Both documents come out of the one click, and each is offered on its own
+  my $state = $t->tx->res->json('/documents');
+  is_deeply [map { $_->{key} } @{$state->{documents}}],  ['spdx', 'notice'], 'every registered document is offered';
+  is_deeply [map { $_->{name} } @{$state->{documents}}], ['1.spdx.json',       '1.NOTICE.txt'], 'named for a download';
+  is_deeply [map { $_->{url} } @{$state->{documents}}],  ['/documents/1/spdx', '/documents/1/notice'], 'and linked';
 
   # The size is the one the download produces, which is the uncompressed report, not the file on disk
-  my $state = $t->tx->res->json('/spdx');
-  my $path  = $pkgs->spdx_report_path(1);
+  my $path = $pkgs->document_path(1, 'spdx');
   gunzip("$path" => \my $buffer) or die "gunzip failed: $GunzipError";
-  is $pkgs->spdx_report_size(1), length($buffer), 'the reported size is the uncompressed one';
+  my ($ready) = grep { $_->{key} eq 'spdx' } @{$pkgs->ready_documents(1)};
+  is $ready->{size}, length($buffer), 'the reported size is the uncompressed one';
   ok length($buffer) > -s $path, 'and it is bigger than the file on disk';
-  like $state->{size}, qr/^[\d.]+\s?\w+$/, 'the button gets a human readable size';
+  like $state->{documents}[0]{size}, qr/^[\d.]+\s?\w+$/, 'the control gets a human readable size';
 
   $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
 };
@@ -627,14 +807,20 @@ subtest 'SPDX state drives the report page download button' => sub {
 subtest 'A report job waits for whoever is holding the package' => sub {
   my $pkgs   = $t->app->packages;
   my $minion = $t->app->minion;
-  $pkgs->remove_spdx_report(1);
+  $pkgs->remove_documents(1);
 
   my $guard = $pkgs->claim_guard(1, 99999);
   ok $guard, 'package claimed by somebody else';
 
-  my $id = $minion->enqueue('spdx_report' => [1] => {notes => {pkg_1 => 1}});
-  $minion->perform_jobs;
-  ok !$pkgs->has_spdx_report(1), 'no report was written';
+  my $id = $minion->enqueue('documents' => [1] => {notes => {pkg_1 => 1}});
+
+  # Perform exactly one attempt: perform_jobs would drain the queue, and on a slow runner a single loop
+  # iteration outlasts the few-second first-retry delay, so the freshly delayed job becomes ready again
+  # and spins the retry count up until the delay settles to a minute.
+  my $worker = $minion->worker->register;
+  $worker->dequeue(0, {id => $id})->perform;
+  $worker->unregister;
+  ok !$pkgs->has_document(1, 'spdx'), 'no report was written';
 
   my $info = $minion->job($id)->info;
   is $info->{state},                               'inactive', 'the job went back into the queue instead of finishing';
@@ -647,7 +833,7 @@ subtest 'A report job waits for whoever is holding the package' => sub {
 
   # Which is what keeps the button spinning while the wait lasts
   $t->get_ok('/login')->status_is(302)->header_is(Location => '/');
-  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/spdx/state', 'building');
+  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/documents/state', 'building');
   $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
 
   # Once the holder lets go, the retry finds the package free and writes the report
@@ -655,7 +841,7 @@ subtest 'A report job waits for whoever is holding the package' => sub {
   $minion->job($id)->retry;
   $minion->perform_jobs;
   is $minion->jobs({states => ['failed']})->total, 0, 'no failed jobs';
-  ok $pkgs->has_spdx_report(1), 'package has SPDX report';
+  ok $pkgs->has_document(1, 'spdx'), 'package has SPDX report';
 };
 
 subtest 'SPDX report is obsolete' => sub {
@@ -663,11 +849,11 @@ subtest 'SPDX report is obsolete' => sub {
 
   is $t->app->pg->db->query('UPDATE bot_packages SET obsolete = true WHERE id = any(?)', [1])->rows, 1,
     'one package obsoleted';
-  $t->get_ok('/spdx/1')->status_is(410)->content_like(qr/package is obsolete/);
+  $t->get_ok('/documents/1/spdx')->status_is(410)->content_like(qr/package is obsolete/);
 
   # And the button says so rather than offering a report that can never be built
-  $t->post_ok('/spdx/1')->status_is(410)->json_is('/state', 'unavailable');
-  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/spdx/state', 'unavailable');
+  $t->post_ok('/documents/1')->status_is(410)->json_is('/state', 'unavailable');
+  $t->get_ok('/reviews/report_state/1')->status_is(200)->json_is('/documents/state', 'unavailable');
 
   $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
 };

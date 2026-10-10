@@ -1,5 +1,12 @@
 # Cavil User API
 
+## Contents
+
+- [Authentication](#authentication)
+- [MCP API](#mcp-api)
+- [Agent Skills](#agent-skills)
+- [REST API](#rest-api)
+
 ## Authentication
 
 All user API endpoints use bearer tokens you can generate with the "API Keys" menu entry after logging into Cavil.
@@ -41,11 +48,16 @@ Many features have access restrictions, and which are available to you will depe
 **Important**: Embargoed package updates cannot be processed with AI and are completely hidden from MCP tools. That
 means you have to manually review them in the UI.
 
-Most MCP clients today support Bearer token authentication, so that is what Cavil relies on as well. More
-authentication mechanisms will be added as the technology evolves.
+Cavil supports the OAuth login from the MCP authorization specification. Clients with OAuth support only need the URL
+`https://legaldb.suse.de/mcp`: they open your browser, you log in to Cavil as usual, and you click **Allow**. There are
+no API keys to create or copy. Write access and accepting/rejecting reviews are both off by default, and you can turn
+them on in the same Allow dialog. Every connection appears as "<client name> (OAuth)" on the **API Keys** page.
+Deleting it there disconnects the client immediately. Some clients don't tell Cavil when you disconnect them on their
+side, so this is the only reliable way to revoke access. See the [claude](#claude) section below for an example.
 
-This example configuration in the `mcp.json` format, which is commonly used by MCP clients, shows how to include a
-Cavil API key by setting the Authorization HTTP header:
+Clients without OAuth support can use Bearer token authentication with an API key instead. This example configuration
+in the `mcp.json` format, which is commonly used by MCP clients, shows how to include a Cavil API key by setting the
+Authorization HTTP header:
 
 ```
 {
@@ -60,106 +72,219 @@ Cavil API key by setting the Authorization HTTP header:
 }
 ```
 
+### MCP tool index
+
+| Tool | Access | Purpose |
+| --- | --- | --- |
+| [`cavil_get_open_reviews`](#cavil_get_open_reviews) | Read-only | List highest-priority open reviews |
+| [`cavil_search_packages`](#cavil_search_packages) | Read-only | Search packages and vendored components |
+| [`cavil_get_report`](#cavil_get_report) | Read-only | Get a package's legal report |
+| [`cavil_search_snippets`](#cavil_search_snippets) | Read-only | Search and aggregate snippets |
+| [`cavil_search_patterns`](#cavil_search_patterns) | Read-only | Precedent research over curated patterns |
+| [`cavil_test_pattern`](#cavil_test_pattern) | Read-only | Dry-run a draft or existing pattern against all snippets |
+| [`cavil_get_file`](#cavil_get_file) | Read-only | Read part of a package file |
+| [`cavil_list_files`](#cavil_list_files) | Read-only | List files in a package |
+| [`cavil_create_note`](#cavil_create_note) | Read-write | Add an AI-assisted note |
+| [`cavil_get_notes`](#cavil_get_notes) | Read-only | List notes for a package |
+| [`cavil_accept_review`](#cavil_accept_review) | Read-write | Accept a legal review |
+| [`cavil_reject_review`](#cavil_reject_review) | Read-write | Reject a legal review |
+| [`cavil_propose_ignore_snippet`](#cavil_propose_ignore_snippet) | Read-write | Propose ignoring a snippet |
+| [`cavil_propose_license_pattern`](#cavil_propose_license_pattern) | Read-write | Propose a license pattern |
+| [`cavil_propose_ignore_glob`](#cavil_propose_ignore_glob) | Read-write | Propose a file exclusion glob |
+| [`cavil_report_missing_license`](#cavil_report_missing_license) | Read-write | Report an unrecognized license |
+
 ### MCP tools
 
-These tools are currently available:
+#### cavil_get_open_reviews
 
-- *cavil_get_open_reviews* - Get a paginated list of highest priority open reviews
-  - **Required Roles**: `user` (read-only)
-  - `search`: Filter results by package name, checksum, or external link. (string, optional)
-  - `limit`: Maximum number of reviews to return. Defaults to `20`, maximum `100`. (number, optional)
-  - `offset`: Number of reviews to skip for pagination. Defaults to `0`. (number, optional)
-  - `min_priority`: Minimum package priority to include. Defaults to `1`, maximum `10`. (number, optional)
+Get a paginated list of highest priority open reviews, each reporting whether a `review` tagged note already applies
+to its report and listing its tags (including a `CVE` tag for updates that fix a security issue).
 
-- *cavil_search_packages* - Search all packages (any review state) by name or by a vendored component they ship
-  - **Required Roles**: `user` (read-only)
-  - `name`: Exact package name. (string, optional)
-  - `component`: Case-insensitive substring matched against a vendored component's name and its purl, e.g. `lodash` or `pkg:npm/lodash@4.17.20`. Matching components are attached to each result. (string, optional)
-  - `limit`: Maximum number of packages to return. Defaults to `25`, maximum `100`. (number, optional)
-  - `offset`: Number of packages to skip for pagination. Defaults to `0`. (number, optional)
+- **Required Roles**: `user` (read-only)
+- `search`: Filter results by package name, checksum, or external link. (string, optional)
+- `limit`: Maximum number of reviews to return. Defaults to `20`, maximum `100`. (number, optional)
+- `offset`: Number of reviews to skip for pagination. Defaults to `0`. (number, optional)
+- `min_priority`: Minimum package priority to include. Defaults to `1`, maximum `10`. (number, optional)
+- `without_review_note`: Only return reviews no `review` tagged note applies to yet. Defaults to `false`.
+  (boolean, optional)
 
-- *cavil_get_report* - Get legal report for a specific package. Unresolved snippets are summarised as a top-by-impact rollup; use *cavil_search_snippets* for the full list and per-snippet detail
-  - **Required Roles**: `user` (read-only)
-  - `package_id`: ID of package to get report for. (number, required)
-  - `url_limit`: Maximum number of URLs to include (occurrence-ordered). Defaults to `10`, `0` omits the section. (number, optional)
-  - `email_limit`: Maximum number of email addresses to include (occurrence-ordered). Defaults to `10`, `0` omits the section. (number, optional)
+#### cavil_search_packages
 
-- *cavil_search_snippets* - Query the unresolved-snippet backlog: filter by resolution / package / license / full-text, aggregate identical snippets by impact, or list individual occurrences with per-snippet detail
-  - **Required Roles**: `user` (read-only)
-  - `resolution`: One of `unresolved` (default), `fold`, `clear`, `overlap`, `covered`, `any`. (string, optional)
-  - `group`: `text` (default, impact-ranked distinct snippets) or `none` (individual occurrences with overlaps/keywords/covered-by detail). (string, optional)
-  - `order`: For `group=text`, one of `occurrences` (default), `packages`, `risk`, `recent`. (string, optional)
-  - `package_id`: Scope to one package; omit for fleet-wide. (number, optional)
-  - `license`: Filter by the snippet's closest license name. (string, optional)
-  - `search`: Full-text search over snippet bodies. (string, optional)
-  - `limit`: Maximum number of rows to return. Defaults to `20`, maximum `100`. (number, optional)
-  - `offset`: Number of rows to skip for pagination. Defaults to `0`. (number, optional)
+Search all packages (any review state) by name or by a vendored component they ship.
 
-- *cavil_get_file* - Get content of a specific file in the package
-  - **Required Roles**: `user` (read-only)
-  - `package_id`: ID of package to read file from. (number, required)
-  - `file_path`: Path to file inside the package checkout. (string, required)
-  - `start_line`: First line to read. Defaults to `1`. (number, optional)
-  - `end_line`: Last line to read. Defaults to `100` and maximum range is 1000 lines. (number, optional)
+- **Required Roles**: `user` (read-only)
+- `name`: Exact package name. (string, optional)
+- `component`: Case-insensitive substring matched against a vendored component's name and its purl, e.g. `lodash` or
+  `pkg:npm/lodash@4.17.20`. Matching components are attached to each result. (string, optional)
+- `limit`: Maximum number of packages to return. Defaults to `25`, maximum `100`. (number, optional)
+- `offset`: Number of packages to skip for pagination. Defaults to `0`. (number, optional)
 
-- *cavil_list_files* - List files in the package
-  - **Required Roles**: `user` (read-only)
-  - `package_id`: ID of package to list files from. (number, required)
-  - `file_glob`: Optional glob pattern used to filter listed files. Defaults to `*` (all files). (string, optional)
+#### cavil_get_report
 
-- *cavil_create_note* - Create a public note for a specific package, marked as AI-assisted
-  - **Required Roles**: `user` (read-write)
-  - `package_id`: ID of package to add a note to. (number, required)
-  - `body`: Note body in Markdown format. (string, required)
-  - `tags`: Array of tag strings, at most 32 characters each and 16 per note. (array of strings, optional)
-  - `skip_if_existing_tag`: Skip the write if a note with this tag already applies to the report, making the call idempotent. (string, optional)
+Get legal report for a specific package. Unresolved snippets are summarised as a top-by-impact rollup; use
+`cavil_search_snippets` for the full list and per-snippet detail.
 
-- *cavil_get_notes* - Get a paginated list of notes for a specific package, optionally filtered by tags. Notes a
-  reviewer has pinned are marked `[pinned]`, sort first, and are always returned regardless of `relevant_only`
-  - **Required Roles**: `user` (read-only)
-  - `package_id`: ID of package to list notes for. (number, required)
-  - `tags`: Return only notes carrying all of the given tags. (array of strings, optional)
-  - `relevant_only`: When `true`, return only notes that apply to this report. Defaults to `false`. (boolean, optional)
-  - `limit`: Maximum number of notes to return. Defaults to `20`, maximum `100`. (number, optional)
-  - `offset`: Number of notes to skip for pagination. Defaults to `0`. (number, optional)
+- **Required Roles**: `user` (read-only)
+- `package_id`: ID of package to get report for. (number, required)
+- `url_limit`: Maximum number of URLs to include (occurrence-ordered). Defaults to `10`, `0` omits the section.
+  (number, optional)
+- `email_limit`: Maximum number of email addresses to include (occurrence-ordered). Defaults to `10`, `0` omits the
+  section. (number, optional)
 
-- *cavil_accept_review* - Accept a legal review for a specific package
-  - **Required Roles**: `manager`, `lawyer` or `admin` (read-write)
-  - **Also requires**: the API key was created with the "Allow accept/reject of reviews" option enabled.
-  - `package_id`: ID of package to accept. (number, required)
-  - `reason`: Reason for package acceptance. (string, optional)
+#### cavil_search_snippets
 
-- *cavil_reject_review* - Reject a legal review for a specific package
-  - **Required Roles**: `lawyer` or `admin` (read-write)
-  - **Also requires**: the API key was created with the "Allow accept/reject of reviews" option enabled.
-  - `package_id`: ID of package to reject. (number, required)
-  - `reason`: Reason for package rejection. (string, required)
+Query the unresolved-snippet backlog: filter by resolution, package, license, or full text; aggregate identical
+snippets by impact; or list individual occurrences with per-snippet detail.
 
-- *cavil_propose_ignore_snippet* - Propose to ignore a specific snippet in the legal review
-  - **Required Roles**: `contributor`, `lawyer` or `admin` (read-write)
-  - `package_id`: ID of package to ignore snippet for. (number, required)
-  - `snippet_id`: ID of snippet to ignore. (number, required)
-  - `reason`: Reason for snippet to be ignored. (string, required)
+- **Required Roles**: `user` (read-only)
+- `resolution`: One of `unresolved` (default), `reported` (has an open missing-license report, whatever its resolution
+  - reporting a snippet Cavil auto-resolved is a valid correction), `fold`, `clear`, `overlap`, `covered`, `any`.
+  (string, optional)
+- `group`: `text` (default, impact-ranked distinct snippets) or `none` (individual occurrences with
+  overlaps/keywords/covered-by detail). (string, optional)
+- `order`: For `group=text`, one of `occurrences` (default), `packages`, `risk`, `recent`. (string, optional)
+- `package_id`: Scope to one package; omit for fleet-wide. (number, optional)
+- `license`: Filter by the snippet's closest license name. (string, optional)
+- `search`: Full-text search over snippet bodies. (string, optional)
+- `limit`: Maximum number of rows to return. Defaults to `20`, maximum `100`. (number, optional)
+- `offset`: Number of rows to skip for pagination. Defaults to `0`. (number, optional)
 
-- *cavil_propose_license_pattern* - Propose a new license pattern to be added
-  - **Required Roles**: `contributor`, `lawyer` or `admin` (read-write)
-  - `package_id`: ID of package to ignore snippet for. (number, required)
-  - `snippet_id`: ID of snippet to ignore. (number, required)
-  - `pattern`: License pattern to be added. (string, required)
-  - `license`: License expression. (string, required)
-  - `reason`: Reason for snippet to be ignored. (string, required)
+#### cavil_search_patterns
 
-- *cavil_propose_ignore_glob* - Propose a file path glob to exclude whole files from scanning system-wide
-  - **Required Roles**: `contributor`, `lawyer` or `admin` (read-write)
-  - `package_id`: ID of package the glob is proposed from; rejected unless it matches a reported file. (number, required)
-  - `glob`: File path glob, e.g. `pkgname-*/testdata/*.log`. (string, required)
-  - `reason`: Reason the matched files should be ignored. (string, required)
+Query the curated license patterns. With a subject it answers "what does Cavil already say about this text?": the
+patterns matching inside it plus near-variants, with a verdict (`consensus`, `conflict`, `partial` or `none`) and
+the close variants classified differently (dissent). Without a subject it lists patterns by filter or runs a report.
 
-- *cavil_report_missing_license* - Report a snippet as genuine license text that cannot be confidently patterned, so a lawyer can author the real pattern (it lands on the Missing Licenses review queue)
-  - **Required Roles**: `contributor`, `lawyer` or `admin` (read-write)
-  - `package_id`: ID of package the snippet belongs to. (number, required)
-  - `snippet_id`: ID of snippet to report as a missing license. (number, required)
-  - `reason`: Reason the snippet needs human review. (string, required)
+- **Required Roles**: `user` (read-only)
+- `snippet_id`: Subject snippet; requires `package_id`, embargoed packages are refused. (number, optional)
+- `package_id`: Package the snippet belongs to. (number, optional)
+- `text`: Subject text, e.g. a draft pattern or a file excerpt. (string, optional)
+- `pattern_id`: Subject pattern; returns the most similar other patterns. (number, optional)
+- `report`: `inconsistent_risk` lists licenses whose patterns disagree on risk. (string, optional)
+- `license`, `risk`, `flag` (`patent`, `trademark`, `export_restricted`, `cla`, `eula`, `full_license_text`),
+  `catch_all`, `search` (pattern substring), `min_skip` (widest `$SKIPn` at least n): Filters. (optional)
+- `limit`: Maximum number of rows to return. Defaults to `20`, maximum `100`. (number, optional)
+- `offset`: Number of rows to skip for pagination. Defaults to `0`. (number, optional)
+
+#### cavil_test_pattern
+
+Dry-run a pattern: how many snippets and packages it would match, up to 5 samples with the words each `$SKIPn`
+swallowed, and the most similar existing patterns. Candidates are prefiltered by full-text search on the pattern's
+longest words (at most 1000 candidates). Occurrence and package counts stop at 10000 and 1000, and the whole dry run
+has a 10 second statement timeout, so it is safe on a production-sized database; a `+` marks a lower bound.
+
+- **Required Roles**: `user` (read-only)
+- `pattern`: Draft pattern text. (string, optional)
+- `pattern_id`: Existing pattern to test instead. (number, optional)
+- `package_id`: Restrict the dry run to one package. (number, optional)
+
+#### cavil_get_file
+
+Get content of a specific file in the package.
+
+- **Required Roles**: `user` (read-only)
+- `package_id`: ID of package to read file from. (number, required)
+- `file_path`: Path to file inside the package checkout. (string, required)
+- `start_line`: First line to read. Defaults to `1`. (number, optional)
+- `end_line`: Last line to read. Defaults to `100` and maximum range is 1000 lines. (number, optional)
+
+#### cavil_list_files
+
+List files in the package.
+
+- **Required Roles**: `user` (read-only)
+- `package_id`: ID of package to list files from. (number, required)
+- `file_glob`: Optional glob pattern used to filter listed files. Defaults to `*` (all files). (string, optional)
+
+#### cavil_create_note
+
+Create a public note for a specific package, marked as AI-assisted.
+
+- **Required Roles**: `user` (read-write)
+- `package_id`: ID of package to add a note to. (number, required)
+- `body`: Note body in Markdown format. (string, required)
+- `tags`: Array of tag strings, at most 32 characters each and 16 per note. (array of strings, optional)
+- `skip_if_existing_tag`: Skip the write if a note with this tag already applies to the report, making the call
+  idempotent. (string, optional)
+
+#### cavil_get_notes
+
+Get a paginated list of notes for a specific package, optionally filtered by tags. Notes a reviewer has pinned are
+marked `[pinned]`, sort first, and are always returned regardless of `relevant_only`. Notes marked `[limitation]` are
+limitations a lawyer set for every version of this package, they sort first as well.
+
+- **Required Roles**: `user` (read-only)
+- `package_id`: ID of package to list notes for. (number, required)
+- `tags`: Return only notes carrying all of the given tags. (array of strings, optional)
+- `relevant_only`: When `true`, return only notes that apply to this report. Defaults to `false`. (boolean, optional)
+- `limit`: Maximum number of notes to return. Defaults to `20`, maximum `100`. (number, optional)
+- `offset`: Number of notes to skip for pagination. Defaults to `0`. (number, optional)
+
+#### cavil_accept_review
+
+Accept a legal review for a specific package. Packages with limitations always need a human review and are refused.
+
+- **Required Roles**: `manager`, `lawyer` or `admin` (read-write)
+- **Also requires**: the API key was created with the "Allow accept/reject of reviews" option enabled.
+- `package_id`: ID of package to accept. (number, required)
+- `reason`: Reason for package acceptance. (string, optional)
+
+#### cavil_reject_review
+
+Reject a legal review for a specific package. Packages with limitations always need a human review and are refused.
+
+- **Required Roles**: `lawyer` or `admin` (read-write)
+- **Also requires**: the API key was created with the "Allow accept/reject of reviews" option enabled.
+- `package_id`: ID of package to reject. (number, required)
+- `reason`: Reason for package rejection. (string, required)
+
+#### cavil_propose_ignore_snippet
+
+Propose to ignore a specific snippet in the legal review.
+
+- **Required Roles**: `contributor`, `lawyer` or `admin` (read-write)
+- `package_id`: ID of package to ignore snippet for. (number, required)
+- `snippet_id`: ID of snippet to ignore. (number, required)
+- `reason`: Reason for snippet to be ignored. (string, required)
+
+#### cavil_propose_license_pattern
+
+Propose a license pattern. If the license already exists, the pattern is added to it and the proposal lands on the
+admin **Change Proposals** page, inheriting risk and flags from one of the license's existing risk levels. A license
+whose patterns all share one risk is inherited silently. Catch-alls like `Any Proprietary` usually span several levels,
+and guessing one could file restrictive terms at risk 1, so there the call fails with a list of the levels (pattern
+count and an example pattern each) and must be repeated with `risk` set to one of them. The success message echoes the
+license and risk that were filed. If the license is unknown, pass an integer `risk` to propose introducing it as a new
+license; that proposal lands on the lawyers' **Missing Licenses** page to ratify.
+
+- **Required Roles**: `contributor`, `lawyer` or `admin` (read-write)
+- `package_id`: ID of the package the snippet belongs to. (number, required)
+- `snippet_id`: ID of the snippet the pattern is derived from. (number, required)
+- `pattern`: License pattern text; must match the snippet. (string, required)
+- `license`: License expression or SPDX identifier. (string, required)
+- `reason`: Why this is the license (shown as the proposal's rationale). (string, required)
+- `risk`: For an existing license, one of its existing risk levels (0-9); required when it has more than one. For a new
+  (unknown) license, the researched risk level 1-9; required. (number, optional)
+- `patent`, `trademark`, `export_restricted`, `cla`, `eula`: Flags describing a new license. (boolean, optional)
+
+#### cavil_propose_ignore_glob
+
+Propose a file path glob to exclude whole files from scanning system-wide.
+
+- **Required Roles**: `contributor`, `lawyer` or `admin` (read-write)
+- `package_id`: ID of package the glob is proposed from; rejected unless it matches a reported file. (number, required)
+- `glob`: File path glob, e.g. `pkgname-*/testdata/*.log`. (string, required)
+- `reason`: Reason the matched files should be ignored. (string, required)
+
+#### cavil_report_missing_license
+
+Report a snippet as genuine license text that cannot be confidently patterned, so a lawyer can author the real
+pattern (it lands on the Missing Licenses review queue).
+
+- **Required Roles**: `contributor`, `lawyer` or `admin` (read-write)
+- `package_id`: ID of package the snippet belongs to. (number, required)
+- `snippet_id`: ID of snippet to report as a missing license. (number, required)
+- `reason`: Reason the snippet needs human review. (string, required)
 
 ### Agent Skills
 
@@ -174,28 +299,36 @@ running one is as simple as typing a short command at the agent prompt.
 
 #### What each bundled skill does
 
-- **[cavil-review-note](../examples/skills/cavil-review-note/)** — produces a short advisory note on a package review
+- **[cavil-review-note](../examples/skills/cavil-review-note/)** - produces a short advisory note on a package review
   and posts it to the Notes tab, tagged `review`. The note tells you the AI's recommendation
   (**ACCEPT** / **REJECT** / **NEEDS HUMAN REVIEW**), a few specific things to look at, and how confident the AI is.
-  **The skill never accepts or rejects the review itself** — that decision stays with you. Run it interactively on
+  **The skill never accepts or rejects the review itself** - that decision stays with you. Run it interactively on
   packages you're about to read, or kick it off against the whole backlog each morning so you arrive at your desk
   with a curated reading list. Most reviewers will want to learn this skill first.
 
-- **[cavil-review](../examples/skills/cavil-review/)** — walks you through a full review of one package end to end, and
+  When the report carries a **Legal Review Notices from Packagers** section, the skill treats it as claims to check
+  rather than as an answer, and the note tells you which ones it confirmed and which it could not. That matters
+  because such a notice is usually derived from package metadata (`cargo tree`, `package.json`), which cannot see the
+  license headers inside individual files - so an honest notice can still miss something the scan found.
+
+- **[cavil-review](../examples/skills/cavil-review/)** - walks you through a full review of one package end to end, and
   (only if you confirm) actually accepts or rejects it. Use this when you're sitting at your desk working on a single
   package interactively, not for unattended backlog runs.
 
-- **[cavil-refine](../examples/skills/cavil-refine/)** — complex skill that is not recommended to be used with models
+- **[cavil-refine](../examples/skills/cavil-refine/)** - complex skill that is not recommended to be used with models
   less capable than Claude Opus 4.8. Helps clean up the license database by proposing new license patterns, marking
   irrelevant snippets to be ignored, or proposing globs to exclude whole fixture/data files, so future reviews of
-  similar packages have fewer false positives. The proposals still need a human to approve them in the admin UI.
+  similar packages have fewer false positives. Licenses it can name but Cavil lacks are researched and proposed as new
+  licenses with a risk. Run `/cavil-refine reported` to sweep the backlog of *reported* missing licenses instead: the
+  confident cases land on the **Missing Licenses** page as one-click **Approve** cards, and anything it cannot identify
+  is left as a standing report for a human. The proposals still need a human to approve them in the admin UI.
 
-- **[cavil-license-research](../examples/skills/cavil-license-research/)** — researches a single license that Cavil does
-  not recognise yet — a license name, an unfamiliar SPDX identifier, or the license text behind an unresolved snippet —
+- **[cavil-license-research](../examples/skills/cavil-license-research/)** - researches a single license that Cavil does
+  not recognise yet - a license name, an unfamiliar SPDX identifier, or the license text behind an unresolved snippet -
   and writes an advisory assessment that recommends where it belongs on Cavil's risk scale, which flags it should carry,
   and what a lawyer should still check, all backed by cited sources. Use it before teaching Cavil a new license, for
   example when a **Missing Licenses** report names an identifier you don't know. **The skill never writes anything to
-  Cavil** — you still author the pattern and set the risk yourself. Because it only reads, this is the one bundled skill
+  Cavil** - you still author the pattern and set the risk yourself. Because it only reads, this is the one bundled skill
   that works with a **read-only** API key.
 
 #### Setting up a skill on your own laptop
@@ -203,13 +336,13 @@ running one is as simple as typing a short command at the agent prompt.
 You can do this end to end yourself. Three one-time steps:
 
 1. **Create a Cavil API key.** Log into the Cavil web UI, open your user menu, click **API Keys**, and create a
-   **read-write** key — three of the bundled skills write something back (notes, decisions, or pattern proposals), and a
+   **read-write** key - four of the bundled skills write something back (notes, decisions, or pattern proposals), and a
    read-write key also works for the read-only `cavil-license-research`, so one key covers them all. Copy the generated
    key somewhere safe and treat it like a password. Anything the AI does with this key shows up under your name in
    Cavil, so don't share it.
 
 2. **Install an AI agent that supports MCP.** Pick one from the [3rd Party MCP Clients](#3rd-party-mcp-clients) section
-   below. Claude Code is the easiest starting point for most reviewers — its install page at
+   below. Claude Code is the easiest starting point for most reviewers - its install page at
    <https://code.claude.com/docs/en/quickstart> walks you through it. After installing, follow the matching
    sub-section in this document to tell the agent how to talk to Cavil with your API key (a single `claude mcp add ...`
    command for Claude Code, similar one-liners for Gemini CLI, opencode, and goose).
@@ -223,17 +356,17 @@ You can do this end to end yourself. Three one-time steps:
    - **Claude Code**: copy each folder into `~/.claude/skills/` (on Windows: `%USERPROFILE%\.claude\skills\`). Create
      that folder first if it doesn't exist yet. The final paths should look like `~/.claude/skills/cavil-review-note/`.
    - **Gemini CLI**: same idea, but the folder is `~/.gemini/skills/`.
-   - **opencode / goose**: see those clients' own documentation for the skills-directory location — they evolve
+   - **opencode / goose**: see those clients' own documentation for the skills-directory location - they evolve
      faster than this doc; the rest of the workflow is identical.
 
 After those three steps, restart the agent. Every time you launch it from then on it picks the skill up automatically.
-You invoke it by typing `/cavil-review-note` (or `/cavil-review`, `/cavil-refine`, `/cavil-license-research`) followed by
-what you'd like reviewed.
+You invoke it by typing `/cavil-review-note` (or `/cavil-review`, `/cavil-refine`, `/cavil-license-research`)
+followed by what you'd like reviewed.
 
 **Troubleshooting.** If `/cavil-review-note` doesn't appear in the agent's auto-complete, the most common causes are
 (a) the folder name is wrong (it must match exactly, including the dash), (b) the folder is in the wrong place
 (`~/.claude/skills/cavil-review-note/SKILL.md` must exist), or (c) the agent was already running when you copied the
-files — restart it. If the skill runs but the agent says it can't see Cavil, the MCP setup from step 2 isn't active;
+files - restart it. If the skill runs but the agent says it can't see Cavil, the MCP setup from step 2 isn't active;
 re-run the `mcp add` command and double-check the API key was pasted correctly.
 
 #### Example uses for cavil-review-note
@@ -275,11 +408,11 @@ pattern, or you got a smarter model since the last note was written, and you wan
 This is the explicit "redo" override. Without that phrase the agent assumes the existing note still applies and skips.
 
 **What you'll see in the Notes tab.** Every note left by this skill is tagged `review` (the small grey chip in the
-note header) and marked **AI assisted** (the blue badge). Click any note for the full body. Notes are advisory only —
+note header) and marked **AI assisted** (the blue badge). Click any note for the full body. Notes are advisory only -
 nothing changes the package state until a human reviewer accepts or rejects it in the normal UI.
 
-If a note turns out to matter beyond the review it was written on — a standing decision about the package, a caveat
-for whoever picks up the next version — lawyers and admins can **pin** it with the thumbtack in the note header.
+If a note turns out to matter beyond the review it was written on - a standing decision about the package, a caveat
+for whoever picks up the next version - lawyers and admins can **pin** it with the thumbtack in the note header.
 Pinned notes are lifted out of the chronological list into a block at the top, stay there while you scroll, and keep
 full contrast on every review of that package name instead of receding behind "Not relevant to this report". Ten pins
 per package is the limit, so the block stays worth reading; unpin one to make room. Pins are visible to everyone the
@@ -305,8 +438,8 @@ the AI to propose pattern fixes that an admin can later approve:
 
 The proposals show up in the Cavil admin UI for review, just as if a contributor had submitted them.
 
-**cavil-license-research (assess an unfamiliar license).** When you hit a license Cavil doesn't know yet — say a
-**Missing Licenses** report names an SPDX identifier you're not sure how to rate — and you want a researched
+**cavil-license-research (assess an unfamiliar license).** When you hit a license Cavil doesn't know yet - say a
+**Missing Licenses** report names an SPDX identifier you're not sure how to rate - and you want a researched
 recommendation before you author the pattern:
 
 ```
@@ -320,12 +453,12 @@ You can also point it at the unresolved snippet that raised the question:
 ```
 
 The agent researches the license on the web, reads its actual text, and writes back an assessment with a recommended
-risk level and flags, the reasoning, and its sources. Nothing is written to Cavil — you take the recommendation into the
+risk level and flags, the reasoning, and its sources. Nothing is written to Cavil - you take the recommendation into the
 pattern editor and set the risk yourself.
 
 #### Finding a package id
 
-Skill examples often want a numeric package id. The id is the number in the report URL — for example, in
+Skill examples often want a numeric package id. The id is the number in the report URL - for example, in
 `https://legaldb.suse.de/reviews/details/472890` the id is `472890`. If you don't have a URL handy, you can also just
 pass the package name and the agent will use `cavil_get_open_reviews` to look it up; if more than one match comes
 back, it'll ask you to pick.
@@ -382,14 +515,21 @@ After restarting gemini-cli, it will automatically discover available Cavil tool
 
 #### claude
 
-Once you have installed and set up [Claude Code](https://code.claude.com/docs/en/quickstart), you can use the clause
+Once you have installed and set up [Claude Code](https://code.claude.com/docs/en/quickstart), you can use the claude
 mcp command to add Cavil:
+
+```
+claude mcp add --transport http cavil https://legaldb.suse.de/mcp
+```
+
+Then start claude, type `/mcp`, select **cavil** and choose **Authenticate**. Your browser opens the Cavil login, and
+after you click **Allow** claude will automatically discover available Cavil tools and make use of them on its own.
+
+If you prefer an API key, add it as a header instead:
 
 ```
 claude mcp add --transport http cavil https://legaldb.suse.de/mcp --header "Authorization: Bearer generated_api_key_here"
 ```
-
-After restarting claude, it will automatically discover available Cavil tools and make use of them on its own.
 
 #### opencode
 
@@ -521,6 +661,18 @@ should be approved for release to customers.
 
 ## REST API
 
+### Endpoint index
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | [`/api/v1/whoami`](#diagnostics) | Identify the API user |
+| `GET` | [`/api/v1/reports`](#locate-reports) | Locate reports by external link |
+| `GET` | [`/api/v1/search`](#search-packages) | Search packages and components |
+| `POST` | [`/api/v1/packages/upload`](#submit-a-package-for-review) | Submit a source archive for review |
+| `GET` | [`/api/v1/report/<package_id>.<format>`](#retrieve-license-reports) | Retrieve a legal report |
+| `GET` | [`/api/v1/documents/<package_id>/spdx`](#retrieve-spdx-reports) | Retrieve an SPDX document |
+| `GET` | [`/api/v1/documents/<package_id>/notice`](#retrieve-notice-files) | Retrieve a NOTICE file |
+
 ### Compression
 
 All responses larger than `860` bytes will be automatically `gzip` compressed for user-agents that include an
@@ -649,6 +801,80 @@ Content-Type: application/json
 }
 ```
 
+### Submit a Package for Review
+
+`POST /api/v1/packages/upload`
+
+Upload a source archive to start a standard legal review, the same pipeline the web upload form and the bot API
+use. This is the entry point for a command-line or CI legal check: package your working tree into an archive,
+upload it, then poll the report endpoint below. It requires a read-write key whose user holds the `upload_ephemeral`
+capability (the same access level as the web upload form); other keys receive a `403`. Unless the user also holds
+the `infra` capability, every submission is ephemeral (see below), whatever the `ephemeral` parameter says.
+
+The request is `multipart/form-data`.
+
+**Request parameters:**
+
+* `name` (required): Package name, used for the checkout directory and queue.
+
+* `priority` (required): Priority of this package review.
+
+* `tarball` (required): The source archive file (tar.*, zip, and the other formats the review pipeline unpacks). Its
+                        size is limited by the instance's `max_request_size` setting (250 MiB by default), which
+                        `GET /api/v1/whoami` reports in bytes as `max_upload_size`.
+
+* `checksum` (required): MD5 checksum of the archive, in lower-case hex. A mismatch is rejected with a `400`
+                         `Checksum mismatch`, so a truncated upload never starts a review over incomplete sources.
+
+* `external_link` (optional): Short string describing the source, for traceability (for example a repository URL
+                              and commit).
+
+* `ephemeral` (optional): Request a one-off report that leaves as little trace as possible. An ephemeral
+                          submission runs the exact same pipeline as a normal one (same license patterns,
+                          ignore rules, report formats and endpoints), but it never appears in the open
+                          review backlog, the recent reviews list, package or component search, or the
+                          snippet backlog, and it never influences the automatic review of normal packages.
+                          It runs at a lower priority than normal uploads, so a burst of them stays out of
+                          the way of day-to-day reviews. It is reachable only by the `id` returned below, via
+                          the report and document endpoints. Ephemeral reviews are fully purged (row,
+                          checkout and all derived data) a short, instance-configurable time after upload, so
+                          fetch the report and any documents you need promptly. The `saved` object below echoes
+                          `ephemeral`.
+
+**Request:**
+
+```
+POST /api/v1/packages/upload
+Host: legaldb.suse.de
+Authorization: Bearer generated_api_key_here
+Accept: application/json
+Content-Type: multipart/form-data; boundary=...
+
+...multipart body with name, priority, checksum, external_link and the tarball file...
+```
+
+**Response:**
+
+Uploading the same archive under the same name again is idempotent: the existing package is returned with
+`duplicate` set to `true`, and no second review is started. The `id` in `saved` is the package/review id used
+with the report and document endpoints below.
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "duplicate": false,
+  "saved": {
+    "id": 23,
+    "name": "my-project",
+    "state": "new",
+    "checkout_dir": "c1ffb4256878c64eb0e40c48f36d24d2",
+    "priority": 5
+  }
+}
+```
+
 ### Retrieve License Reports
 
 `GET /api/v1/report/<package_id>.<format>`
@@ -656,6 +882,13 @@ Content-Type: application/json
 Get legal report in plain text or JSON format. Additionally to `txt` and `json`, the extended report format used for
 MCP is available with the format identifier `mcp`. Note that the exact report format is not static and will change from
 time to time.
+
+While the package is still being unpacked, indexed or analyzed the endpoint returns `408`; poll until it returns
+`200`. For the JSON format the `408` body carries a `stage` field (`queued`, `unpacking`, `indexing`,
+`analyzing` or `finalizing`) so a client can show progress. Once ready, the JSON includes two top-level fields
+for gating a CI run without a second request: `risk`, the report's maximum license risk on the 1-9 scale (the
+same number the web report shows, forced to `9` when there are unresolved matches), and `acceptable_risk`, the
+instance's configured threshold at or below which a report is considered acceptable.
 
 **Request:**
 
@@ -697,9 +930,10 @@ Diff to closest match 12345:
 
 ### Retrieve SPDX Reports
 
-`GET /api/v1/spdx/<package_id>`
+`GET /api/v1/documents/<package_id>/spdx`
 
-Get the legal report as an SPDX 3.0.1 SBOM in JSON format, compliant with BSI TR-03183-2. Note that this report may be
+Get the legal report as an SPDX 3.0.1 SBOM in JSON format, following BSI TR-03183-2 (and, where the two do not
+conflict, the CISA minimum elements). Note that this report may be
 generated on demand, and in such cases the server will return a `408` error code until the report has been generated.
 These documents are meant to be saved rather than read in a browser, so the response carries
 `Content-Disposition: attachment; filename="<package_id>.spdx.json"`.
@@ -707,7 +941,7 @@ These documents are meant to be saved rather than read in a browser, so the resp
 **Request:**
 
 ```
-GET /api/v1/spdx/23
+GET /api/v1/documents/23/spdx
 Host: legaldb.suse.de
 Authorization: Bearer generated_api_key_here
 ```
@@ -730,11 +964,33 @@ Content-Type: application/json
       "createdUsing": ["http://legaldb.suse.de/spdx/23#tool-cavil"]
     },
     {
+      "type": "Tool",
+      "spdxId": "http://legaldb.suse.de/spdx/23#tool-cavil",
+      "creationInfo": "_:creationInfo",
+      "name": "Cavil",
+      "externalIdentifier": [
+        {
+          "type": "ExternalIdentifier",
+          "externalIdentifierType": "packageUrl",
+          "identifier": "pkg:generic/cavil@1.031"
+        }
+      ]
+    },
+    {
       "type": "software_Sbom",
       "spdxId": "http://legaldb.suse.de/spdx/23",
       "creationInfo": "_:creationInfo",
       "software_sbomType": ["source"],
-      "rootElement": ["http://legaldb.suse.de/spdx/23#package"]
+      "rootElement": ["http://legaldb.suse.de/spdx/23#package"],
+      "comment": "Unknown information is stated rather than omitted. ...",
+      "externalIdentifier": [
+        {
+          "type": "ExternalIdentifier",
+          "externalIdentifierType": "other",
+          "identifier": "1.3",
+          "comment": "SBOM version"
+        }
+      ]
     },
     {
       "type": "software_Package",
@@ -746,3 +1002,62 @@ Content-Type: application/json
   ]
 }
 ```
+
+### Retrieve NOTICE Files
+
+`GET /api/v1/documents/<package_id>/notice`
+
+Get the attribution document for the package: one section per license Cavil detected, listing the copyright notices
+harvested from the files that license was matched in, followed by its terms. Notices from files no license was matched
+in are kept in a final section rather than dropped. Like the SPDX report this may be generated on demand, and the
+server will return a `408` error code until it is ready. It is meant to be saved rather than read in a browser, so the
+response carries `Content-Disposition: attachment; filename="<package_id>.NOTICE.txt"`.
+
+Cavil cannot resolve terms for every license it detects, so the document opens with a completeness statement naming
+every license whose text is missing and why. Check it before shipping the file.
+
+**Request:**
+
+```
+GET /api/v1/documents/23/notice
+Host: legaldb.suse.de
+Authorization: Bearer generated_api_key_here
+```
+
+**Response:**
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/plain
+
+NOTICE for perl-Mojolicious 7.25
+Generated by Cavil 1.032 from source checkout c7cfdab0e71b0bebfdf8b2dc3badfecd.
+
+==============================================================================
+Completeness
+==============================================================================
+
+This document reproduces the license text Cavil holds for 2 of the 2 licenses detected in this package.
+
+==============================================================================
+Artistic-2.0
+==============================================================================
+
+Copyright (C) 2008-2017, Sebastian Riedel and others.
+Copyright (C) 2013 Google Inc.
+
+  The Artistic License 2.0
+
+  Copyright (c) 2000-2006, The Perl Foundation.
+  ...
+
+------------------------------------------------------------------------------
+Notices not attributable to a specific license
+------------------------------------------------------------------------------
+
+Copyright (c) 2017 SUSE LINUX GmbH, Nuernberg, Germany.
+```
+
+Every document Cavil derives from a package is available at `GET /api/v1/documents/<package_id>/<key>`; `spdx` and
+`notice` are the keys it currently builds, and an unknown key is a `404`. One request builds them all, so asking for
+either produces both.

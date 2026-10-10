@@ -2,8 +2,8 @@
   <div class="upload-page">
     <cavil-notice-panel tone="warning" title="Experimental feature" icon="fa-solid fa-flask">
       <p class="cavil-notice-summary">
-        Upload any archive supported by Cavil (tar.*, zip, rpm, 7z, …) for legal review. No metadata is required &mdash;
-        the package name is taken from the filename and licenses are detected automatically.
+        Upload any archive supported by Cavil (tar.*, zip, rpm, 7z, …) for legal review. No metadata is required, the
+        package name is taken from the filename and licenses are detected automatically.
       </p>
     </cavil-notice-panel>
 
@@ -54,6 +54,25 @@
           <option v-for="p in 8" :key="p" :value="String(p)">{{ p }}</option>
         </select>
       </div>
+    </div>
+
+    <div class="form-check mt-3">
+      <input
+        id="upload-ephemeral"
+        v-model="ephemeral"
+        name="ephemeral"
+        type="checkbox"
+        class="form-check-input"
+        :disabled="ephemeralOnly"
+      />
+      <label class="form-check-label" for="upload-ephemeral">
+        Ephemeral one-off review
+        <span class="form-text d-block">
+          Kept out of the review backlog and automatically deleted a short time after upload. Use for quick ad-hoc
+          checks.
+        </span>
+        <span v-if="ephemeralOnly" class="form-text d-block">Your account can only create ephemeral reviews.</span>
+      </label>
     </div>
 
     <div v-if="uploading || progress > 0" class="mt-3">
@@ -108,6 +127,7 @@ export default {
       file: null,
       name: '',
       priority: '5',
+      ephemeral: this.ephemeralOnly,
       isDragging: false,
       uploading: false,
       progress: 0,
@@ -158,6 +178,7 @@ export default {
       const form = new FormData();
       form.append('name', this.name.trim());
       form.append('priority', this.priority);
+      if (this.ephemeral) form.append('ephemeral', '1');
       form.append('tarball', this.file);
 
       const xhr = new XMLHttpRequest();
@@ -199,8 +220,8 @@ export default {
 }
 .upload-dropzone {
   align-items: center;
-  background: #f6f8fa;
-  border: 2px dashed #d0d7de;
+  background: var(--cavil-canvas-subtle);
+  border: 2px dashed var(--cavil-border);
   border-radius: 8px;
   cursor: pointer;
   display: flex;
@@ -215,35 +236,35 @@ export default {
 }
 .upload-dropzone:hover,
 .upload-dropzone:focus {
-  border-color: #0969da;
+  border-color: var(--cavil-accent);
   outline: none;
 }
 .upload-dropzone.is-dragging {
-  background: #ddf4ff;
-  border-color: #0969da;
+  background: var(--cavil-accent-bg);
+  border-color: var(--cavil-accent);
 }
 .upload-dropzone.has-file {
-  background: #ffffff;
+  background: var(--cavil-canvas);
   border-style: solid;
 }
 .upload-file-input {
   display: none;
 }
 .upload-dropzone-icon {
-  color: #6e7781;
+  color: var(--cavil-fg-subtle);
   font-size: 1.75rem;
 }
 .upload-dropzone-primary {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 15px;
   font-weight: 600;
   overflow-wrap: anywhere;
 }
 .upload-dropzone-link {
-  color: #0969da;
+  color: var(--cavil-accent);
 }
 .upload-dropzone-secondary {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 13px;
 }
 </style>

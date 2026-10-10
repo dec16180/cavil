@@ -1,11 +1,25 @@
 <template>
   <div class="report-notes">
-    <div v-if="showRelevanceFilter" class="report-notes-toolbar" data-notes-toolbar>
-      <label class="report-notes-relevance-toggle">
-        <input type="checkbox" v-model="relevantOnly" class="form-check-input" data-notes-relevant-only />
-        Only relevant notes
-      </label>
-      <span class="report-notes-relevance-hint">{{ relevant }} of {{ total }} relevant to this report</span>
+    <div v-if="showNoteFilter" class="report-notes-scope" :data-note-scope="noteScope" data-notes-filter>
+      Showing
+      <span
+        v-if="noteScope === 'history'"
+        class="report-notes-scope-caveat"
+        title="From reports with different licensing; may not apply to this report."
+        data-notes-history-hint
+        >previous</span
+      ><template v-else>relevant</template>
+      <span class="report-notes-scope-sep">·</span>
+      <button
+        type="button"
+        class="report-notes-scope-toggle"
+        :disabled="initialLoading"
+        data-notes-scope-toggle
+        @click="setNoteScope(noteScope === 'history' ? 'relevant' : 'history')"
+      >
+        show {{ noteScope === 'history' ? relevant : historyCount }}
+        {{ noteScope === 'history' ? 'relevant' : 'previous' }}
+      </button>
     </div>
     <div v-if="initialLoading" class="report-notes-loading">
       <LegalLoading message="Loading notes..." size="small" />
@@ -16,7 +30,7 @@
       </div>
       <div v-if="allNotes.length === 0 && !loadError" class="report-notes-empty">
         <i class="fa-regular fa-note-sticky"></i>
-        <p class="mb-0">{{ emptyMessage }}</p>
+        <p class="mb-0">{{ scopedEmptyMessage }}</p>
       </div>
       <ul v-else class="report-notes-list">
         <li
@@ -27,9 +41,9 @@
             'report-note',
             {
               'report-note-lawyer-only': c.lawyer_only,
+              'report-note-limitation': c.limitation,
               'report-note-pinned': c.pinned,
-              'report-note-pinned-last': c.pinned && i === pinnedNotes.length - 1,
-              'report-note-deemphasized': isNonRelevant(c)
+              'report-note-pinned-last': i === pinnedNotes.length - 1
             }
           ]"
           :data-note-id="c.id"
@@ -93,6 +107,14 @@
                 >
               </a>
               <span
+                v-if="c.limitation"
+                class="report-note-badge limitation-badge"
+                title="Future versions of this package always need a human review"
+                data-note-limitation-badge
+              >
+                <i class="fa-solid fa-triangle-exclamation"></i> Limitation
+              </span>
+              <span
                 v-if="c.pinned"
                 class="report-note-badge pinned-badge"
                 title="Pinned by a reviewer as standing context for every review of this package"
@@ -124,7 +146,7 @@
                 >{{ t }}</span
               >
               <button
-                v-if="allowActions && c.can_pin && editingId !== c.id"
+                v-if="allowActions && c.can_pin && !c.limitation && editingId !== c.id"
                 type="button"
                 :class="['report-note-pin', 'cavil-icon-action', {'is-pinned': c.pinned}]"
                 :disabled="pinningId === c.id"
@@ -174,9 +196,6 @@
           </div>
           <div v-else class="report-note-body-wrap">
             <div class="report-note-body markdown-body" v-html="c.body_html"></div>
-            <span v-if="isNonRelevant(c)" class="report-note-relevance-overlay" data-note-relevance-overlay>
-              <span class="report-note-relevance-label">Not relevant to this report</span>
-            </span>
           </div>
         </li>
       </ul>
@@ -191,7 +210,7 @@
         <span v-else>Scroll to load more</span>
       </div>
 
-      <div v-if="showComposer" class="report-note-form" data-note-form>
+      <div v-if="showComposer && noteScope !== 'history'" class="report-note-form" data-note-form>
         <label class="report-note-form-label">Add a note</label>
         <TagInput ref="newTagInput" v-model="tags" :suggestions="knownTags" data-key="new" />
         <MarkdownComposer
@@ -207,12 +226,38 @@
           <template #leading>
             <span class="report-note-composer-toggles">
               <label v-if="canPostLawyerOnly" class="report-note-composer-toggle">
-                <input type="checkbox" v-model="lawyerOnly" class="form-check-input" data-note-lawyer-only />
+                <input
+                  type="checkbox"
+                  v-model="lawyerOnly"
+                  :disabled="limitation"
+                  class="form-check-input"
+                  data-note-lawyer-only
+                />
                 Lawyers only
               </label>
               <label v-if="canPin" class="report-note-composer-toggle">
-                <input type="checkbox" v-model="pinned" class="form-check-input" data-note-pinned />
+                <input
+                  type="checkbox"
+                  v-model="pinned"
+                  :disabled="limitation"
+                  class="form-check-input"
+                  data-note-pinned
+                />
                 Pinned
+              </label>
+              <label
+                v-if="canLimitation"
+                class="report-note-composer-toggle"
+                title="Future versions of this package always need a human review"
+              >
+                <input
+                  type="checkbox"
+                  v-model="limitation"
+                  class="form-check-input"
+                  data-note-limitation
+                  @change="lawyerOnly = pinned = false"
+                />
+                Limitation
               </label>
             </span>
           </template>
@@ -242,7 +287,8 @@ export default {
     emptyMessage: {type: String, default: 'No notes yet. Leave the first one to help future reviewers.'},
     showPackageName: {type: Boolean, default: false},
     permalinkToOrigin: {type: Boolean, default: false},
-    filterTags: {type: Array, default: () => []}
+    filterTags: {type: Array, default: () => []},
+    limitationsOnly: {type: Boolean, default: false}
   },
   emits: ['counts-changed'],
   computed: {
@@ -259,19 +305,20 @@ export default {
     allNotes() {
       return [...this.pinnedNotes, ...this.notes];
     },
-    // Show the "Only relevant notes" toggle only when filtering would actually
-    // help: there must be both relevant notes to keep and non-relevant ones to
-    // hide. (De-emphasis itself is unconditional - any non-relevant note recedes
-    // whether or not relevant siblings exist.)
-    showRelevanceFilter() {
-      return (
-        this.pkgId !== null &&
-        !this.showPackageName &&
-        this.total !== null &&
-        this.relevant !== null &&
-        this.relevant > 0 &&
-        this.relevant < this.total
-      );
+    reportScoped() {
+      return this.pkgId !== null && !this.showPackageName;
+    },
+    historyCount() {
+      if (this.total === null || this.relevant === null) return 0;
+      return Math.max(0, this.total - this.relevant);
+    },
+    showNoteFilter() {
+      return this.reportScoped && this.total !== null && this.relevant !== null && this.historyCount > 0;
+    },
+    scopedEmptyMessage() {
+      if (this.noteScope === 'relevant' && this.showNoteFilter) return 'No notes are relevant to this report.';
+      if (this.noteScope === 'history') return 'No previous notes for this package.';
+      return this.emptyMessage;
     }
   },
   data() {
@@ -288,12 +335,14 @@ export default {
       pinningId: null,
       pinError: null,
       canPin: false,
+      canLimitation: false,
       draft: '',
       lawyerOnly: false,
       pinned: false,
+      limitation: false,
       tags: [],
       knownTags: [],
-      relevantOnly: false,
+      noteScope: this.pkgId !== null && !this.showPackageName ? 'relevant' : 'all',
       total: null,
       relevant: null,
       editingId: null,
@@ -307,7 +356,18 @@ export default {
   },
   async mounted() {
     await this.loadMore();
-    if (this.seekNoteId !== null) await this.seekToNote(this.seekNoteId);
+    if (this.seekNoteId !== null) {
+      const found = await this.seekToNote(this.seekNoteId);
+      if (!found && this.reportScoped && this.noteScope === 'relevant' && this.historyCount > 0) {
+        await this.setNoteScope('history');
+        await this.seekToNote(this.seekNoteId);
+      }
+    }
+
+    // Rendered, not merely fetched: counts-changed still fires while the list is a spinner, and
+    // anything scrolling to the notes needs their real height.
+    await this.$nextTick();
+    this.$emit('ready');
     this.setupObserver();
     // Tag autocomplete is only useful where the reviewer can author/edit notes.
     if (this.showComposer || this.allowActions) this.loadKnownTags();
@@ -324,7 +384,7 @@ export default {
     filterTags() {
       this.reloadFromTop();
     },
-    relevantOnly() {
+    limitationsOnly() {
       this.reloadFromTop();
     }
   },
@@ -370,25 +430,23 @@ export default {
     isRelevant(c) {
       return this.isCurrentReview(c) || c.same_report === true;
     },
-    // Inherited from a report with different licensing - de-emphasized in a
-    // mixed list so the relevant notes stand out by contrast. A pin is a
-    // reviewer saying the note applies whatever the report says, which
-    // outranks the automatic judgement.
-    isNonRelevant(c) {
-      return this.isFromOtherReport(c) && !this.isRelevant(c) && !c.pinned;
-    },
     isObsoleteOrigin(c) {
       return !!(c.original_package && c.original_package.obsolete);
     },
     originBadgeTitle(c) {
       if (c.same_report === true) {
-        return `Identical license report — this note applies to your report. ${this.originTitle(c)}`;
+        return `Identical license report, this note applies to your report. ${this.originTitle(c)}`;
       }
       const state = c.original_package && c.original_package.state;
       const stateText = state ? ` (report state: ${state})` : '';
       return `From a report with different licensing${stateText}. ${this.originTitle(c)}`;
     },
-    reloadFromTop() {
+    async setNoteScope(scope) {
+      if (scope === this.noteScope) return;
+      this.noteScope = scope;
+      await this.reloadFromTop();
+    },
+    async reloadFromTop() {
       if (this.observer) {
         this.observer.disconnect();
         this.observer = null;
@@ -397,9 +455,22 @@ export default {
       this.pinnedNotes = [];
       this.hasMore = false;
       this.initialLoading = true;
-      this.loadMore().then(() => this.setupObserver());
+      await this.loadMore();
+      if (this.noteScope === 'history' && this.historyCount === 0) {
+        this.noteScope = 'relevant';
+        this.notes = [];
+        this.pinnedNotes = [];
+        this.hasMore = false;
+        this.initialLoading = true;
+        await this.loadMore();
+      }
+      this.setupObserver();
     },
     setupObserver() {
+      if (this.observer) {
+        this.observer.disconnect();
+        this.observer = null;
+      }
       const target = this.$refs.sentinel;
       if (!target || typeof IntersectionObserver === 'undefined') return;
       this.observer = new IntersectionObserver(entries => {
@@ -418,7 +489,9 @@ export default {
         const qs = {limit: 20};
         if (this.notes.length > 0) qs.before_id = this.notes[this.notes.length - 1].id;
         if (this.filterTags.length) qs.tags_json = JSON.stringify(this.filterTags);
-        if (this.relevantOnly) qs.relevant_only = 1;
+        if (this.limitationsOnly) qs.limitation = 1;
+        if (this.noteScope === 'relevant') qs.relevant_only = 1;
+        if (this.noteScope === 'history') qs.history_only = 1;
         const res = await this.ua.get(this.listEndpoint, {query: qs});
         if (!res.isSuccess) {
           this.loadError = `Failed to load notes (HTTP ${res.statusCode})`;
@@ -429,6 +502,7 @@ export default {
         // Only the first page carries the pinned block.
         if (Array.isArray(data.pinned)) this.pinnedNotes = data.pinned;
         if (data.can_pin !== undefined) this.canPin = !!data.can_pin;
+        if (data.can_limitation !== undefined) this.canLimitation = !!data.can_limitation;
         this.hasMore = !!data.has_more;
         if (data.total !== undefined) this.total = data.total;
         if (data.relevant !== undefined) this.relevant = data.relevant;
@@ -450,7 +524,12 @@ export default {
       this.submitting = true;
       this.submitError = null;
       try {
-        const form = {body, lawyer_only: this.lawyerOnly ? '1' : '0', pinned: this.pinned ? '1' : '0'};
+        const form = {
+          body,
+          lawyer_only: this.lawyerOnly ? '1' : '0',
+          pinned: this.pinned ? '1' : '0',
+          limitation: this.limitation ? '1' : '0'
+        };
         if (this.tags.length) form.tags_json = JSON.stringify(this.tags);
         const res = await this.ua.post(`/reviews/notes/${this.pkgId}`, {form});
         if (!res.isSuccess) {
@@ -467,11 +546,16 @@ export default {
         const data = await res.json();
         // A pinned note belongs in the block above the scroll, not at the head
         // of the stream, so let the server place it.
-        if (data.note.pinned) this.pinnedNotes.unshift(data.note);
+        if (data.note.limitation) this.pinnedNotes.unshift(data.note);
+        else if (data.note.pinned)
+          this.pinnedNotes.splice(this.pinnedNotes.filter(n => n.limitation).length, 0, data.note);
         else this.notes.unshift(data.note);
+        if (this.total !== null) this.total += 1;
+        if (this.relevant !== null) this.relevant += 1;
         this.draft = '';
         this.lawyerOnly = false;
         this.pinned = false;
+        this.limitation = false;
         this.tags = [];
         // Re-fetch counts via a HEAD-like call would be cheap; piggyback on
         // the next page request instead: refresh counts by re-counting locally
@@ -494,10 +578,11 @@ export default {
       }
       await this.$nextTick();
       const el = document.getElementById(`note-${targetId}`);
-      if (!el) return;
+      if (!el) return false;
       el.scrollIntoView({behavior: 'smooth', block: 'center'});
       el.classList.add('report-note-highlight');
       setTimeout(() => el.classList.remove('report-note-highlight'), 2000);
+      return true;
     },
     startEdit(c) {
       this.editingId = c.id;
@@ -576,7 +661,7 @@ export default {
         // The note moves between the pinned block and the keyset stream, and
         // the two are paginated independently. Splicing it across by hand
         // risks it reappearing on the next scroll page, so reload from the top.
-        this.reloadFromTop();
+        await this.reloadFromTop();
       } catch (err) {
         this.pinError = err.message || 'Failed to pin note';
       } finally {
@@ -585,7 +670,10 @@ export default {
     },
     async deleteNote(c) {
       // eslint-disable-next-line no-alert
-      if (!window.confirm('Delete this note?')) return;
+      const question = c.limitation
+        ? `Remove this limitation? Future versions of ${c.package_name} can be accepted automatically again.`
+        : 'Delete this note?';
+      if (!window.confirm(question)) return;
       this.deletingId = c.id;
       try {
         const res = await this.ua.delete(`/reviews/notes/${c.id}`);
@@ -593,6 +681,14 @@ export default {
         for (const list of [this.notes, this.pinnedNotes]) {
           const idx = list.findIndex(x => x.id === c.id);
           if (idx >= 0) list.splice(idx, 1);
+        }
+        if (this.total !== null) this.total = Math.max(0, this.total - 1);
+        if (this.relevant !== null && (c.pinned || c.limitation || this.isRelevant(c))) {
+          this.relevant = Math.max(0, this.relevant - 1);
+        }
+        if (this.noteScope === 'history' && this.historyCount === 0) {
+          await this.reloadFromTop();
+          return;
         }
         this.$emit('counts-changed', {bump: -1, lawyer_only_bump: c.lawyer_only ? -1 : 0});
       } finally {
@@ -610,9 +706,9 @@ export default {
 .report-notes-loading,
 .report-notes-empty {
   align-items: center;
-  border: 1px dashed #d0d7de;
+  border: 1px dashed var(--cavil-border);
   border-radius: 8px;
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -622,15 +718,15 @@ export default {
   text-align: center;
 }
 .report-notes-empty i {
-  color: #afb8c1;
+  color: var(--cavil-border-strong);
   font-size: 28px;
 }
 .report-notes-error {
   align-items: center;
-  background: #ffebe9;
-  border: 1px solid #ff818266;
+  background: var(--cavil-danger-bg);
+  border: 1px solid var(--cavil-danger-edge);
   border-radius: 6px;
-  color: #82071e;
+  color: var(--cavil-danger-2);
   display: flex;
   gap: 8px;
   margin: 12px 0;
@@ -638,9 +734,9 @@ export default {
 }
 .report-note-retry {
   background: transparent;
-  border: 1px solid #cf222e;
+  border: 1px solid var(--cavil-danger);
   border-radius: 6px;
-  color: #cf222e;
+  color: var(--cavil-danger);
   cursor: pointer;
   margin-left: auto;
   padding: 2px 10px;
@@ -651,95 +747,55 @@ export default {
   padding: 0;
 }
 .report-note {
-  background: #ffffff;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas);
+  border: 1px solid var(--cavil-border);
   border-radius: 8px;
   margin-bottom: 16px;
   overflow: hidden;
   position: relative;
 }
-/* Notes inherited from a report with different licensing keep their provenance
-  readable, while the body recedes behind a frosted-glass relevance marker. */
-.report-note-deemphasized .report-note-body {
-  filter: blur(7px);
-  opacity: 0.38;
-  transition:
-    filter 0.15s ease,
-    opacity 0.15s ease;
-}
 .report-note-body-wrap {
   position: relative;
 }
-.report-note-relevance-overlay {
-  align-items: center;
-  backdrop-filter: blur(2px);
-  background: rgba(255, 255, 255, 0.68);
-  color: #6e7781;
-  display: flex;
-  font-size: 11px;
-  font-weight: 600;
-  inset: 0;
-  justify-content: center;
-  letter-spacing: 0;
-  opacity: 1;
-  padding: 16px;
-  pointer-events: none;
-  position: absolute;
-  text-align: center;
-  transition:
-    opacity 0.15s ease,
-    visibility 0.15s ease;
-  visibility: visible;
-  z-index: 1;
-}
-.report-note-relevance-label {
-  background: rgba(246, 248, 250, 0.88);
-  border: 1px solid rgba(110, 119, 129, 0.22);
-  border-radius: 2em;
-  box-shadow: 0 1px 2px rgba(31, 35, 40, 0.04);
-  padding: 2px 10px;
-}
-.report-note-deemphasized:hover .report-note-relevance-overlay,
-.report-note-deemphasized:focus-within .report-note-relevance-overlay {
-  opacity: 0;
-  visibility: hidden;
-}
-.report-note-deemphasized:hover .report-note-body,
-.report-note-deemphasized:focus-within .report-note-body {
-  filter: none;
-  opacity: 1;
-}
 .report-note-lawyer-only {
-  border-left: 4px solid #bf8700;
-  background: linear-gradient(180deg, rgba(255, 244, 207, 0.45) 0%, #ffffff 60px);
+  border-left: 4px solid var(--cavil-attention-strong);
+  background: linear-gradient(180deg, rgba(var(--cavil-attention-tint-rgb), 0.45) 0%, var(--cavil-canvas) 60px);
 }
 /* Pinned notes keep the normal card shape - the left-border accent belongs to
    lawyer-only, and the two flags combine on one card. A firmer border plus the
    badge is enough to read as "held above the list". */
 .report-note-pinned {
-  border-color: #8c959f;
+  border-color: var(--cavil-fg-disabled);
 }
 .report-note-pinned-last {
   margin-bottom: 28px;
 }
 .report-note-header {
   align-items: center;
-  background: #f6f8fa;
-  border-bottom: 1px solid #d0d7de;
+  background: var(--cavil-canvas-subtle);
+  border-bottom: 1px solid var(--cavil-border);
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
   padding: 10px 14px;
 }
+.report-note-limitation {
+  border-left: 4px solid var(--cavil-danger);
+  background: linear-gradient(180deg, rgba(var(--cavil-danger-rgb), 0.12) 0%, var(--cavil-canvas) 60px);
+}
+.report-note-limitation .report-note-header {
+  background: var(--cavil-danger-tint-1);
+  border-bottom-color: var(--cavil-danger-border);
+}
 .report-note-lawyer-only .report-note-header {
-  background: #fff8e1;
-  border-bottom-color: #e9c46a;
+  background: var(--cavil-attention-tint-1);
+  border-bottom-color: var(--cavil-attention-2);
 }
 .report-note-avatar {
   align-items: center;
-  background: #0969da;
+  background: var(--cavil-accent-emphasis);
   border-radius: 50%;
-  color: #ffffff;
+  color: var(--cavil-on-accent);
   display: inline-flex;
   font-size: 13px;
   font-weight: 600;
@@ -748,13 +804,13 @@ export default {
   width: 28px;
 }
 .report-note-byline {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   flex: 1 1 auto;
   font-size: 13px;
   min-width: 0;
 }
 .report-note-author {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-weight: 600;
 }
 .report-note-role {
@@ -770,42 +826,42 @@ export default {
   white-space: nowrap;
 }
 .report-note-role-lawyer {
-  background: #fff8c5;
-  border-color: #d4a72c66;
-  color: #7d4e00;
+  background: var(--cavil-attention-bg);
+  border-color: var(--cavil-attention-border);
+  color: var(--cavil-attention-deep);
 }
 .report-note-role-admin {
-  background: #ddf4ff;
-  border-color: #54aeff66;
-  color: #0550ae;
+  background: var(--cavil-accent-bg);
+  border-color: var(--cavil-accent-vivid-fade);
+  color: var(--cavil-accent-strong);
 }
 .report-note-role-user {
-  background: #eaeef2;
-  border-color: rgba(110, 119, 129, 0.25);
-  color: #57606a;
+  background: var(--cavil-neutral-bg);
+  border-color: rgba(var(--cavil-neutral-alt-rgb), 0.25);
+  color: var(--cavil-fg-muted);
 }
 .report-note-date {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
 }
 .report-note-permalink {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   text-decoration: none;
 }
 .report-note-permalink:hover {
-  color: #0969da;
+  color: var(--cavil-accent);
   text-decoration: underline;
 }
 .report-note-package-link {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-weight: 600;
   text-decoration: none;
 }
 .report-note-package-link:hover {
-  color: #0969da;
+  color: var(--cavil-accent);
   text-decoration: underline;
 }
 .report-note-package-name {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-weight: 600;
 }
 .report-note-highlight {
@@ -813,10 +869,10 @@ export default {
 }
 @keyframes report-note-flash {
   0% {
-    box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.45);
+    box-shadow: 0 0 0 3px rgba(var(--cavil-accent-rgb), 0.45);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(9, 105, 218, 0);
+    box-shadow: 0 0 0 0 rgba(var(--cavil-accent-rgb), 0);
   }
 }
 .report-note-badges {
@@ -837,93 +893,117 @@ export default {
   white-space: nowrap;
 }
 .report-note-badge.lawyer-only-badge {
-  background: #fff8c5;
-  border-color: #d4a72c66;
-  color: #7d4e00;
+  background: var(--cavil-attention-bg);
+  border-color: var(--cavil-attention-border);
+  color: var(--cavil-attention-deep);
   text-transform: none;
 }
 .report-note-badge.ai-assisted-badge {
-  background: #ddf4ff;
-  border-color: #54aeff66;
-  color: #0550ae;
+  background: var(--cavil-accent-bg);
+  border-color: var(--cavil-accent-vivid-fade);
+  color: var(--cavil-accent-strong);
+  text-transform: none;
+}
+.report-note-badge.limitation-badge {
+  background: var(--cavil-canvas);
+  border-color: var(--cavil-danger-border);
+  color: var(--cavil-danger);
   text-transform: none;
 }
 .report-note-badge.pinned-badge {
-  background: #eaeef2;
-  border-color: rgba(110, 119, 129, 0.35);
-  color: #424a53;
+  background: var(--cavil-neutral-bg);
+  border-color: rgba(var(--cavil-neutral-alt-rgb), 0.35);
+  color: var(--cavil-fg-muted-strong);
   text-transform: none;
 }
-/* Origin badge: a neutral provenance link. Relevance is conveyed by the row
-   (relevant = full contrast, non-relevant = de-emphasized), not the badge. */
+/* Origin badge: a neutral provenance link within the explicitly scoped view. */
 .report-note-badge.origin-report-badge {
-  background: #eaeef2;
-  border-color: rgba(110, 119, 129, 0.25);
-  color: #57606a;
+  background: var(--cavil-neutral-bg);
+  border-color: rgba(var(--cavil-neutral-alt-rgb), 0.25);
+  color: var(--cavil-fg-muted);
   text-decoration: none;
   text-transform: none;
 }
 .report-note-badge.origin-report-badge:hover {
-  background: #dde3ea;
+  background: var(--cavil-edge-2);
   text-decoration: none;
 }
 .report-note-origin-state {
-  color: #8c959f;
+  color: var(--cavil-fg-disabled);
   font-style: italic;
 }
-.report-notes-toolbar {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-.report-notes-relevance-toggle {
-  align-items: center;
-  color: #1f2328;
-  display: inline-flex;
-  font-size: 13px;
-  gap: 6px;
-  margin: 0;
-}
-.report-notes-relevance-toggle .form-check-input {
-  margin: 0;
-}
-.report-notes-relevance-hint {
-  color: #57606a;
+.report-notes-scope {
+  color: var(--cavil-fg-muted);
   font-size: 12px;
+  margin-bottom: 16px;
+  text-align: right;
+}
+.report-notes-scope-caveat {
+  cursor: help;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+.report-notes-scope-sep {
+  color: var(--cavil-fg-disabled);
+  margin: 0 2px;
+}
+.report-notes-scope-toggle {
+  background: none;
+  border: none;
+  color: var(--cavil-accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+.report-notes-scope-toggle:hover:not(:disabled) {
+  text-decoration: underline;
+}
+.report-notes-scope-toggle:disabled {
+  color: var(--cavil-fg-disabled);
+  cursor: default;
 }
 /* Tag chip + editor styles live in TagInput.vue (imported here), which is the
    canonical home of the tag widget and supplies these .report-note-tag* rules. */
 .report-note-pin.is-pinned {
-  color: #424a53;
+  color: var(--cavil-fg-muted-strong);
 }
 .report-note-pin:hover:not(:disabled) {
-  color: #0550ae;
+  color: var(--cavil-accent-strong);
 }
 .report-note-edit:hover:not(:disabled) {
-  color: #0550ae;
+  color: var(--cavil-accent-strong);
 }
 .report-note-delete:hover:not(:disabled) {
-  color: #cf222e;
+  color: var(--cavil-danger);
 }
 .report-note-edited {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 12px;
   margin-left: 6px;
 }
 .report-note-separator {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   margin: 0 4px;
 }
 .report-note-edit-pane {
   padding: 12px 16px;
 }
 .report-note-body {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 14px;
   line-height: 1.5;
   padding: 14px 16px;
+}
+/* Note bodies are arbitrary markdown (AI-assisted notes have emitted `##`); without this,
+   headings render at Bootstrap defaults and tower over the note column. Keep them near body size. */
+.report-note-body :is(h1, h2, h3, h4, h5, h6) {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  margin: 16px 0 8px;
+}
+.report-note-body :is(h1, h2, h3, h4, h5, h6):first-child {
+  margin-top: 0;
 }
 .report-note-body p {
   margin-bottom: 12px;
@@ -940,14 +1020,14 @@ export default {
   margin-top: 4px;
 }
 .report-note-body pre {
-  background: #f6f8fa;
+  background: var(--cavil-canvas-subtle);
   border-radius: 6px;
   font-size: 12px;
   overflow: auto;
   padding: 12px;
 }
 .report-note-body code {
-  background: rgba(175, 184, 193, 0.2);
+  background: rgba(var(--cavil-neutral-cool-rgb), 0.2);
   border-radius: 4px;
   font-size: 85%;
   padding: 0.2em 0.4em;
@@ -957,13 +1037,13 @@ export default {
   padding: 0;
 }
 .report-note-body blockquote {
-  border-left: 3px solid #d0d7de;
-  color: #57606a;
+  border-left: 3px solid var(--cavil-border);
+  color: var(--cavil-fg-muted);
   margin: 0 0 12px;
   padding-left: 12px;
 }
 .report-notes-sentinel {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 13px;
   padding: 12px 0;
   text-align: center;
@@ -972,7 +1052,7 @@ export default {
   margin-top: 24px;
 }
 .report-note-form-label {
-  color: #1f2328;
+  color: var(--cavil-fg);
   display: block;
   font-size: 13px;
   font-weight: 600;
@@ -986,7 +1066,7 @@ export default {
 }
 .report-note-composer-toggle {
   align-items: center;
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   display: inline-flex;
   font-size: 13px;
   gap: 6px;

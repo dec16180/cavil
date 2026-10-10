@@ -171,67 +171,15 @@
                       <option>4</option>
                       <option>5</option>
                       <option>6</option>
+                      <option>7</option>
+                      <option>8</option>
                       <option>9</option>
                     </select>
                   </div>
                   <div class="snippet-editor-attribute snippet-editor-attribute-flags">
                     <label class="form-label">Flags</label>
                     <div class="snippet-editor-attribute-flag-list">
-                      <div class="form-check">
-                        <input
-                          v-model="licenseOptions.patent"
-                          type="checkbox"
-                          class="form-check-input"
-                          id="patent"
-                          name="patent"
-                          value="1"
-                        />
-                        <label class="form-check-label" for="patent">Patent</label>
-                      </div>
-                      <div class="form-check">
-                        <input
-                          v-model="licenseOptions.trademark"
-                          type="checkbox"
-                          class="form-check-input"
-                          id="trademark"
-                          name="trademark"
-                          value="1"
-                        />
-                        <label class="form-check-label" for="trademark">Trademark</label>
-                      </div>
-                      <div class="form-check">
-                        <input
-                          v-model="licenseOptions.cla"
-                          type="checkbox"
-                          class="form-check-input"
-                          id="cla"
-                          name="cla"
-                          value="1"
-                        />
-                        <label class="form-check-label" for="cla">CLA</label>
-                      </div>
-                      <div class="form-check">
-                        <input
-                          v-model="licenseOptions.eula"
-                          type="checkbox"
-                          class="form-check-input"
-                          id="eula"
-                          name="eula"
-                          value="1"
-                        />
-                        <label class="form-check-label" for="eula">EULA</label>
-                      </div>
-                      <div class="form-check">
-                        <input
-                          v-model="licenseOptions.export_restricted"
-                          type="checkbox"
-                          class="form-check-input"
-                          id="export_restricted"
-                          name="export_restricted"
-                          value="1"
-                        />
-                        <label class="form-check-label" for="export_restricted">Export Restricted</label>
-                      </div>
+                      <PatternFlags v-model="licenseOptions" />
                     </div>
                   </div>
                 </div>
@@ -304,6 +252,8 @@
 <script>
 import ClosestPattern from './ClosestPattern.vue';
 import LegalLoading from './LegalLoading.vue';
+import PatternFlags, {LICENSE_FLAGS, PATTERN_FLAGS} from './PatternFlags.vue';
+import {rankLicenses} from '../helpers/licenseAutocomplete.js';
 import {fileViewUrl, setupPopoverDelayed} from '../helpers/links.js';
 import {renderPatternTooltip, showPatternTooltip} from '../helpers/patternTooltip.js';
 import {EditorState, StateEffect, StateField} from '@codemirror/state';
@@ -314,9 +264,10 @@ const setDecoLinesEffect = StateEffect.define();
 
 export default {
   name: 'SnippetEditor',
-  components: {ClosestPattern, LegalLoading},
+  components: {ClosestPattern, LegalLoading, PatternFlags},
   props: {
     snippetId: {type: Number, required: true},
+    fileId: {type: Number, default: null},
     hash: {type: String, default: null},
     from: {type: String, default: null},
     hasContributorRole: {type: Boolean, default: false},
@@ -339,14 +290,7 @@ export default {
       license: '',
       licenseFocused: false,
       licenses: {},
-      licenseOptions: {
-        cla: false,
-        eula: false,
-        export_restricted: false,
-        patent: false,
-        risk: 1,
-        trademark: false
-      },
+      licenseOptions: {risk: 1, ...Object.fromEntries(PATTERN_FLAGS.map(flag => [flag.name, false]))},
       matches: {},
       originalDecorations: null,
       originalSnippetText: null,
@@ -357,7 +301,7 @@ export default {
       smartEditBusy: false,
       riskHtml:
         '<b>Low risk licenses</b><br>' +
-        '<b>1:</b> Public-Domain<br>' +
+        '<b>1:</b> Public Domain<br>' +
         '<b>2:</b> BSD-2-Clause, MIT<br>' +
         '<b>3:</b> LGPL-2.0-only, LGPL-2.1-or-later<br>' +
         '<b>4:</b> GPL-2.0-only, GPL-3.0-or-later<br>' +
@@ -368,7 +312,6 @@ export default {
         '<b>7:</b> Non-Commercial<br>' +
         '<b>Unknown risk (reserved)</b><br>' +
         '<b>9:</b> Keyword patterns',
-      snippetUrl: `/snippet/meta/${this.snippetId}`,
       startLine: null,
       suggestions: [],
       ua: new UserAgent({baseURL: window.location.href})
@@ -437,58 +380,44 @@ export default {
       return labels[action];
     },
     autocomplete() {
-      const license = this.license;
-      if (license === '') {
-        this.results = this.suggestions;
-        return;
-      }
-      const words = license.split(' ').filter(w => w.length > 0);
-      let results = this.suggestions;
-      for (const word of words) {
-        results = results.filter(name => name.toLowerCase().includes(word.toLowerCase()));
-      }
-      const q = license.toLowerCase();
-      results = [...results].sort((a, b) => {
-        const al = a.toLowerCase();
-        const bl = b.toLowerCase();
-        // 1. Exact match wins
-        const aExact = al === q;
-        const bExact = bl === q;
-        if (aExact !== bExact) return aExact ? -1 : 1;
-        // 2. Prefix match beats substring match
-        const aStarts = al.startsWith(q);
-        const bStarts = bl.startsWith(q);
-        if (aStarts !== bStarts) return aStarts ? -1 : 1;
-        // 3. Earlier position of the query beats later
-        const aIdx = al.indexOf(q);
-        const bIdx = bl.indexOf(q);
-        if (aIdx !== bIdx) return aIdx - bIdx;
-        // 4. Shorter names beat longer ones (less surrounding noise)
-        if (a.length !== b.length) return a.length - b.length;
-        // 5. Stable alphabetical fallback
-        return a.localeCompare(b);
-      });
-      this.results = results;
+      this.results = rankLicenses(this.suggestions, this.license);
     },
     fillLicense(result) {
       if (this.$refs.license) this.$refs.license.blur();
       this.license = result;
-      if (this.licenses[result] !== undefined) this.licenseOptions = this.licenses[result];
+      // Copied, not aliased: the autocomplete cache is shared. And only the license's own properties -
+      // full_license_text is about this pattern's text.
+      const options = this.licenses[result];
+      if (options !== undefined) {
+        this.licenseOptions = {
+          ...this.licenseOptions,
+          risk: options.risk,
+          ...Object.fromEntries(LICENSE_FLAGS.map(flag => [flag.name, !!options[flag.name]]))
+        };
+      }
       this.results = this.suggestions;
       this.licenseFocused = false;
     },
     onClosestLoaded(closest) {
       this.closest = closest;
     },
+    // Build a /snippet/... URL, carrying the occurrence's file id so the server scopes a
+    // content-hash-deduped snippet to the file the reviewer is on (not an arbitrary occurrence).
+    snippetUrl(path, extra = {}) {
+      const params = new URLSearchParams(extra);
+      if (this.fileId !== null) params.set('file', this.fileId);
+      const qs = params.toString();
+      return qs === '' ? path : `${path}?${qs}`;
+    },
     async getSnippet() {
-      const res = await this.ua.get(this.snippetUrl);
+      const res = await this.ua.get(this.snippetUrl(`/snippet/meta/${this.snippetId}`));
       const data = await res.json();
 
       const snippet = data.snippet;
       this.package = snippet.package;
       if (this.package !== null) {
         this.package.packageUrl = `/reviews/details/${this.package.id}`;
-        this.package.fileUrl = fileViewUrl(this.package.id, this.package.filename);
+        this.package.fileUrl = fileViewUrl(this.package.id, this.package.filename, snippet.sline);
         this.package.file = this.package.filename.split('/').pop();
       }
       this.patternText = snippet.text;
@@ -510,11 +439,9 @@ export default {
       if (initial.pattern !== undefined) this.patternText = initial.pattern;
       if (initial.license !== undefined) this.license = initial.license;
       if (initial.risk !== undefined) this.licenseOptions.risk = Number(initial.risk);
-      this.licenseOptions.patent = initial.patent === '1' || initial.patent === true;
-      this.licenseOptions.trademark = initial.trademark === '1' || initial.trademark === true;
-      this.licenseOptions.export_restricted = initial.export_restricted === '1' || initial.export_restricted === true;
-      this.licenseOptions.cla = initial.cla === '1' || initial.cla === true;
-      this.licenseOptions.eula = initial.eula === '1' || initial.eula === true;
+      for (const flag of PATTERN_FLAGS) {
+        this.licenseOptions[flag.name] = initial[flag.name] == 1;
+      }
       if (initial.edited !== undefined) this.edited = String(initial.edited);
       if (initial['highlighted-keywords'] !== undefined) {
         this.highlightedKeywords = initial['highlighted-keywords'];
@@ -697,12 +624,14 @@ export default {
       }
     },
     async smartEdit() {
-      return this.applyServerEdit(`/snippet/smart_edit/${this.snippetId}`, data =>
+      return this.applyServerEdit(this.snippetUrl(`/snippet/smart_edit/${this.snippetId}`), data =>
         this.shiftedDecorations(data.start_line)
       );
     },
     async spdxEdit() {
-      return this.applyServerEdit(`/snippet/smart_edit/${this.snippetId}?mode=spdx`, () => this.emptyDecorations());
+      return this.applyServerEdit(this.snippetUrl(`/snippet/smart_edit/${this.snippetId}`, {mode: 'spdx'}), () =>
+        this.emptyDecorations()
+      );
     },
     restoreOriginal() {
       this.editor.dispatch({
@@ -774,11 +703,7 @@ export default {
         'highlighted-keywords': this.highlightedKeywords,
         'highlighted-licenses': this.highlightedLicenses
       };
-      if (this.licenseOptions.patent) formData.patent = '1';
-      if (this.licenseOptions.trademark) formData.trademark = '1';
-      if (this.licenseOptions.export_restricted) formData.export_restricted = '1';
-      if (this.licenseOptions.cla) formData.cla = '1';
-      if (this.licenseOptions.eula) formData.eula = '1';
+      for (const flag of PATTERN_FLAGS) if (this.licenseOptions[flag.name]) formData[flag.name] = '1';
       if (this.hash !== null) formData.hash = this.hash;
       if (this.from !== null) formData.from = this.from;
       if (this.package !== null) formData.package = this.package.id;
@@ -790,7 +715,7 @@ export default {
 
 <style>
 .snippet-editor .snippet-editor-host {
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
   overflow: hidden;
   position: relative;
@@ -805,11 +730,11 @@ export default {
 }
 .snippet-editor .snippet-editor-tool-btn {
   align-items: center;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid #d0d7de;
+  background: var(--cavil-surface-raised);
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
-  box-shadow: 0 1px 2px rgba(31, 35, 40, 0.08);
-  color: #1f2328;
+  box-shadow: 0 1px 2px rgba(var(--cavil-shadow-alt-rgb), 0.08);
+  color: var(--cavil-fg);
   cursor: pointer;
   display: inline-flex;
   font-size: 13px;
@@ -823,14 +748,14 @@ export default {
   width: 28px;
 }
 .snippet-editor .snippet-editor-tool-btn:hover:not(:disabled) {
-  background: #ffffff;
-  box-shadow: 0 2px 4px rgba(31, 35, 40, 0.12);
-  color: #0969da;
+  background: var(--cavil-canvas);
+  box-shadow: 0 2px 4px rgba(var(--cavil-shadow-alt-rgb), 0.12);
+  color: var(--cavil-accent);
 }
 .snippet-editor .snippet-editor-tool-btn:focus {
-  border-color: #0969da;
-  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.3);
-  color: #0969da;
+  border-color: var(--cavil-accent);
+  box-shadow: 0 0 0 3px rgba(var(--cavil-accent-rgb), 0.3);
+  color: var(--cavil-accent);
   outline: none;
 }
 .snippet-editor .snippet-editor-tool-btn:disabled {
@@ -858,7 +783,7 @@ export default {
 }
 .snippet-editor-hints {
   align-items: center;
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   column-gap: 16px;
   display: flex;
   flex-wrap: wrap;
@@ -867,7 +792,7 @@ export default {
   row-gap: 4px;
 }
 .snippet-editor .form-text {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 12px;
   margin-top: 6px;
 }
@@ -878,14 +803,14 @@ export default {
   white-space: nowrap;
 }
 .snippet-editor-hints code {
-  background: rgba(175, 184, 193, 0.2);
+  background: rgba(var(--cavil-neutral-cool-rgb), 0.2);
   border-radius: 4px;
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 11px;
   padding: 1px 5px;
 }
 .snippet-editor-hints-swatch {
-  border: 1px solid rgba(27, 31, 36, 0.1);
+  border: 1px solid var(--cavil-swatch-edge);
   border-radius: 3px;
   display: inline-block;
   height: 10px;
@@ -906,41 +831,41 @@ export default {
   align-items: center;
 }
 .snippet-editor .snippet-editor-neutral {
-  background-color: #f6f8fa;
-  border: 1px solid rgba(31, 35, 40, 0.15);
-  color: #1f2328;
+  background-color: var(--cavil-canvas-subtle);
+  border: 1px solid var(--cavil-control-edge);
+  color: var(--cavil-fg);
   font-size: 14px;
   font-weight: 500;
   line-height: 20px;
   padding: 5px 16px;
 }
 .snippet-editor .snippet-editor-neutral:hover {
-  background-color: #eef0f3;
-  border-color: rgba(31, 35, 40, 0.15);
-  color: #1f2328;
+  background-color: var(--cavil-canvas-tint-strong);
+  border-color: var(--cavil-control-edge);
+  color: var(--cavil-fg);
 }
 .snippet-editor .snippet-editor-neutral:focus {
-  background-color: #f6f8fa;
-  border-color: rgba(31, 35, 40, 0.15);
-  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.3);
-  color: #1f2328;
+  background-color: var(--cavil-canvas-subtle);
+  border-color: var(--cavil-control-edge);
+  box-shadow: 0 0 0 3px rgba(var(--cavil-accent-rgb), 0.3);
+  color: var(--cavil-fg);
   outline: none;
 }
 
 /* Primer form chrome */
 .snippet-editor .form-label {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 13px;
   font-weight: 600;
   margin-bottom: 4px;
 }
 .snippet-editor .form-control,
 .snippet-editor .form-select {
-  background-color: #ffffff;
-  border: 1px solid #d0d7de;
+  background-color: var(--cavil-canvas);
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
-  box-shadow: inset 0 1px 0 rgba(208, 215, 222, 0.2);
-  color: #1f2328;
+  box-shadow: inset 0 1px 0 rgba(var(--cavil-border-rgb), 0.2);
+  color: var(--cavil-fg);
   font-size: 14px;
   line-height: 20px;
   padding: 5px 12px;
@@ -950,15 +875,15 @@ export default {
 }
 .snippet-editor .form-control:focus,
 .snippet-editor .form-select:focus {
-  background-color: #ffffff;
-  border-color: #0969da;
-  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.3);
-  color: #1f2328;
+  background-color: var(--cavil-canvas);
+  border-color: var(--cavil-accent);
+  box-shadow: 0 0 0 3px rgba(var(--cavil-accent-rgb), 0.3);
+  color: var(--cavil-fg);
   outline: none;
 }
 .snippet-editor .form-check-input {
-  background-color: #ffffff;
-  border: 1px solid #6e7781;
+  background-color: var(--cavil-canvas);
+  border: 1px solid var(--cavil-fg-subtle);
   border-radius: 3px;
   box-shadow: none;
   height: 16px;
@@ -966,16 +891,16 @@ export default {
   width: 16px;
 }
 .snippet-editor .form-check-input:checked {
-  background-color: #0969da;
-  border-color: #0969da;
+  background-color: var(--cavil-accent);
+  border-color: var(--cavil-accent);
 }
 .snippet-editor .form-check-input:focus {
-  border-color: #0969da;
-  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.3);
+  border-color: var(--cavil-accent);
+  box-shadow: 0 0 0 3px rgba(var(--cavil-accent-rgb), 0.3);
   outline: none;
 }
 .snippet-editor .form-check-label {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 14px;
   padding-left: 2px;
   user-select: none;
@@ -1009,10 +934,10 @@ export default {
 
 /* Primer-style green buttons */
 .snippet-editor .btn-success {
-  background-color: #1f883d;
-  border: 1px solid rgba(31, 35, 40, 0.15);
-  box-shadow: 0 1px 0 rgba(31, 35, 40, 0.04);
-  color: #ffffff;
+  background-color: var(--cavil-success-emphasis);
+  border: 1px solid var(--cavil-control-edge);
+  box-shadow: 0 1px 0 rgba(var(--cavil-shadow-alt-rgb), 0.04);
+  color: var(--cavil-on-accent);
   font-size: 14px;
   font-weight: 500;
   line-height: 20px;
@@ -1022,44 +947,91 @@ export default {
     box-shadow 0.15s;
 }
 .snippet-editor .btn-success:hover {
-  background-color: #1a7f37;
-  border-color: rgba(31, 35, 40, 0.15);
-  color: #ffffff;
+  background-color: var(--cavil-success);
+  border-color: var(--cavil-control-edge);
+  color: var(--cavil-on-accent);
 }
 .snippet-editor .btn-success:focus,
 .snippet-editor .btn-success.focus {
-  background-color: #1a7f37;
-  border-color: rgba(31, 35, 40, 0.15);
-  box-shadow: 0 0 0 3px rgba(31, 136, 61, 0.4);
-  color: #ffffff;
+  background-color: var(--cavil-success);
+  border-color: var(--cavil-control-edge);
+  box-shadow: 0 0 0 3px rgba(var(--cavil-success-emphasis-rgb), 0.4);
+  color: var(--cavil-on-accent);
 }
 .snippet-editor .btn-success:active,
 .snippet-editor .btn-success.active {
-  background-color: #187432;
-  border-color: rgba(31, 35, 40, 0.15);
-  box-shadow: inset 0 1px 0 rgba(0, 45, 17, 0.2);
-  color: #ffffff;
+  background-color: var(--cavil-success-3);
+  border-color: var(--cavil-control-edge);
+  box-shadow: inset 0 1px 0 rgba(var(--cavil-shadow-success-rgb), 0.2);
+  color: var(--cavil-on-accent);
+}
+/* These hand-rolled Primer-green buttons outrank the global .btn-success rules, so dark
+   needs them restated: neutral surface at rest, filling in on hover, like every other
+   coloured button. */
+/* Light lifts this to pure white on hover; inverted that is the page colour, so the button
+   would sink into the background instead of rising off it. */
+/* A 12% wash reads on white but not on near-black, leaving these as empty outlines. The
+   bar is what actually marks the lines in the editor, so putting it on the swatch makes the
+   legend both visible and a truer key than the wash alone was. */
+[data-bs-theme='dark'] .snippet-editor-hints-swatch {
+  border-color: var(--cavil-border-strong);
+}
+[data-bs-theme='dark'] .snippet-editor .keyword-line.snippet-editor-hints-swatch {
+  box-shadow: inset 3px 0 0 var(--cavil-attention-strong);
+}
+[data-bs-theme='dark'] .snippet-editor .license-line.snippet-editor-hints-swatch {
+  box-shadow: inset 3px 0 0 var(--cavil-success-emphasis);
+}
+[data-bs-theme='dark'] .snippet-editor .snippet-editor-tool-btn:hover:not(:disabled) {
+  background: var(--cavil-border-muted);
+}
+[data-bs-theme='dark'] .snippet-editor .snippet-editor-neutral {
+  background-color: var(--cavil-canvas-tint-strong);
+}
+/* Rest already sits on the light rule's hover colour, so dark needs its own hover a step
+   further up or the button stops responding to the pointer. */
+[data-bs-theme='dark'] .snippet-editor .snippet-editor-neutral:hover {
+  background-color: var(--cavil-border-muted);
+  border-color: var(--cavil-fg-disabled);
+}
+[data-bs-theme='dark'] .snippet-editor .btn-success {
+  background-color: var(--cavil-canvas-tint-strong);
+  border-color: rgba(var(--cavil-success-rgb), 0.4);
+  color: var(--cavil-success);
+}
+[data-bs-theme='dark'] .snippet-editor .btn-success:hover,
+[data-bs-theme='dark'] .snippet-editor .btn-success:focus,
+[data-bs-theme='dark'] .snippet-editor .btn-success.focus {
+  background-color: #238636;
+  border-color: var(--cavil-success);
+  color: var(--cavil-on-accent);
+}
+[data-bs-theme='dark'] .snippet-editor .btn-success:active,
+[data-bs-theme='dark'] .snippet-editor .btn-success.active {
+  background-color: #1a7f37;
+  border-color: var(--cavil-success);
+  color: var(--cavil-on-accent);
 }
 .snippet-editor .dropdown-toggle-split {
   padding-left: 8px;
   padding-right: 8px;
 }
 .snippet-editor .dropdown-menu {
-  background: #ffffff;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas);
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
-  box-shadow: 0 8px 24px rgba(140, 149, 159, 0.2);
+  box-shadow: 0 8px 24px rgba(var(--cavil-neutral-rgb), 0.2);
   font-size: 14px;
   padding: 4px 0;
 }
 .snippet-editor .dropdown-item {
-  color: #1f2328;
+  color: var(--cavil-fg);
   padding: 6px 14px;
 }
 .snippet-editor .dropdown-item:hover,
 .snippet-editor .dropdown-item:focus {
-  background-color: #f6f8fa;
-  color: #1f2328;
+  background-color: var(--cavil-canvas-subtle);
+  color: var(--cavil-fg);
 }
 
 /* Primer-style autocomplete popover */
@@ -1067,10 +1039,10 @@ export default {
   position: relative;
 }
 .snippet-editor .autocomplete-container {
-  background: #ffffff;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas);
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
-  box-shadow: 0 8px 24px rgba(140, 149, 159, 0.2);
+  box-shadow: 0 8px 24px rgba(var(--cavil-neutral-rgb), 0.2);
   cursor: pointer;
   left: 0;
   margin: 4px 0 0;
@@ -1085,32 +1057,32 @@ export default {
   overflow-y: auto;
 }
 .snippet-editor .autocomplete-item {
-  color: #1f2328;
+  color: var(--cavil-fg);
   font-size: 14px;
   padding: 6px 14px;
 }
 .snippet-editor .autocomplete-item:hover {
-  background-color: #f6f8fa;
-  color: #1f2328;
+  background-color: var(--cavil-canvas-subtle);
+  color: var(--cavil-fg);
 }
 
 /* Highlight palette - applies both to legend swatches and CM lines */
 .snippet-editor .license-line {
-  background-color: rgba(31, 136, 61, 0.12);
+  background-color: rgba(var(--cavil-success-emphasis-rgb), 0.12);
 }
 .snippet-editor .keyword-line {
-  background-color: rgba(191, 135, 0, 0.14);
+  background-color: rgba(var(--cavil-attention-strong-rgb), 0.14);
 }
 .snippet-editor .cm-line.license-line {
-  box-shadow: inset 3px 0 0 #1f883d;
+  box-shadow: inset 3px 0 0 var(--cavil-success-emphasis);
 }
 .snippet-editor .cm-line.keyword-line {
-  box-shadow: inset 3px 0 0 #bf8700;
+  box-shadow: inset 3px 0 0 var(--cavil-attention-strong);
 }
 .snippet-editor .cm-line.license-line.keyword-line {
   box-shadow:
-    inset 3px 0 0 #1f883d,
-    inset 6px 0 0 #bf8700;
+    inset 3px 0 0 var(--cavil-success-emphasis),
+    inset 6px 0 0 var(--cavil-attention-strong);
 }
 .snippet-editor .cm-line.found-pattern {
   cursor: help;
@@ -1123,13 +1095,13 @@ export default {
   padding: 0;
 }
 .cavil-pattern-tip {
-  background: #ffffff;
-  border: 1px solid #d0d7de;
+  background: var(--cavil-canvas);
+  border: 1px solid var(--cavil-border);
   border-radius: 8px;
   box-shadow:
-    0 1px 3px rgba(31, 35, 40, 0.08),
-    0 8px 24px rgba(66, 74, 83, 0.12);
-  color: #1f2328;
+    0 1px 3px rgba(var(--cavil-shadow-alt-rgb), 0.08),
+    0 8px 24px rgba(var(--cavil-fg-muted-strong-rgb), 0.12);
+  color: var(--cavil-fg);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
   font-size: 11px;
   line-height: 1.5;
@@ -1137,19 +1109,26 @@ export default {
   min-width: 200px;
   overflow: hidden;
 }
+/* Alphas tuned against white barely register on a dark canvas, leaving the card looking
+   unlifted. Floating overlays in dark carry a much heavier black, as GitHub's do. */
+[data-bs-theme='dark'] .cavil-pattern-tip {
+  box-shadow:
+    0 1px 3px rgba(var(--cavil-shadow-alt-rgb), 0.3),
+    0 8px 24px rgba(var(--cavil-shadow-rgb), 0.7);
+}
 /* Pin bar for the persistent (closable) pattern tooltip in the editor: a slim header that names why the
    card is sticky and carries the close button. */
 .cavil-pattern-tip-pinbar {
   align-items: center;
-  background: #eaeef2;
-  border-bottom: 1px solid #d0d7de;
+  background: var(--cavil-neutral-bg);
+  border-bottom: 1px solid var(--cavil-border);
   display: flex;
   gap: 6px;
   justify-content: space-between;
   padding: 3px 4px 3px 8px;
 }
 .cavil-pattern-tip-pinbar-label {
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -1160,7 +1139,7 @@ export default {
   background: transparent;
   border: 0;
   border-radius: 4px;
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   cursor: pointer;
   display: inline-flex;
   height: 18px;
@@ -1169,29 +1148,29 @@ export default {
   width: 18px;
 }
 .cavil-pattern-tip-close:hover {
-  background: #d0d7de;
-  color: #1f2328;
+  background: var(--cavil-border);
+  color: var(--cavil-fg);
 }
 .cavil-pattern-tip-loading,
 .cavil-pattern-tip-error {
   align-items: center;
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   display: flex;
   gap: 8px;
   padding: 12px 14px;
 }
 .cavil-pattern-tip-error {
-  color: #cf222e;
+  color: var(--cavil-danger);
 }
 .cavil-pattern-tip-summary {
-  border-bottom: 1px solid #d1d9e0b3;
-  color: #59636e;
+  border-bottom: 1px solid var(--cavil-border-translucent);
+  color: var(--cavil-fg-muted-alt);
   font-size: 11px;
   font-weight: 500;
   padding: 6px 12px;
 }
 .cavil-pattern-tip-card {
-  border-top: 1px solid #d1d9e0b3;
+  border-top: 1px solid var(--cavil-border-translucent);
   padding: 0;
 }
 .cavil-pattern-tip-card:first-child {
@@ -1199,14 +1178,14 @@ export default {
 }
 .cavil-pattern-tip-header {
   align-items: stretch;
-  background: #f6f8fa;
+  background: var(--cavil-canvas-subtle);
   display: flex;
   gap: 6px;
   justify-content: space-between;
   min-height: 26px;
 }
 .cavil-pattern-tip-title {
-  color: #3d444d;
+  color: var(--cavil-tip-title);
   display: block;
   font-size: 10px;
   font-weight: 500;
@@ -1236,12 +1215,12 @@ export default {
   padding: 0 8px 0 0;
   white-space: nowrap;
   background: transparent;
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   text-shadow: none;
 }
 .cavil-pattern-tip-open {
   align-items: center;
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   display: inline-flex;
   font-size: 10px;
   justify-content: center;
@@ -1250,20 +1229,20 @@ export default {
 }
 .cavil-pattern-tip-open:hover,
 .cavil-pattern-tip-open:focus {
-  color: #0969da;
+  color: var(--cavil-accent);
   text-decoration: none;
 }
 .cavil-pattern-tip-preview-wrap {
-  background: #ffffff;
+  background: var(--cavil-canvas);
   border: 0;
-  border-top: 1px solid #d1d9e0b3;
+  border-top: 1px solid var(--cavil-border-translucent);
   border-radius: 0;
   max-height: 68px;
   overflow: hidden;
   position: relative;
 }
 .cavil-pattern-tip-preview-wrap.is-truncated::after {
-  background: linear-gradient(rgba(255, 255, 255, 0), #ffffff 82%);
+  background: linear-gradient(rgba(var(--cavil-canvas-rgb), 0), var(--cavil-canvas) 82%);
   bottom: 0;
   content: '';
   height: 18px;
@@ -1275,7 +1254,7 @@ export default {
 .cavil-pattern-tip-preview {
   background: transparent;
   border: 0;
-  color: #59636e;
+  color: var(--cavil-fg-muted-alt);
   font-family:
     ui-monospace,
     SFMono-Regular,
@@ -1294,7 +1273,7 @@ export default {
 }
 
 .snippet-editor-tabs {
-  border-bottom: 1px solid #d0d7de;
+  border-bottom: 1px solid var(--cavil-border);
   display: flex;
   gap: 4px;
   margin-bottom: 16px;
@@ -1305,7 +1284,7 @@ export default {
   border: 1px solid transparent;
   border-bottom: 0;
   border-radius: 6px 6px 0 0;
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   cursor: pointer;
   display: inline-flex;
   font-size: 13px;
@@ -1319,31 +1298,31 @@ export default {
     color 0.15s;
 }
 .snippet-editor-tab:hover:not(:disabled):not(.active) {
-  background: #f3f5f7;
-  color: #1f2328;
+  background: var(--cavil-canvas-tint);
+  color: var(--cavil-fg);
 }
 .snippet-editor-tab.active {
-  background: #ffffff;
-  border-color: #d0d7de;
-  color: #1f2328;
+  background: var(--cavil-canvas);
+  border-color: var(--cavil-border);
+  color: var(--cavil-fg);
   font-weight: 600;
 }
 .snippet-editor-tab:disabled {
-  color: #8c959f;
+  color: var(--cavil-fg-disabled);
   cursor: not-allowed;
 }
 .snippet-editor-tab-badge {
-  background: #ddf4ff;
+  background: var(--cavil-accent-bg);
   border-radius: 10px;
-  color: #0969da;
+  color: var(--cavil-accent);
   font-size: 11px;
   font-weight: 600;
   margin-left: 2px;
   padding: 1px 7px;
 }
 .snippet-editor-tab:disabled .snippet-editor-tab-badge {
-  background: #eaeef2;
-  color: #8c959f;
+  background: var(--cavil-neutral-bg);
+  color: var(--cavil-fg-disabled);
 }
 .snippet-editor-tab-content {
   position: relative;

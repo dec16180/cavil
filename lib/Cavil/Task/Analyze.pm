@@ -6,7 +6,7 @@ use Mojo::Base 'Mojolicious::Plugin', -signatures;
 
 use Cavil::ReportUtil
   qw(new_license_names new_unresolved_files report_checksum report_shortname summary_delta summary_delta_score);
-use Mojo::JSON qw(to_json);
+use Cavil::Util 'to_json_fast';
 
 sub register ($self, $app, $config) {
   $app->minion->add_task(analyze  => \&_analyze);
@@ -22,7 +22,6 @@ sub _analyze ($job, $id, $generation = 0) {
   my $minion = $app->minion;
   my $pkgs   = $app->packages;
   my $log    = $app->log;
-  my $config = $app->config;
 
   # Protect from race conditions. A build inherits its claim on the package from its index job, because
   # the promote below needs the same protection the indexing did, and hands it back as part of that same
@@ -64,25 +63,29 @@ sub _analyze ($job, $id, $generation = 0) {
   # shows the backfilled ones.
   _backfill_component_licenses($app->pg->db, $id, $generation);
 
-  # A rebuild can follow a re-unpack, which replaces the sources and with them the spec file. Take a fresh
-  # spec file report for it and store it with the promote below, so a reader never sees the new spec file
-  # license beside the old file report. A plain re-analyze cannot have new sources, so it uses the cache.
-  my $specfile = ($generation ? $reports->build_specfile_report($id) : $reports->specfile_report($id)) // {};
-  my $dig      = $reports->dig_report($id, undef, $generation);
+  # A rebuild can follow a re-unpack, which replaces the sources and with them the declarations. Take fresh
+  # ones for it and store them with the promote below, so a reader never sees the new declared license beside
+  # the old file report. A plain re-analyze cannot have new sources, so it uses the cache.
+  my $declarations = ($generation ? $reports->build_declarations($id) : undef) // $reports->declarations($id);
+  my $dig          = $reports->dig_report($id, undef, $generation);
 
-  my $chksum    = report_checksum($specfile, $dig);
-  my $shortname = report_shortname($reports->shortname($chksum), $specfile, $dig);
+  my $chksum    = report_checksum($declarations, $dig);
+  my $shortname = report_shortname($reports->shortname($chksum), $declarations, $dig);
   my $flags     = $pkgs->flags($id, $generation);
 
-  # Free up memory
-  my $specfile_json = $generation && %$specfile ? to_json($specfile) : undef;
-  undef $specfile;
+  # Informational annotations derived from the finished report - today the package's legal documents and
+  # how much of each no known license pattern explains. Deliberately computed after the checksum and
+  # shortname above and never folded into them: an unexplained remainder is a fact readers need, not a
+  # reason to re-review.
+  my $annotations = $reports->build_annotations($id, $dig);
+
+  # Free up memory.
+  my $declarations_json = $generation ? to_json_fast($declarations) : undef;
+  undef $declarations;
 
   my $new_candidates = [];
 
-  # Unresolved keyword matches. Count the full set (missed_snippets), NOT the expansion-truncated
-  # $dig->{snippets}: max_expanded_files only caps how many file previews the report renders, it must
-  # never shrink the stored count. (Mirrors the full-set walk in Cavil::Model::Reports::summary.)
+  # Unresolved keyword matches, counted once per snippet across all files
   my $unresolved = 0;
   if (my $missed = $dig->{missed_snippets}) {
     my %seen;
@@ -103,11 +106,11 @@ sub _analyze ($job, $id, $generation = 0) {
     # served, and the build is retried or swept.
     if ($generation) {
 
-      # Retire the live generation first - deleting matched_files cascades its pattern_matches and
-      # file_snippets - then hand generation 0 to the rows this build wrote
-      $db->delete($_, {package => $id, generation => 0}) for qw(package_components urls emails matched_files);
+      # Deleting matched_files cascades its matches and snippets.
+      $db->delete($_, {package => $id, generation => 0})
+        for qw(package_components urls emails copyrights matched_files);
       $db->update($_, {generation => 0}, {package => $id, generation => $generation})
-        for qw(package_components urls emails pattern_matches file_snippets matched_files);
+        for qw(package_components urls emails copyrights pattern_matches file_snippets matched_files);
     }
 
     # The build hands the package back in the same commit that makes its report the live one, so there is
@@ -117,20 +120,20 @@ sub _analyze ($job, $id, $generation = 0) {
     %state = (%state, indexed => \'now()', processing_job => undef, index_stage => undef) if $generation;
     $db->update('bot_packages', \%state, {id => $id});
 
-    # bot_reports holds the two cached reports and has exactly one row per package. A first import has
-    # none yet - nothing created it, because the spec file report was read straight from the checkout.
-    my %cached = (ldig_report => to_json($dig));
-    $cached{specfile_report} = $specfile_json if defined $specfile_json;
+    # A first import has no cached report row yet.
+    my %cached = (ldig_report => to_json_fast($dig), annotations => to_json_fast($annotations));
+
+    # Rewritten on a rebuild (fresh sources), left untouched on a plain re-analyze (cached declarations kept).
+    $cached{declarations} = $declarations_json if defined $declarations_json;
     if ($db->select('bot_reports', 'id', {package => $id})->hash) {
       $db->update('bot_reports', \%cached, {package => $id});
     }
     else {
-      $db->insert('bot_reports', {package => $id, specfile_report => $specfile_json // '{}', %cached});
+      $db->insert('bot_reports', {package => $id, %cached});
     }
     if ($pkg->{state} ne 'new') {
 
-      # in case we reindexed an old pkg, check if 'new' packages now match.
-      # new patterns might change the story
+      # New patterns may unblock matching packages still marked new.
       $new_candidates = $db->select('bot_packages', 'id',
         {name => $pkg->{name}, indexed => {'!=' => undef}, id => {'!=' => $pkg->{id}}, state => 'new'})->hashes;
     }
@@ -151,15 +154,8 @@ sub _analyze ($job, $id, $generation = 0) {
   # here is still the package's problem - the follow-up work that hands the new report to the reviewer.
   # So it goes back on the way out, and only the successful path stays quiet.
   eval {
-    my $prio        = $job->info->{priority};
-    my $analyzed_id = $minion->enqueue(
-      analyzed => [$id] => {parents => [$job->id], priority => $prio + 1, notes => {"pkg_$id" => 1}});
-
-    # The real last job of the build when reports are generated for every one of them, so it keeps climbing
-    # the chain rather than dropping out of the build's band and being overtaken - by the time it came back
-    # round the package could be rebuilding again, and the report it was asked for would never be written.
-    $pkgs->generate_spdx_report($id, {parents => [$analyzed_id], priority => $prio + 2})
-      if $config->{always_generate_spdx_reports};
+    my $prio = $job->info->{priority};
+    $minion->enqueue(analyzed => [$id] => {parents => [$job->id], priority => $prio + 1, notes => {"pkg_$id" => 1}});
 
     # Each of these works on (and claims) the candidate, not this package, so it is noted as the
     # candidate's job - otherwise the cleanup sweep sees no job for a package that is being worked on and
@@ -169,8 +165,7 @@ sub _analyze ($job, $id, $generation = 0) {
       $minion->enqueue(analyzed => [$cid] => {parents => [$job->id], priority => $prio, notes => {"pkg_$cid" => 1}});
     }
 
-    # Classify the snippets this package brought in, the same way a pattern change schedules pattern_stats:
-    # when there are snippets still awaiting the classifier, enqueue the (fleet-wide) classify job.
+    # One fleet-wide classifier job drains any pending snippets.
     $pkgs->classify($id);
   };
   if (my $err = $@) {
@@ -231,7 +226,7 @@ sub _analyzed ($job, $id) {
 
   _auto_review($app, $id);
 
-  # End of the chain unless an SPDX report follows, so the package is handed back here rather than left to
+  # End of the chain unless a document build follows, so the package is handed back here rather than left to
   # the guard, which would only release it and leave a reindex requested in the meantime waiting for the
   # nightly sweep. A failure skips this on purpose: the release is all the guard does, and the retry that
   # an admin starts from the Minion dashboard hands the package back properly.
@@ -259,11 +254,12 @@ sub _auto_review ($app, $id) {
   }
 
   # Incomplete checkout
-  my $specfile = $reports->specfile_report($id);
-  if ($specfile->{incomplete_checkout}) {
+  if (@{$reports->declarations($id)->{incomplete_checkout}}) {
     _look_for_smallest_delta($app, $pkg, 0, 0, 1) if $pkg->{state} eq 'new';
     return;
   }
+
+  my $limitations = $app->notes->limitations($pkg->{name});
 
   # Already accepted: the auto-accept machinery below is for 'new' packages only.
   # Refresh the notice/diff so a reindex with new patterns cannot leave a stale
@@ -274,7 +270,8 @@ sub _auto_review ($app, $id) {
 
     # An "unacceptable" sibling with the same report vetoes the upgrade, exactly
     # as it did for these packages at the (former) unacceptable-history guard.
-    unless (grep { $_->{state} eq 'unacceptable' } @$siblings) {
+    # Limitations veto it too, an inherited lawyer sign-off is an auto-accept.
+    unless (@$limitations || grep { $_->{state} eq 'unacceptable' } @$siblings) {
       my $lawyer;
       for my $p (@$siblings) {
         next               if $p->{obsolete};
@@ -299,6 +296,7 @@ sub _auto_review ($app, $id) {
   my $name                = $pkg->{name};
   my $acceptable_packages = $config->{acceptable_packages} || [];
   if (grep { $name eq $_ } @$acceptable_packages) {
+    return _hold($app, $pkg, $limitations, 'Otherwise accepted package name') if @$limitations;
     $pkg->{state}            = 'acceptable';
     $pkg->{review_timestamp} = 1;
     $pkg->{reviewing_user}   = undef;
@@ -327,7 +325,10 @@ sub _auto_review ($app, $id) {
 
   # Exclude "unacceptable" reviews
   my $packages = $pkgs->history($name, $pkg_shortname, $id);
-  return if grep { $_->{state} eq 'unacceptable' } @$packages;
+  if (my ($rejected) = grep { $_->{state} eq 'unacceptable' } @$packages) {
+    return _hold($app, $pkg, $limitations,
+      "Manual review is required because it was rejected before with the same license as $rejected->{id}");
+  }
 
   my ($found_acceptable_by_lawyer, $found_acceptable);
   for my $p (@$packages) {
@@ -341,6 +342,7 @@ sub _auto_review ($app, $id) {
 
   # Previously reviewed and accepted
   if (my $f_id = $found_acceptable_by_lawyer || $found_acceptable) {
+    return _hold($app, $pkg, $limitations, "Otherwise accepted same license as $f_id") if @$limitations;
     $pkg->{state}            = $found_acceptable_by_lawyer ? 'acceptable_by_lawyer' : 'acceptable';
     $pkg->{review_timestamp} = 1;
     $pkg->{reviewing_user}   = undef;
@@ -349,6 +351,12 @@ sub _auto_review ($app, $id) {
     $pkg->{result}           = "Accepted because previously reviewed under the same license ($f_id)";
     $pkgs->update($pkg);
     return;
+  }
+
+  # Risk 0 is never accepted, and without a risk only no significant difference would have been
+  if (@$limitations) {
+    my $risk = $reports->risk_is_acceptable($pkg_shortname);
+    return _hold($app, $pkg, $limitations, $risk ? "Otherwise accepted low risk ($risk)" : undef, !defined $risk);
   }
 
   # Acceptable risk
@@ -422,18 +430,37 @@ sub _look_for_smallest_delta ($app, $pkg, $allow_accept, $has_manual_review, $in
 # whatever it was when the package was last in 'new' state. Leaves state,
 # result, reviewing_user, and review_timestamp untouched.
 sub _refresh_notice ($app, $pkg) {
-  my ($matched_id, $best, $summary) = _smallest_delta($app, $pkg);
-
-  my ($notice, $diff_report);
-  if (defined $matched_id && !$best) {
-    $notice = "Not found any significant difference against $matched_id";
-  }
-  elsif ($best) {
-    $notice      = summary_delta($best, $summary);
-    $notice      = undef unless length $notice;
-    $diff_report = _diff_report($best, $summary);
-  }
+  my ($notice, $diff_report) = _delta_notice($app, $pkg);
   $app->packages->update({id => $pkg->{id}, notice => $notice, diff_report => $diff_report});
+}
+
+# Returns (notice, diff_report, no_diff_id), the last one only set when there was no significant difference
+sub _delta_notice ($app, $pkg) {
+  my ($matched_id, $best, $summary) = _smallest_delta($app, $pkg);
+  return ("Not found any significant difference against $matched_id", undef, $matched_id)
+    if defined $matched_id && !$best;
+  return (undef, undef, undef) unless $best;
+
+  my $notice = summary_delta($best, $summary);
+  return (length $notice ? $notice : undef, _diff_report($best, $summary), undef);
+}
+
+# The id phrases here are linkified by the report UI, keep them in sync
+sub _hold ($app, $pkg, $limitations, $reason, $no_diff_accepts = 0) {
+  my ($notice, $diff_report, $no_diff_id) = _delta_notice($app, $pkg);
+  $reason //= "Otherwise accepted no significant difference against $no_diff_id"
+    if $no_diff_accepts && defined $no_diff_id;
+
+  my @blocks;
+  for my $limitation (@$limitations) {
+    push @blocks, $limitation->{package} ? "Limitation noted in $limitation->{package}" : 'Limitation noted';
+    push @blocks, join("\n", map { length ? "  $_" : '' } split /\r?\n/, $limitation->{body});
+  }
+  push @blocks, $reason if defined $reason;
+  push @blocks, $notice if defined $notice && !(defined $no_diff_id && defined $reason);
+  $app->packages->update(
+    {id => $pkg->{id}, notice => join("\n\n", @blocks), diff_report => $diff_report, result => undef});
+  return;
 }
 
 # Structured, machine-readable companion to the notice text, stored in the
@@ -450,7 +477,7 @@ sub _diff_report ($best, $summary) {
   my $licenses = new_license_names($best, $summary);
   return undef unless @$files || @$licenses;
 
-  return to_json({version => 1, closest => $best->{id}, new_unresolved => $files, new_licenses => $licenses});
+  return to_json_fast({version => 1, closest => $best->{id}, new_unresolved => $files, new_licenses => $licenses});
 }
 
 # Find the closest matching older review. Returns (matched_id, best_summary,

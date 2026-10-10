@@ -4,6 +4,8 @@
 package Cavil::Bom::Registry;
 use Mojo::Base -base, -signatures;
 
+use Cavil::Util qw(safe_string);
+
 use Cavil::Bom::Detector::Npm;
 use Cavil::Bom::Detector::Cargo;
 use Cavil::Bom::Detector::Pypi;
@@ -13,7 +15,6 @@ use Cavil::Bom::Detector::Composer;
 use Cavil::Bom::Detector::Nuget;
 use Cavil::Bom::Detector::Rubygems;
 
-# One detector per ecosystem; adding an ecosystem is a new module plus a line here
 has detectors => sub ($self) {
   [
     Cavil::Bom::Detector::Npm->new,   Cavil::Bom::Detector::Cargo->new, Cavil::Bom::Detector::Pypi->new,
@@ -22,14 +23,12 @@ has detectors => sub ($self) {
   ];
 };
 
-# Flat list of [path-regex, detector] pairs, built once from the detectors' file patterns
 has _matchers => sub ($self) {
   my @matchers;
   for my $detector (@{$self->detectors}) { push @matchers, [$_, $detector] for $detector->files }
   return \@matchers;
 };
 
-# Cheap check for the per-file indexing loop: does this path look like a component metadata file?
 sub matches ($self, $path) {
   $path =~ $_->[0] and return 1 for @{$self->_matchers};
   return 0;
@@ -66,16 +65,10 @@ sub _sanitize ($component) {
   return undef unless ref $component eq 'HASH';
 
   for my $field (qw(name version purl type)) {
-    next unless defined $component->{$field};
-    return undef
-      if ref $component->{$field} || length $component->{$field} > 512 || $component->{$field} =~ /[\x00-\x1f]/;
+    return undef if defined $component->{$field} && !safe_string($component->{$field});
   }
-  return undef unless defined $component->{name} && length $component->{name};
-  return undef unless defined $component->{purl} && length $component->{purl};
-
-  my $license = $component->{license};
-  $component->{license} = undef
-    if defined $license && (ref $license || length $license > 512 || $license =~ /[\x00-\x1f]/);
+  return undef                  unless length($component->{name} // '') && length($component->{purl} // '');
+  $component->{license} = undef unless safe_string($component->{license});
 
   return $component;
 }

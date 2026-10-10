@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -19,9 +7,14 @@ use Test::More;
 use Mojo::File qw(path curfile tempfile);
 use Mojo::JSON qw(decode_json);
 use Cavil::Util (
-  qw(buckets expand_spec_macros lines_context license_is_catch_all normalize_license_expr obs_ssh_auth parse_exclude_file),
-  qw(parse_service_file normalize_license_text pattern_matches pattern_contains_redundant_skip read_lines),
-  qw(external_link_data request_id_from_external_link run_cmd spdx_link ssh_sign text_shingles validate_tags)
+  qw(buckets expand_spec_macros extract_copyrights legal_review_notices lines_context license_is_catch_all),
+  qw(license_text),
+  qw(normalize_license_expr obs_ssh_auth original_filename),
+  qw(parse_exclude_file parse_list_filter parse_service_file normalize_license_text pattern_matches pattern_contains_redundant_skip read_lines),
+  qw(safe_string),
+  qw(external_link_data incoming_priority request_id_from_external_link run_cmd spdx_link ssh_sign text_shingles),
+  qw(validate_tags PRIORITY_INCOMING PRIORITY_UPKEEP PRIORITY_WAITING),
+  qw(decode_json_fast encode_json_fast to_json_fast)
 );
 
 my $PRIVATE_KEY = tempfile->spew(<<'EOF');
@@ -76,6 +69,14 @@ subtest 'expand_spec_macros' => sub {
 
     my $chained = "%define mainver 91.2\nName: tool\nVersion: %{mainver}\n" . "Source: %{name}-%{version}.tar.gz\n";
     is $tag->($chained, 'Source'), 'tool-91.2.tar.gz', 'seeded %{version} is itself macro-resolved';
+  };
+
+  subtest 'conditional references to defined macros' => sub {
+    my $spec = "%define name_ext -test\n%define short_name os-autoinst\nName: %{short_name}%{?name_ext}\n";
+    is $tag->($spec,                                  'Name'),    'os-autoinst-test', '%{?foo} (the os-autoinst case)';
+    is $tag->("%define x 1\nVersion: 2%{?x:.%{x}}\n", 'Version'), '2.1', '%{?foo:text} with a nested reference';
+    is $tag->("%define x 1\nVersion: 2%{!?x:.0}\n",   'Version'), '2',   '%{!?foo:text}';
+    is $tag->("Version: 2%{!?x:.0}\n", 'Version'), '2%{!?x:.0}',         'undefined is left for the build system';
   };
 
   subtest 'unknown macros are left untouched' => sub {
@@ -156,6 +157,16 @@ subtest 'parse_exclude_file' => sub {
   is_deeply parse_exclude_file('t/exclude-files/cavil.exclude', 'gcc1'),    ['another.tar.gz',  'specific.zip'];
   is_deeply parse_exclude_file('t/exclude-files/cavil.exclude', 'gcc9'),    ['another.tar.gz',  'specific.zip'];
   is_deeply parse_exclude_file('t/exclude-files/empty.exclude', 'whatever'), [];
+};
+
+subtest 'parse_list_filter' => sub {
+  is_deeply [parse_list_filter('tag:CVE openssl', ['tag'])], [{tag => 'CVE'}, 'openssl'], 'qual and free text';
+  is_deeply [parse_list_filter('tag=CVE', ['tag'])],         [{tag => 'CVE'}, ''],        'equals syntax';
+  is_deeply [parse_list_filter('TAG:CVE', ['tag'])],         [{tag => 'CVE'}, ''], 'field name is case insensitive';
+  is_deeply [parse_list_filter('foo:bar baz', ['tag'])],     [{}, 'foo:bar baz'],     'unknown field folded into text';
+  is_deeply [parse_list_filter('just some words', ['tag'])], [{}, 'just some words'], 'plain text untouched';
+  is_deeply [parse_list_filter('', ['tag'])],                [{}, ''],                'empty string';
+  is_deeply [parse_list_filter(undef, ['tag'])],             [{}, ''],                'undef string';
 };
 
 subtest 'parse_service_file' => sub {
@@ -431,50 +442,49 @@ subtest 'read_lines' => sub {
 };
 
 subtest 'spdx_link' => sub {
-  is spdx_link('MIT'), '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/MIT.html">MIT</a>',
+  is spdx_link('MIT'), '<button type="button" class="license-link spdx" data-license="MIT">MIT</button>',
     'known license';
   is spdx_link('Apache-2.0'),
-    '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/Apache-2.0.html">Apache-2.0</a>',
-    'known license';
+    '<button type="button" class="license-link spdx" data-license="Apache-2.0">Apache-2.0</button>', 'known license';
   is spdx_link('Unknown-License'), 'Unknown-License', 'unknown license';
 
   subtest 'Expression with AND' => sub {
     is spdx_link('Apache-2.0 AND MIT'),
-      '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/Apache-2.0.html">Apache-2.0</a>' . ' AND '
-      . '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/MIT.html">MIT</a>';
+      '<button type="button" class="license-link spdx" data-license="Apache-2.0">Apache-2.0</button>' . ' AND '
+      . '<button type="button" class="license-link spdx" data-license="MIT">MIT</button>';
   };
 
   subtest 'Expression with OR' => sub {
     is spdx_link('MIT OR GPL-2.0-only'),
-      '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/MIT.html">MIT</a>' . ' OR '
-      . '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/GPL-2.0-only.html">GPL-2.0-only</a>';
+      '<button type="button" class="license-link spdx" data-license="MIT">MIT</button>' . ' OR '
+      . '<button type="button" class="license-link spdx" data-license="GPL-2.0-only">GPL-2.0-only</button>';
   };
 
   subtest 'Expression with parentheses and AND/OR' => sub {
     is spdx_link('(MIT OR Apache-2.0) AND GPL-2.0-only'),
-        '('
-      . '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/MIT.html">MIT</a>' . ' OR '
-      . '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/Apache-2.0.html">Apache-2.0</a>'
-      . ') AND '
-      . '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/GPL-2.0-only.html">GPL-2.0-only</a>';
+      '<span class="license-nowrap">(<button type="button" class="license-link spdx" data-license="MIT">MIT</button></span>'
+      . ' OR '
+      . '<span class="license-nowrap"><button type="button" class="license-link spdx" data-license="Apache-2.0">Apache-2.0</button>)</span>'
+      . ' AND '
+      . '<button type="button" class="license-link spdx" data-license="GPL-2.0-only">GPL-2.0-only</button>';
   };
 
   subtest 'Expression with exception' => sub {
     is spdx_link('Classpath-exception-2.0'),
-      '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/Classpath-exception-2.0.html">Classpath-exception-2.0</a>',
+      '<button type="button" class="license-link spdx" data-license="Classpath-exception-2.0">Classpath-exception-2.0</button>',
       'SPDX exception only';
 
     is spdx_link('GPL-2.0-only WITH Classpath-exception-2.0'),
-        '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/GPL-2.0-only.html">GPL-2.0-only</a>'
+        '<button type="button" class="license-link spdx" data-license="GPL-2.0-only">GPL-2.0-only</button>'
       . ' WITH '
-      . '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/Classpath-exception-2.0.html">'
-      . 'Classpath-exception-2.0</a>', 'SPDX license WITH exception';
+      . '<button type="button" class="license-link spdx" data-license="Classpath-exception-2.0">'
+      . 'Classpath-exception-2.0</button>', 'SPDX license WITH exception';
 
     is spdx_link('MIT WITH Autoconf-exception-3.0'),
-        '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/MIT.html">MIT</a>'
+        '<button type="button" class="license-link spdx" data-license="MIT">MIT</button>'
       . ' WITH '
-      . '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/Autoconf-exception-3.0.html">'
-      . 'Autoconf-exception-3.0</a>', 'MIT WITH Autoconf-exception-3.0';
+      . '<button type="button" class="license-link spdx" data-license="Autoconf-exception-3.0">'
+      . 'Autoconf-exception-3.0</button>', 'MIT WITH Autoconf-exception-3.0';
   };
 
   subtest 'Untrusted text is HTML-escaped (no XSS)' => sub {
@@ -482,13 +492,21 @@ subtest 'spdx_link' => sub {
     # License strings can come from imported component metadata and are rendered with v-html, so any
     # non-link text must be escaped
     is spdx_link('MIT <img src=x onerror=alert(1)>'),
-      '<a class="spdx-link" target="_blank" href="https://spdx.org/licenses/MIT.html">MIT</a>'
+      '<button type="button" class="license-link spdx" data-license="MIT">MIT</button>'
       . ' &lt;img src=x onerror=alert(1)&gt;', 'markup around a known license is escaped';
     is spdx_link('<script>alert(1)</script>'), '&lt;script&gt;alert(1)&lt;/script&gt;',
       'unknown license with markup is fully escaped';
     is spdx_link('Foo & Bar'), 'Foo &amp; Bar', 'ampersands are escaped';
     unlike spdx_link('MIT" onmouseover="alert(1)'), qr/onmouseover="alert/, 'attribute-breaking text is escaped';
   };
+};
+
+subtest 'license_text' => sub {
+  like license_text('MIT'),                     qr/Permission is hereby granted, free of charge/, 'a listed license';
+  like license_text('Classpath-exception-2.0'), qr/link this library/i, 'an exception, which spdx_link also links';
+  is license_text('Nope-1.0'), undef, 'an identifier that is not on the list';
+  is license_text(''),         undef, 'no identifier at all';
+  unlike license_text('MIT'), qr/\r/, 'no line endings introduced';
 };
 
 subtest 'ssh_sign' => sub {
@@ -571,6 +589,16 @@ subtest 'validate_tags' => sub {
     is $clean, undef, 'undef element rejected';
     like $error, qr/tags must be an array of strings/, 'error explains';
   };
+
+  subtest 'exempt regex skips the count cap' => sub {
+    my @cves = map {"CVE-2024-$_"} 1 .. 20;
+    my ($clean, $error) = validate_tags([@cves], qr/^CVE-/i);
+    is $error,         undef, 'many CVE tags allowed when exempt from the count';
+    is scalar @$clean, 20,    'all CVE tags kept';
+
+    ($clean, $error) = validate_tags([@cves, map {"t$_"} 1 .. 17], qr/^CVE-/i);
+    like $error, qr/too many tags, maximum is 16/, 'non-exempt tags still counted against the cap';
+  };
 };
 
 subtest 'obs_ssh_auth' => sub {
@@ -585,12 +613,12 @@ subtest 'obs_ssh_auth' => sub {
 };
 
 subtest 'license_is_catch_all' => sub {
-  ok license_is_catch_all('Any Permissive'),      'an "Any ..." grab-bag is catch_all';
-  ok license_is_catch_all('Any reference local'), 'another "Any ..." grab-bag is catch_all';
-  ok license_is_catch_all('GPL-Unspecified'),     'a version-less family marker is catch_all';
-  ok license_is_catch_all('LGPL Unspecified'),    'the space-separated variant is catch_all';
-  ok license_is_catch_all('All Rights Reserved'), 'the proprietary default marker is catch_all';
-  ok license_is_catch_all('Public-Domain'),       'the public-domain marker is catch_all';
+  ok license_is_catch_all('Any Permissive'),          'an "Any ..." grab-bag is catch_all';
+  ok license_is_catch_all('Any reference local'),     'another "Any ..." grab-bag is catch_all';
+  ok license_is_catch_all('Any Public Domain'),       'the public-domain marker is catch_all';
+  ok license_is_catch_all('Any All Rights Reserved'), 'the proprietary default marker is catch_all';
+  ok license_is_catch_all('GPL-Unspecified'),         'a version-less family marker is catch_all';
+  ok license_is_catch_all('LGPL-Unspecified'),        'another version-less family marker is catch_all';
 
   ok !license_is_catch_all('MIT'),                            'a concrete SPDX license is not catch_all';
   ok !license_is_catch_all('GPL-2.0 WITH Linking-exception'), 'a concrete WITH-exception license is not catch_all';
@@ -598,8 +626,239 @@ subtest 'license_is_catch_all' => sub {
   ok !license_is_catch_all(''),                               'the empty (keyword) license is not catch_all';
   ok !license_is_catch_all(undef),                            'undef is not catch_all';
 
-  # Composite expressions ending in "Unspecified" are swept in (the safe direction for coverage)
-  ok license_is_catch_all('MIT OR BSD-Unspecified'), 'a composite ending in Unspecified is treated as catch_all';
+  # One placeholder anywhere in an expression makes the whole expression one, on either side of the operator
+  ok license_is_catch_all('MIT OR BSD-Unspecified'),  'a composite naming an unspecified family is catch_all';
+  ok license_is_catch_all('BSD-Unspecified OR MIT'),  'and so is the same statement written the other way round';
+  ok license_is_catch_all('MIT AND BSD-Unspecified'), 'an unspecified half of an AND leaves it unknown too';
+  ok license_is_catch_all('BSD-3-Clause AND Any Permissive'),     'a grab-bag component counts the same';
+  ok license_is_catch_all('GPL-Unspecified WITH Font-Exception'), 'a version-less family carrying an exception';
+  ok license_is_catch_all('(LGPL-Unspecified AND GPL-Unspecified) OR MIT'), 'components inside parentheses count';
+
+  # Both conventions have to be spelled exactly, or the name no longer announces the flag
+  ok !license_is_catch_all('LGPL Unspecified'), 'the space-separated variant is not catch_all';
+  ok !license_is_catch_all('Anything'),         'a license merely starting with "Any" is not catch_all';
+  ok !license_is_catch_all('GPL-2.0 WITH Unspecified-Exception'),
+    'the suffix has to end a component, so an unknown exception has to be named "Exception-Unspecified"';
+  ok !license_is_catch_all('LicenseRef-SUSE-Public-Domain'), 'a LicenseRef is an identified license';
+};
+
+subtest 'incoming_priority' => sub {
+  is incoming_priority(5),     PRIORITY_INCOMING,     'an ordinary request is the incoming band itself';
+  is incoming_priority(10),    PRIORITY_INCOMING + 5, 'the most urgent request is at the top of the band';
+  is incoming_priority(1),     PRIORITY_INCOMING - 4, 'a product import is at the bottom of it';
+  is incoming_priority(undef), PRIORITY_INCOMING,     'a request without one is treated as ordinary';
+
+  # The review priority is not a queue priority, and a request cannot use it to leave the band
+  is incoming_priority( 0),   PRIORITY_INCOMING - 4, 'below the scale is the bottom of the band';
+  is incoming_priority(-100), PRIORITY_INCOMING - 4, 'and so is far below it';
+  is incoming_priority( 11),  PRIORITY_INCOMING + 5, 'above the scale is the top of the band';
+  is incoming_priority(1000), PRIORITY_INCOMING + 5, 'and so is far above it';
+
+  ok incoming_priority(1) > PRIORITY_UPKEEP + 7, 'the least urgent import outranks every rebuild the queue makes';
+  ok incoming_priority(10) < PRIORITY_WAITING,   'the most urgent one still yields to a reviewer waiting on a report';
+};
+
+subtest 'JSON helpers' => sub {
+  subtest 'round-trip' => sub {
+    my $data = {b => 2, a => [1, 'two', {c => 'three'}], "\x{fc}" => "\x{e4}", empty => {}, list => []};
+    is_deeply decode_json_fast(encode_json_fast($data)),        $data, 'binary round-trip';
+    is_deeply Mojo::JSON::from_json(to_json_fast($data)),       $data, 'text round-trip readable by Mojo::JSON';
+    is_deeply decode_json_fast(Mojo::JSON::encode_json($data)), $data, 'Mojo::JSON output readable by us';
+
+    is encode_json_fast("\x{e4}"), qq{"\xc3\xa4"}, 'binary encoder emits UTF-8 bytes';
+    is to_json_fast("\x{e4}"),     qq{"\x{e4}"},   'text encoder emits characters';
+    is encode_json_fast(undef),    'null',         'nonref allowed, as with Mojo::JSON';
+    is to_json_fast(\1),           'true',         'booleans survive';
+  };
+
+  # Cavil keys hashes on filenames and contributor names straight out of the archive. Sorting those
+  # keys, which is what Mojo::JSON's encoders do, never returns with Cpanel::JSON::XS 4.43 - so if this
+  # subtest ever stops finishing rather than starts failing, "canonical" is back.
+  subtest 'non-ASCII keys' => sub {
+    my @names = ("Bj\x{f8}rn", "Rafa\x{142}", "Andr\x{e9}", "J\x{e9}r\x{f4}me", "M\x{e5}rten", "Wei\x{df}");
+    my %hash  = map { ("$names[$_ % @names] Person$_" => $_) } 1 .. 500;
+    is_deeply decode_json_fast(encode_json_fast(\%hash)),  \%hash, 'they survive the binary round-trip';
+    is_deeply Mojo::JSON::from_json(to_json_fast(\%hash)), \%hash, 'and the text one';
+  };
+
+  # Everything Mojo::JSON sets except "canonical" is kept, so input that used to parse still parses
+  is_deeply decode_json_fast('{"a":1,"a":2}'), {a => 2}, 'duplicate keys are still allowed, not fatal';
+};
+
+subtest 'legal_review_notices' => sub {
+  is_deeply legal_review_notices("Name: foo\nLicense: MIT\n"), [], 'no notices';
+
+  is_deeply legal_review_notices("# Legal-Review-Notice: single line\nLicense: MIT\n"), ['single line'], 'one-liner';
+
+  is_deeply legal_review_notices("###  Legal-Review-Notice:  many hashes and spaces  \n"), ['many hashes and spaces'],
+    'marker and whitespace stripped';
+
+  is_deeply legal_review_notices("# Legal-Review-Notice: line one\n# line two\n# line three\nLicense: MIT\n"),
+    ["line one\nline two\nline three"], 'continuation lines joined and stopped by a directive';
+
+  is_deeply legal_review_notices("# Legal-Review-Notice: trailing space   \n# more   \n"), ["trailing space\nmore"],
+    'trailing whitespace trimmed on every line';
+
+  is_deeply legal_review_notices("# Legal-Review-Notice: first\n\n# an unrelated comment\n"), ['first'],
+    'a blank line ends the notice';
+
+  is_deeply legal_review_notices("# Legal-Review-Notice: first\n#\n# an unrelated comment\n"), ['first'],
+    'an empty comment line ends the notice';
+
+  is_deeply legal_review_notices("# Legal-Review-Notice: first\n###\n# an unrelated comment\n"), ['first'],
+    'a hashes-only comment line ends the notice';
+
+  is_deeply legal_review_notices("# Legal-Review-Notice: first\nName: foo\n# Legal-Review-Notice: second\n"),
+    ['first', 'second'], 'two separate one-liners';
+
+  is_deeply legal_review_notices("# Legal-Review-Notice: first\n# more\n# Legal-Review-Notice: second\n# also\n"),
+    ["first\nmore", "second\nalso"], 'a new notice ends the previous block';
+
+  is_deeply legal_review_notices("# Legal-Review-Notice: at the very end\n# with a continuation"),
+    ["at the very end\nwith a continuation"], 'notice runs to the end of file';
+};
+
+subtest 'extract_copyrights' => sub {
+  my $notices = sub { [sort keys %{extract_copyrights(shift)}] };
+
+  subtest 'shapes that are notices' => sub {
+    my @cases = (
+      ['Copyright (c) 2018 Foo Bar',      'Copyright (c) 2018 Foo Bar'],
+      ['Copyright 2013 Thorsten Lorenz.', 'Copyright 2013 Thorsten Lorenz.'], ['(c) 2018 Foo', '(c) 2018 Foo'],
+      ['(C) Copyright 2002 Zwane Mwaikambo',          '(C) Copyright 2002 Zwane Mwaikambo'],
+      ['Copyright © 2019 John Doe',                   'Copyright © 2019 John Doe'],
+      ['SPDX-FileCopyrightText: 2019 Jane <j@e.org>', 'SPDX-FileCopyrightText: 2019 Jane <j@e.org>'],
+      [' * Copyright (c) 2018 Foo',                   'Copyright (c) 2018 Foo'],
+      ['// Copyright 2015 The Chromium Authors',      'Copyright 2015 The Chromium Authors'],
+      ['# Copyright (C) 2024 SUSE LLC',               'Copyright (C) 2024 SUSE LLC'],
+
+      # A notice on one line closes its comment on that line; the terminator is not part of the notice
+      ['/* Copyright (c) 2019 Foo Bar */',    'Copyright (c) 2019 Foo Bar'],
+      ['<!-- Copyright (c) 2019 Foo Bar -->', 'Copyright (c) 2019 Foo Bar'],
+
+      # A notice with no year at all. The commonest single notice in the wild, and requiring a year
+      # (as the SBOM writer used to) drops every one of them.
+      [
+        'Copyright (c) Microsoft Corporation. All rights reserved.',
+        'Copyright (c) Microsoft Corporation. All rights reserved.'
+      ],
+      ['Copyright (c) Sindre Sorhus <s@s.com>', 'Copyright (c) Sindre Sorhus <s@s.com>'],
+
+      # Patch files are most of an openSUSE package and carry notices behind a diff marker
+      ['+Copyright (c) 2009 The Go Authors.', 'Copyright (c) 2009 The Go Authors.'],
+      ['+ * Copyright (c) 2006 Intel Corp.',  'Copyright (c) 2006 Intel Corp.']
+    );
+    for my $case (@cases) {
+      my ($input, $expected) = @$case;
+      is_deeply $notices->($input), [$expected], "notice: $input";
+    }
+  };
+
+  subtest 'shapes that are not notices' => sub {
+    my @cases = (
+      'Copyright',                                                   # nothing follows the anchor
+      'The Copyright Office should be sent a form',                  # anchor not at the line start
+      'copyright notice, this list of conditions and the follow',    # wrapped license text
+      'COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR',       # wrapped warranty disclaimer
+      'Copyright and related rights are waived via the Creative',    # CC0 prose, no holder
+      'Copyright (C) YEAR NAME OF AUTHOR',                           # GPL boilerplate placeholder
+      'Copyright [yyyy] [name of copyright owner]',                  # Apache boilerplate placeholder
+      'Copyright (c) <year> <copyright holders>',                    # MIT boilerplate placeholder
+      'Copyright (c) <YEAR>, <OWNER>',                               # BSD boilerplate placeholder
+      'Copyright Holder, and derivatives of that collection',        # Artistic License defined term
+      'Copyright Holder may include your modifications in the',      # Artistic License defined term
+      'Copyright Holder. This restriction only applies to the',      # SIL OFL defined term
+
+      # "(c)" also enumerates clauses. Apache-2.0 section 4(c) alone put this in 80 files of one package,
+      # and prose, maths and protocol comments all open the same way.
+      '(c) You must retain, in the Source form of any Derivative Works that You distribute, all',
+      '(c) The stream ID is for a locally-created stream which does not exist yet. This is a',
+      '(C) The PN is below the watermark.', '(c) 1 < qInv < p'
+    );
+    is_deeply $notices->($_), [], "not a notice: $_" for @cases;
+  };
+
+  subtest 'multi-line notices are collected whole' => sub {
+    is_deeply $notices->("Copyright (c) 2011 The Chromium Authors\nAll rights reserved.\n"),
+      ['Copyright (c) 2011 The Chromium Authors All rights reserved.'], 'the paired trailer comes along';
+
+    is_deeply $notices->(" * Copyright (c) 2019\n *     Alice <a\@e.org>\n *     Bob <b\@e.org>\n"),
+      ['Copyright (c) 2019 Alice <a@e.org> Bob <b@e.org>'], 'holders indented under a bare year';
+
+    is_deeply $notices->("Copyright 2019 Foo Inc.,\nBar Ltd.\n"), ['Copyright 2019 Foo Inc., Bar Ltd.'],
+      'a notice broken off mid sentence';
+
+    # Without this the fold runs straight from the notice into the license and stores the two as one
+    is_deeply $notices->("Copyright (c) Microsoft Corporation.\nLicensed under the Apache License\n"),
+      ['Copyright (c) Microsoft Corporation.'], 'the license body ends the notice';
+
+    is_deeply $notices->("Copyright (c) 2018 Foo\nCopyright (c) 2019 Bar\n"),
+      ['Copyright (c) 2018 Foo', 'Copyright (c) 2019 Bar'], 'the next notice ends the previous one';
+
+    is_deeply $notices->(" * Copyright (c) 2019\n\n *     Not A Holder\n"), ['Copyright (c) 2019'],
+      'a blank line ends the notice';
+  };
+
+  subtest 'occurrences are counted' => sub {
+    is_deeply extract_copyrights("Copyright 2019 Foo\nsome code\nCopyright 2019 Foo\n"), {'Copyright 2019 Foo' => 2},
+      'one entry, counted twice';
+  };
+
+  subtest 'hostile input stays bounded' => sub {
+    ok !%{extract_copyrights('')},             'empty string';
+    ok !%{extract_copyrights("\x00\xff\xfe")}, 'binary noise';
+    is_deeply $notices->('Copyright (c) 2019 Foo'), ['Copyright (c) 2019 Foo'], 'no trailing newline';
+
+    # A line of nothing but comment leaders must not make the anchor backtrack; a nested quantifier
+    # here is the classic way to hang a scanner that reads every file of every package
+    my $punctuation = ('#*/;!|>+-' x 20_000) . "X\n";
+    ok !%{extract_copyrights($punctuation)}, 'a long run of comment leaders is cheap';
+
+    # Caps: notices per file, lines scanned, continuation lines folded, stored notice length
+    my $many = join '', map {"Copyright (c) 2019 Holder $_\n"} 1 .. 500;
+    is scalar keys %{extract_copyrights($many)}, 100, 'notices per file are capped';
+
+    my $deep = "Copyright (c) 2019\n" . join '', map { (' ' x 40) . "Holder $_\n" } 1 .. 100;
+    is_deeply $notices->($deep), ['Copyright (c) 2019 Holder 1 Holder 2 Holder 3 Holder 4'],
+      'folding stops after a bounded run of continuation lines';
+
+    # A single line long enough to matter is a minified blob and never reaches the length cap; folding
+    # several wide continuation lines together is the way a stored notice can actually grow
+    my $wide = 'Copyright (c) 2019 ' . ('A' x 250) . "\n";
+    $wide .= join '', map { '    ' . ('B' x 250) . "\n" } 1 .. 4;
+    is length $notices->($wide)->[0], 1024, 'a folded notice is truncated to its cap';
+
+    my $blob = 'Copyright (c) 2019 ' . ('a' x 5000);
+    is_deeply $notices->($blob), [], 'an over-long source line is a minified blob, not a notice';
+
+    my $late = ("\n" x 25_000) . "Copyright (c) 2019 Too Far Down\n";
+    is_deeply $notices->($late), [], 'lines past the scan cap are not examined';
+  };
+};
+
+subtest 'original_filename undoes the ".processed" naming, and leaves everything else alone' => sub {
+
+  # The inverse of how Cavil::PostProcess names a rewritten copy: "<base>.processed.<ext>", or a bare
+  # "<name>.processed" when the name has no extension to keep.
+  is original_filename('lib/foo.processed.js'), 'lib/foo.js', 'the extension is restored';
+  is original_filename('Makefile.processed'),   'Makefile',   'a name with no extension loses the suffix';
+  is original_filename('a/b.c/x.processed'),    'a/b.c/x',    'a dot in a directory is not mistaken for one';
+
+  is original_filename('lib/foo.js'),        'lib/foo.js',        'an ordinary path is untouched';
+  is original_filename('processed.js'),      'processed.js',      'a file merely named "processed" is untouched';
+  is original_filename('foo.processed.d/x'), 'foo.processed.d/x', 'and a directory named ".processed.d" is not a copy';
+};
+
+subtest 'safe_string' => sub {
+  ok safe_string('MIT OR Apache-2.0'), 'plain value';
+  ok safe_string(''),                  'empty value';
+  ok safe_string('x' x 512),           'longest value';
+  ok !safe_string(undef),              'undefined';
+  ok !safe_string([1]),                'reference';
+  ok !safe_string('x' x 513),          'too long';
+  ok !safe_string("two\nlines"),       'newline';
+  ok !safe_string("tab\there"),        'tab';
+  ok !safe_string("nul\x00"),          'NUL byte';
 };
 
 done_testing;

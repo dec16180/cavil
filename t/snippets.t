@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict, -signatures;
 
@@ -22,6 +10,7 @@ use Test::More;
 use Test::Mojo;
 use Cavil::Test;
 use Cavil::Util qw(SNIPPET_SCORE_VERSION);
+use Mojo::File  qw(path);
 
 plan skip_all => 'set TEST_ONLINE to enable this test' unless $ENV{TEST_ONLINE};
 
@@ -56,9 +45,7 @@ subtest 'Unpack and index with the job queue' => sub {
   );
 };
 
-# The Classify Snippets page filters purely on the stored file_snippets.resolution column (computed
-# once by resolve_snippets, covered in t/snippet_resolve.t), so here we set it directly and check the
-# filter + full-text search + keyset pagination read it correctly.
+# Set resolution directly; resolution computation is tested separately.
 subtest 'resolution + text-search filters and keyset pagination' => sub {
   my $app = Test::Mojo->new(Cavil => $cavil_test->default_config)->app;
   my $db  = $app->pg->db;
@@ -139,6 +126,37 @@ subtest 'resolution + text-search filters and keyset pagination' => sub {
 
     is scalar(@{$app->snippets->unclassified({%base, search => 'zzzdefinitelynotpresent'})->{snippets}}), 0,
       'a no-match term returns nothing';
+  };
+
+  subtest 'a bare numeric search is an exact id lookup that bypasses the state filters' => sub {
+
+    # Approved, so the %base defaults (classified, not approved) would hide it in every text-search view.
+    my $approved_id = $db->insert(
+      'snippets',
+      {
+        hash          => 'id-lookup',
+        text          => 'approved snippet body cited in a review note',
+        package       => 1,
+        classified    => 1,
+        license       => 1,
+        approved      => 1,
+        confidence    => 100,
+        likelyness    => 0,
+        second_match  => 0,
+        score_version => SNIPPET_SCORE_VERSION
+      },
+      {returning => 'id'}
+    )->hash->{id};
+    $db->insert('file_snippets',
+      {package => 1, file => $mf, snippet => $approved_id, sline => 3, eline => 5, resolution => 'fold'});
+
+    my @rows = @{$app->snippets->unclassified({%base, search => "$approved_id"})->{snippets}};
+    is scalar @rows,   1,            'the id lookup returns exactly one row';
+    is $rows[0]->{id}, $approved_id, 'and it is the requested snippet';
+    ok !(grep { $_->{id} == $approved_id } @{$app->snippets->unclassified({%base})->{snippets}}),
+      'proof the bypass matters: the default view hides this approved snippet';
+    is scalar(@{$app->snippets->unclassified({%base, search => '999999999'})->{snippets}}), 0,
+      'a non-existent id returns nothing';
   };
 
   subtest 'fold + search compose (the proactive-audit path)' => sub {
@@ -575,6 +593,45 @@ subtest 'snippet_search excludes obsolete packages' => sub {
     is $occ[0]{file},    'current/live.txt', 'obsolete file path is not shown';
     is $occ[0]{package}, 1,                  'group=none exposes the actionable package_id';
   };
+};
+
+# Indexing records a file only once something matched in it, so the files whose license text nobody has a
+# pattern for yet are exactly the ones with no row to attach a snippet to.
+subtest 'A file nothing matched in can still start a snippet' => sub {
+  my $app = $t->app;
+  my $db  = $app->pg->db;
+  my $pkg = $app->packages->find(1);
+  my $new = path($cavil_test->checkout_dir, $pkg->{name}, $pkg->{checkout_dir}, '.unpacked', 'NOVEL-TERMS.txt');
+  $new->spew("Custom terms nobody has a pattern for.\nA second line of them.\n");
+
+  my $row = {package => 1, filename => 'NOVEL-TERMS.txt', generation => 0};
+  is $db->select('matched_files', 'id', $row)->hash, undef, 'indexing never recorded the file';
+
+  ok my $snippet = $app->snippets->from_file_path(1, 'NOVEL-TERMS.txt', 1, 2), 'the range becomes a snippet anyway';
+  ok my $file    = $db->select('matched_files', 'id', $row)->hash, 'the file it hangs off was created for it';
+  my $occurrence = $db->select('file_snippets', ['sline', 'eline'], {snippet => $snippet, file => $file->{id}})->hash;
+  is_deeply $occurrence, {sline => 1, eline => 2}, 'linked to the lines that were selected';
+
+  is $app->snippets->from_file_path(1, 'NOVEL-TERMS.txt', 1, 2), $snippet, 'asking twice reuses both';
+  is $db->select('matched_files', 'id', $row)->hashes->size,     1,        'without a second file row';
+
+  is $app->snippets->from_file_path(1, 'gone.txt', 1, 2), undef, 'a path that is not in the checkout is refused';
+};
+
+# The path comes from a URL and from AI tool calls, and creating the row on demand means it is no longer
+# indexing that decides which files can be read
+subtest 'Only files inside the package can start a snippet' => sub {
+  my $app      = $t->app;
+  my $pkg      = $app->packages->find(1);
+  my $unpacked = path($cavil_test->checkout_dir, $pkg->{name}, $pkg->{checkout_dir}, '.unpacked');
+
+  is $app->snippets->from_file_path(1, '../../../../../../../etc/hostname', 1, 1), undef, 'no climbing out';
+
+  symlink '/etc/hostname', $unpacked->child('ESCAPE.txt')->to_string or die "Cannot symlink: $!";
+  is $app->snippets->from_file_path(1, 'ESCAPE.txt', 1, 1), undef, 'and no symlink out of the checkout';
+
+  is $app->pg->db->select('matched_files', 'id', {package => 1, filename => 'ESCAPE.txt'})->hash, undef,
+    'a refused path leaves no file row behind';
 };
 
 done_testing();

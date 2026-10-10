@@ -1,17 +1,5 @@
-# Copyright (C) 2022 SUSE Linux GmbH
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Controller::Pagination;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
@@ -82,12 +70,15 @@ sub known_products ($self) {
   $v->optional('limit')->num;
   $v->optional('offset')->num;
   $v->optional('filter');
+  $v->optional('grouped');
   return $self->reply->json_validation_error if $v->has_error;
-  my $limit  = $v->param('limit')  // 10;
-  my $offset = $v->param('offset') // 0;
-  my $search = $v->param('filter') // '';
+  my $limit   = $v->param('limit')   // 10;
+  my $offset  = $v->param('offset')  // 0;
+  my $search  = $v->param('filter')  // '';
+  my $grouped = $v->param('grouped') // 'true';
 
-  my $page = $self->products->paginate_known_products({limit => $limit, offset => $offset, search => $search});
+  my $page = $self->products->paginate_known_products(
+    {limit => $limit, offset => $offset, search => $search, grouped => $grouped});
   $self->render(json => $page);
 }
 
@@ -98,6 +89,7 @@ sub open_reviews ($self) {
   $v->optional('priority')->num;
   $v->optional('inProgress');
   $v->optional('notEmbargoed');
+  $v->optional('annotated');
   $v->optional('filter');
   return $self->reply->json_validation_error if $v->has_error;
   my $limit         = $v->param('limit')        // 10;
@@ -105,16 +97,19 @@ sub open_reviews ($self) {
   my $priority      = $v->param('priority')     // 2;
   my $in_progress   = $v->param('inProgress')   // 'false';
   my $not_embargoed = $v->param('notEmbargoed') // 'false';
+  my $annotated     = $v->param('annotated')    // 'false';
   my $search        = $v->param('filter')       // '';
 
   my $page = $self->packages->paginate_open_reviews(
     {
-      limit         => $limit,
-      offset        => $offset,
-      in_progress   => $in_progress,
-      not_embargoed => $not_embargoed,
-      priority      => $priority,
-      search        => $search
+      limit               => $limit,
+      offset              => $offset,
+      in_progress         => $in_progress,
+      not_embargoed       => $not_embargoed,
+      priority            => $priority,
+      search              => $search,
+      notes               => $annotated eq 'true' ? 'with' : 'any',
+      include_lawyer_only => $self->_can_see_lawyer_only
     }
   );
   $self->render(json => $self->_mark_active_packages($page));
@@ -131,6 +126,7 @@ sub product_reviews ($self) {
   $v->optional('exportRestricted');
   $v->optional('cla');
   $v->optional('eula');
+  $v->optional('annotated');
   $v->optional('filter');
   return $self->reply->json_validation_error if $v->has_error;
   my $limit              = $v->param('limit')             // 10;
@@ -142,22 +138,25 @@ sub product_reviews ($self) {
   my $export_restricted  = $v->param('exportRestricted')  // 'false';
   my $cla                = $v->param('cla')               // 'false';
   my $eula               = $v->param('eula')              // 'false';
+  my $annotated          = $v->param('annotated')         // 'false';
   my $search             = $v->param('filter')            // '';
 
   my $name = $self->stash('name');
   my $page = $self->packages->paginate_product_reviews(
     $name,
     {
-      limit              => $limit,
-      offset             => $offset,
-      attention          => $attention,
-      unresolved_matches => $unresolved_matches,
-      patent             => $patent,
-      trademark          => $trademark,
-      export_restricted  => $export_restricted,
-      cla                => $cla,
-      eula               => $eula,
-      search             => $search
+      limit               => $limit,
+      offset              => $offset,
+      attention           => $attention,
+      unresolved_matches  => $unresolved_matches,
+      patent              => $patent,
+      trademark           => $trademark,
+      export_restricted   => $export_restricted,
+      cla                 => $cla,
+      eula                => $eula,
+      search              => $search,
+      notes               => $annotated eq 'true' ? 'with' : 'any',
+      include_lawyer_only => $self->_can_see_lawyer_only
     }
   );
   $self->render(json => $self->_mark_active_packages($page));
@@ -226,16 +225,55 @@ sub review_search ($self) {
   $self->render(json => $self->_mark_active_packages($page));
 }
 
+sub ephemeral_reviews ($self) {
+  my $v = $self->validation;
+  $v->optional('limit')->num;
+  $v->optional('offset')->num;
+  $v->optional('filter');
+  return $self->reply->json_validation_error if $v->has_error;
+  my $limit  = $v->param('limit')  // 10;
+  my $offset = $v->param('offset') // 0;
+  my $search = $v->param('filter') // '';
+
+  my $page = $self->packages->paginate_ephemeral_reviews({limit => $limit, offset => $offset, search => $search});
+  $self->_mark_active_packages($page);
+
+  # Scheduled deletion time, same formula as the report metadata (created + the configured TTL).
+  my $hours = $self->app->config->{hours_to_keep_ephemeral_packages} // 24;
+  $_->{ephemeral_delete} = $_->{created_epoch} + $hours * 3600 for @{$page->{page}};
+
+  $self->render(json => $page);
+}
+
 sub _mark_active_packages ($self, $page) {
   my $minion = $self->minion;
   my $config = $self->app->config;
+
+  # One query for the whole page; the review search names the column "package" instead of "name"
+  my $rows
+    = [map { {id => $_->{id}, name => $_->{name} // $_->{package}, checksum => $_->{checksum}} } @{$page->{page}}];
+  my $notes = $self->notes->relevant_notes($rows, include_lawyer_only => $self->_can_see_lawyer_only);
+
   for my $pkg (@{$page->{page}}) {
     my $id = $pkg->{id};
     $pkg->{external_link_data} = external_link_data($pkg->{external_link}, $config->{external_link_sources});
     $pkg->{active_jobs}        = $minion->jobs({states => ['inactive', 'active'], notes => ["pkg_$id"]})->total;
     $pkg->{failed_jobs}        = $minion->jobs({states => ['failed'], notes => ["pkg_$id"]})->total;
+    $pkg->{relevant_note}      = _note_state($notes->{$id});
   }
   return $page;
 }
+
+# Strongest state wins: a limitation, an agent review, a human review, or just a note
+sub _note_state ($relevant) {
+  return undef unless $relevant;
+  return 'limitation' if $relevant->{limitation};
+  return 'ai_review'  if $relevant->{ai};
+  return 'review'     if $relevant->{review};
+  return 'note';
+}
+
+# A note icon would give away the existence of a lawyer-only note to someone who cannot read it
+sub _can_see_lawyer_only ($self) { $self->current_user_can('curate') ? 1 : 0 }
 
 1;

@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -88,11 +76,10 @@ subtest 'Details after import (indexing in progress)' => sub {
     ->status_is(200)
     ->json_is('/package_name',   'perl-Mojolicious')
     ->json_is('/state',          'new')
-    ->json_is('/unpacked_files', undef);
+    ->json_is('/unpacked_files', undef)
+    ->json_is('/declarations',   []);
 
-  $t->json_is('/errors', [])->json_is('/warnings', []);
-
-  $t->get_ok('/reviews/report/1')->status_is(408)->content_like(qr/not indexed/);
+  $t->get_ok('/reviews/report/1')->status_is(408)->json_is('/stage' => 'queued');
   $t->get_ok('/reviews/report_details/1')
     ->status_is(408)
     ->json_is('/error', 'not indexed')
@@ -114,26 +101,14 @@ subtest 'Details after indexing' => sub {
 
   $t->get_ok('/reviews/meta/1')
     ->status_is(200)
-    ->json_like('/package_license/name', qr!Artistic-2.0!)
-    ->json_is('/package_license/spdx', 1)
+    ->json_is('/declarations/0/license', 'Artistic-2.0')
     ->json_like('/package_version',        qr!7\.25!)
     ->json_like('/package_summary',        qr!Real-time web framework!)
-    ->json_like('/package_group',          qr!Development/Libraries/Perl!)
     ->json_like('/package_url',            qr!http://search\.cpan\.org/dist/Mojolicious/!)
     ->json_like('/state',                  qr!new!)
     ->json_like('/legal_review_notices/0', qr!Upstream project maintained by SUSE employee!)
     ->json_is('/unpacked_files', 339)
     ->json_is('/unpacked_size',  '2.5MiB');
-
-  $t->json_like('/package_files/0/file',       qr/perl-Mojolicious\.spec/)
-    ->json_like('/package_files/0/licenses/0', qr/Artistic-2.0/)
-    ->json_like('/package_files/0/version',    qr/7\.25/)
-    ->json_like('/package_files/0/sources/0',  qr/http:\/\/www\.cpan\.org/)
-    ->json_like('/package_files/0/summary',    qr/Real-time web framework/)
-    ->json_like('/package_files/0/url',        qr/http:\/\//)
-    ->json_like('/package_files/0/group',      qr/Development\/Libraries\/Perl/);
-
-  $t->json_is('/errors', [])->json_is('/warnings', []);
 
   $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
 };
@@ -166,51 +141,24 @@ subtest 'Details after indexing' => sub {
 
   $t->get_ok('/reviews/meta/1')
     ->status_is(200)
-    ->json_like('/package_license/name', qr!Artistic-2.0!)
-    ->json_is('/package_license/spdx', 1)
+    ->json_is('/declarations/0/license', 'Artistic-2.0')
     ->json_like('/package_version', qr!7\.25!)
     ->json_like('/package_summary', qr!Real-time web framework!)
-    ->json_like('/package_group',   qr!Development/Libraries/Perl!)
     ->json_like('/package_url',     qr!http://search\.cpan\.org/dist/Mojolicious/!)
     ->json_like('/state',           qr!new!);
 
+  $t->get_ok('/reviews/report_artifacts/1')
+    ->status_is(200)
+    ->json_like('/emails/values/0/0',     qr!coolo\@suse\.com!)
+    ->json_like('/urls/values/0/0',       qr!http://mojolicious.org!)
+    ->json_like('/copyrights/values/0/0', qr!Copyright!);
   $t->get_ok('/reviews/report_details/1')
     ->status_is(200)
-    ->json_like('/emails/0/0', qr!coolo\@suse\.com!)
-    ->json_like('/urls/0/0',   qr!http://mojolicious.org!)
-    ->json_has('/files/0/id')
-    ->json_has('/files/0/path')
-    ->json_like('/files/0/file_url', qr!/reviews/file_view/1/!)
+    ->json_hasnt('/files')
     ->json_has('/chart/licenses')
     ->json_has('/chart/num-files')
     ->json_has('/chart/colours')
     ->json_has('/risks');
-
-  subtest 'Expanded file limit' => sub {
-    my $db       = $t->app->pg->db;
-    my $row      = $db->select('bot_reports', 'ldig_report', {package => 1})->hash;
-    my $original = $row->{ldig_report};
-    my $dig      = Mojo::JSON::from_json($original);
-    my $fpid     = 999998;
-    for my $id (9100 .. 9249) {
-      $dig->{files}{$id}           = "fake/missed/missed$id.txt";
-      $dig->{missed_snippets}{$id} = [[1, 1, $id, 'deadbeef', 0.1, $fpid]];
-      $dig->{missed_files}{$id}    = [9, 0.1, 'Keyword', undef];
-    }
-    $db->update('bot_reports', {ldig_report => Mojo::JSON::to_json($dig)}, {package => 1});
-
-    $t->get_ok('/reviews/report_details/1')->status_is(200);
-    my $details = $t->tx->res->json;
-    my $expand  = grep { $_->{expand} } @{$details->{files}};
-    cmp_ok $expand,                     '<=', 100,     'expand=true count capped at max_expanded_files';
-    cmp_ok scalar @{$details->{files}}, '>',  $expand, 'remaining files are sent collapsed';
-    is $details->{max_expanded_files}, 100, 'max_expanded_files reported in response';
-    cmp_ok $details->{hidden_inline_previews}, '>', 0, 'hidden_inline_previews counts missed files past the inline cap';
-    is $details->{hidden_inline_previews}, scalar(@{$details->{missed_files}}) - $expand,
-      'hidden_inline_previews equals total missed files minus inline-expanded ones';
-
-    $db->update('bot_reports', {ldig_report => $original}, {package => 1});
-  };
 
   $t->get_ok('/reviews/fetch_source/1')
     ->status_is(200)
@@ -220,7 +168,41 @@ subtest 'Details after indexing' => sub {
   $t->get_ok('/reviews/fetch_source/1.json')
     ->status_is(200)
     ->content_type_is('application/json;charset=UTF-8')
-    ->json_like('/source/name', qr/perl-Mojolicious/);
+    ->json_like('/source/name', qr/perl-Mojolicious/)
+    ->json_hasnt('/source/total');
+
+  subtest 'Source scoped to one report row' => sub {
+    my $js     = 'Mojolicious-7.25/lib/Mojolicious/resources/public/mojo/prettify/run_prettify.processed.js';
+    my $risk   = $t->get_ok('/reviews/report_details/1')->tx->res->json->{risks}{5};
+    my ($file) = grep { $_->[1] eq $js } map { @{$_->{files}} } grep { $_->{name} eq 'Apache-2.0' } @$risk;
+    my $url    = "/reviews/fetch_source/$file->[0].json?license=Apache-2.0&risk=5";
+
+    my $source = $t->get_ok($url)->status_is(200)->json_is('/source/total', 4)->tx->res->json->{source};
+    my @starts = grep { $_->[1]{end} } @{$source->{lines}};
+    is scalar @starts, 4, 'every match of the license is shown';
+    ok !(grep { $_->[1]{pid} && $_->[1]{name} ne 'Apache-2.0' } @{$source->{lines}}), 'no other license is shown';
+
+    $source = $t->get_ok("$url&groups=1")->status_is(200)->json_is('/source/total', 4)->tx->res->json->{source};
+    @starts = grep { $_->[1]{end} } @{$source->{lines}};
+    is scalar @starts, 1, 'only the first match is shown';
+    ok !$starts[0][1]{nextend}, 'no match to step to beyond the page';
+
+    my $end = $starts[0][1]{end};
+    $source = $t->get_ok("$url&groups=1&start=$end&end=" . ($end + 2))->status_is(200)->tx->res->json->{source};
+    ok !(grep { $_->[1]{pid} && $_->[1]{name} ne 'Apache-2.0' } @{$source->{lines}}), 'extending keeps the scope';
+    ok grep({ $_->[0] == $end + 5 } @{$source->{lines}}), 'extended range comes with context';
+
+    $t->get_ok('/reviews/fetch_source/1.json?license=Apache-2.0')->status_is(400);
+    $t->get_ok('/reviews/fetch_source/1.json?groups=0')->status_is(400);
+    $t->get_ok('/reviews/fetch_source/1.json?license=')->status_is(400);
+    $t->get_ok('/reviews/fetch_source/1.json?license=&risk=5')->status_is(200)->json_is('/source/total', 0);
+
+    $source = $t->get_ok('/reviews/fetch_source/5.json?unresolved=1')->status_is(200)->tx->res->json->{source};
+    ok $source->{total}, 'unresolved snippets are counted';
+    my @marked = grep { $_->[1]{risk} } @{$source->{lines}};
+    ok @marked,                               'unresolved snippets are shown';
+    ok !(grep { !$_->[1]{snippet} } @marked), 'only unresolved snippets are shown';
+  };
 
   subtest 'Vue file browser metadata' => sub {
     $t->get_ok('/reviews/file_view_meta/1/')
@@ -231,8 +213,7 @@ subtest 'Details after indexing' => sub {
       ->json_has('/entries/0/name')
       ->json_has('/breadcrumbs/0/url');
 
-    $t->get_ok('/reviews/report_details/1')->status_is(200);
-    my $path = $t->tx->res->json->{files}[0]{path};
+    my $path = 'Mojolicious-7.25/lib/Mojolicious.pm';
     my $url  = join '/', map { url_escape $_ } split '/', $path;
     $t->get_ok("/reviews/file_view_meta/1/$url")
       ->status_is(200)
@@ -249,23 +230,117 @@ subtest 'Details after indexing' => sub {
     cmp_ok scalar @{$source->{lines}}, '>', 1000, 'file browser returns the whole source file';
     ok grep({ $_->[1]{pid} } @{$source->{lines}}), 'whole source file keeps pattern annotations';
 
-    local $t->app->config->{max_file_browser_size} = 10;
-    my $package = $t->app->packages->find(1);
-    my $large
-      = $cavil_test->checkout_dir->child('perl-Mojolicious', $package->{checkout_dir}, '.unpacked', 'large.txt');
-    $large->spurt("This file is too large for the configured browser limit.\n");
-    $t->get_ok('/reviews/file_view_meta/1/large.txt')
+    # A file over the limit is shown one window at a time, from wherever the reviewer asks for
+    local $t->app->config->{max_file_browser_size} = 400;
+    my $package  = $t->app->packages->find(1);
+    my $unpacked = $cavil_test->checkout_dir->child('perl-Mojolicious', $package->{checkout_dir}, '.unpacked');
+    $unpacked->child('large.txt')->spurt(join '', map {"line $_ padding padding padding\n"} 1 .. 50);
+    my $window
+      = $t->get_ok('/reviews/file_view_meta/1/large.txt')
       ->status_is(200)
-      ->json_is('/kind',             'file')
-      ->json_is('/source/filename',  'large.txt')
-      ->json_is('/source/oversized', 1)
-      ->json_is('/source/maxSize',   10)
-      ->json_has('/source/sizeLabel')
-      ->json_has('/source/maxSizeLabel')
-      ->json_hasnt('/source/lines');
+      ->json_is('/source/filename',            'large.txt')
+      ->json_is('/source/window/from',         1)
+      ->json_is('/source/window/more',         1)
+      ->json_is('/source/window/matchesAbove', 0)
+      ->json_is('/source/window/matchesBelow', 0)
+      ->json_is('/source/lines/0/2',           'line 1 padding padding padding')
+      ->tx->res->json->{source};
+    my $to = $window->{window}{to};
+    cmp_ok $to, '<', 50, 'window does not show the whole file';
+    is $window->{lines}[-1][0], $to, 'window ends where it says';
+
+    $window
+      = $t->get_ok('/reviews/file_view_meta/1/large.txt?from=' . ($to + 1))
+      ->status_is(200)
+      ->json_is('/source/window/from', $to + 1)
+      ->json_is('/source/lines/0/0',   $to + 1)
+      ->json_is('/source/lines/0/2',   'line ' . ($to + 1) . ' padding padding padding');
+    $window
+      = $t->get_ok('/reviews/file_view_meta/1/large.txt?from=45')
+      ->status_is(200)
+      ->json_is('/source/window/to',   50)
+      ->json_is('/source/window/more', 0)
+      ->tx->res->json->{source};
+    is $window->{lines}[-1][2], 'line 50 padding padding padding', 'last window ends with the file';
+
+    # One line longer than the budget (minified code) is clipped instead of read whole
+    $unpacked->child('minified.js')->spurt(('x' x 1000) . "\nnext\n");
+    $t->get_ok('/reviews/file_view_meta/1/minified.js')
+      ->status_is(200)
+      ->json_is('/source/lines/0/2',   'x' x 400)
+      ->json_is('/source/window/to',   1)
+      ->json_is('/source/window/more', 1);
+    $unpacked->child($_)->remove for qw(large.txt minified.js);
 
     $t->get_ok('/reviews/file_view_meta/1/does-not-exist')->status_is(404);
     $t->get_ok('/reviews/file_view_meta/1/../COPYING')->status_is(400);
+  };
+
+  subtest 'file browser download' => sub {
+    my $path = 'Mojolicious-7.25/lib/Mojolicious.pm';
+    $t->get_ok("/reviews/file_view_meta/1/$path")->json_is('/source/rawUrl', "/reviews/file_raw/1/$path");
+
+    my $package  = $t->app->packages->find(1);
+    my $unpacked = $cavil_test->checkout_dir->child('perl-Mojolicious', $package->{checkout_dir}, '.unpacked');
+    $t->get_ok("/reviews/file_raw/1/$path")
+      ->status_is(200)
+      ->content_type_is('application/octet-stream')
+      ->header_is('X-Content-Type-Options' => 'nosniff')
+      ->header_is('Content-Disposition' => q{attachment; filename="Mojolicious.pm"; filename*=UTF-8''Mojolicious.pm});
+    ok $t->tx->res->body eq $unpacked->child($path)->slurp, 'the download is the file byte for byte';
+
+    # Too large for the browser to show at once, still downloaded whole
+    local $t->app->config->{max_file_browser_size} = 400;
+    $unpacked->child('large.txt')->spurt(join '', map {"line $_ padding padding padding\n"} 1 .. 50);
+    $t->get_ok('/reviews/file_raw/1/large.txt')->status_is(200);
+    is length $t->tx->res->body, -s $unpacked->child('large.txt'), 'large file is downloaded whole';
+
+    # Package content never renders on this origin, and odd names cannot break out of the header
+    $unpacked->child(qq{evil "page".html})->spurt('<script>alert(1)</script>');
+    $t->get_ok('/reviews/file_raw/1/' . url_escape(qq{evil "page".html}))
+      ->status_is(200)
+      ->content_type_is('application/octet-stream')
+      ->header_is(
+      'Content-Disposition' => q{attachment; filename="evil _page_.html"; filename*=UTF-8''evil%20%22page%22.html});
+    $unpacked->child("caf\x{e9}.txt")->spurt('x');
+    $t->get_ok('/reviews/file_raw/1/caf%C3%A9.txt')
+      ->status_is(200)
+      ->header_is('Content-Disposition' => q{attachment; filename="caf_.txt"; filename*=UTF-8''caf%C3%A9.txt});
+    $unpacked->child($_)->remove for 'large.txt', qq{evil "page".html}, "caf\x{e9}.txt";
+
+    $t->get_ok('/reviews/file_raw/1/Mojolicious-7.25')->status_is(404);
+    $t->get_ok('/reviews/file_raw/1/does-not-exist')->status_is(404);
+  };
+
+  subtest 'file browser stays inside the package' => sub {
+    my $package  = $t->app->packages->find(1);
+    my $unpacked = $cavil_test->checkout_dir->child('perl-Mojolicious', $package->{checkout_dir}, '.unpacked');
+    my $secret   = $unpacked->dirname->child('secret.txt')->spew('SECRET');
+
+    # Archives unpack their symlinks as they are, pointing anywhere
+    symlink "$secret",                             $unpacked->child('absolute-link');
+    symlink '../secret.txt',                       $unpacked->child('relative-link');
+    symlink "@{[$unpacked->dirname]}",             $unpacked->child('dir-link');
+    symlink 'Mojolicious-7.25/lib/Mojolicious.pm', $unpacked->child('inside-link');
+
+    my @escapes = (
+      '../secret.txt',         '%2e%2e/secret.txt',  '%2E%2E%2Fsecret.txt',        '..%2fsecret.txt',
+      '.%2e/secret.txt',       'a/../../secret.txt', 'x/%2e%2e/%2e%2e/secret.txt', '..\\secret.txt',
+      '%252e%252e/secret.txt', '/etc/passwd',        '%2Fetc%2Fpasswd',            'absolute-link',
+      'relative-link',         'dir-link',           'dir-link/secret.txt'
+    );
+    for my $route (qw(file_raw file_view_meta file_view)) {
+      for my $escape (@escapes) {
+        my $res = $t->ua->get("/reviews/$route/1/$escape")->result;
+        ok $res->code == 400 || $res->code == 404, "$route refuses $escape";
+        unlike $res->body, qr/SECRET|root:/, "$route leaks nothing for $escape";
+      }
+    }
+
+    # A link that stays inside the package is just another name for one of its files
+    $t->get_ok('/reviews/file_raw/1/inside-link')->status_is(200)->content_like(qr/package Mojolicious/);
+
+    $_->remove for $secret, map { $unpacked->child($_) } qw(absolute-link relative-link dir-link inside-link);
   };
 
   $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
@@ -364,18 +439,19 @@ subtest 'Details after reindexing' => sub {
   $t->get_ok('/reviews/meta/1')
     ->status_is(200)
     ->json_has('/package_shortname')
-    ->json_like('/package_license/name', qr!Artistic-2.0!)
-    ->json_is('/package_license/spdx', 1)
+    ->json_is('/declarations/0/license', 'Artistic-2.0')
     ->json_like('/package_version', qr!7\.25!)
     ->json_like('/package_summary', qr!Real-time web framework!)
-    ->json_like('/package_group',   qr!Development/Libraries/Perl!)
     ->json_like('/package_url',     qr!http://search\.cpan\.org/dist/Mojolicious/!)
     ->json_like('/state',           qr!new!);
 
+  $t->get_ok('/reviews/report_artifacts/1')
+    ->status_is(200)
+    ->json_like('/emails/values/0/0',     qr!coolo\@suse\.com!)
+    ->json_like('/urls/values/0/0',       qr!http://mojolicious.org!)
+    ->json_like('/copyrights/values/0/0', qr!Copyright!);
   $t->get_ok('/reviews/report_details/1')
     ->status_is(200)
-    ->json_like('/emails/0/0', qr!coolo\@suse\.com!)
-    ->json_like('/urls/0/0',   qr!http://mojolicious.org!)
     ->json_has('/chart/licenses')
     ->json_has('/chart/num-files')
     ->json_has('/chart/colours')
@@ -419,19 +495,20 @@ subtest 'Manual review' => sub {
   $t->get_ok('/reviews/meta/1')
     ->status_is(200)
     ->json_has('/package_shortname')
-    ->json_like('/package_license/name', qr!Artistic-2.0!)
-    ->json_is('/package_license/spdx', 1)
+    ->json_is('/declarations/0/license', 'Artistic-2.0')
     ->json_like('/package_version', qr!7\.25!)
     ->json_like('/package_summary', qr!Real-time web framework!)
-    ->json_like('/package_group',   qr!Development/Libraries/Perl!)
     ->json_like('/package_url',     qr!http://search\.cpan\.org/dist/Mojolicious/!)
     ->json_like('/state',           qr!acceptable!)
     ->json_like('/result',          qr/Test review/);
 
+  $t->get_ok('/reviews/report_artifacts/1')
+    ->status_is(200)
+    ->json_like('/emails/values/0/0',     qr!coolo\@suse\.com!)
+    ->json_like('/urls/values/0/0',       qr!http://mojolicious.org!)
+    ->json_like('/copyrights/values/0/0', qr!Copyright!);
   $t->get_ok('/reviews/report_details/1')
     ->status_is(200)
-    ->json_like('/emails/0/0', qr!coolo\@suse\.com!)
-    ->json_like('/urls/0/0',   qr!http://mojolicious.org!)
     ->json_has('/chart/licenses')
     ->json_is('/missed_files/1/name',     'Mojolicious-7.25/LICENSE')
     ->json_is('/missed_files/1/license',  'Keyword')
@@ -537,6 +614,28 @@ subtest 'Fasttrack review' => sub {
   # An empty comment falls back to the default
   $t->post_ok('/reviews/fasttrack_package/1' => form => {comment => ''})->status_is(200)->json_is('/ok', 1);
   is $t->app->packages->find(1)->{result}, 'Reviewed ok', 'default comment';
+
+  $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
+};
+
+subtest 'Scoped source for licenses sharing a line at the same risk' => sub {
+  $t->get_ok('/login')->status_is(302)->header_is(Location => '/');
+
+  # Joins "powerful web development toolkit" (SUSE-NotALicense) on the same README line, one wins the line
+  $t->app->patterns->create(pattern => 'that you can use for all kinds of', license => 'Any reference local');
+  $t->app->patterns->expire_cache;
+  $t->app->packages->reindex(1);
+  $t->app->minion->perform_jobs;
+
+  my $risk = $t->get_ok('/reviews/report_details/1')->tx->res->json->{risks}{5};
+  for my $license ('SUSE-NotALicense', 'Any reference local') {
+    my ($file)
+      = grep { $_->[1] eq 'Mojolicious-7.25/README.processed.md' }
+      map { @{$_->{files}} } grep { $_->{name} eq $license } @$risk;
+    my $url    = "/reviews/fetch_source/$file->[0].json?license=" . url_escape($license) . '&risk=5';
+    my $source = $t->get_ok($url)->status_is(200)->json_is('/source/total', 1)->tx->res->json->{source};
+    ok grep({ ($_->[1]{name} // '') eq $license } @{$source->{lines}}), "$license line is shown";
+  }
 
   $t->get_ok('/logout')->status_is(302)->header_is(Location => '/');
 };

@@ -2,6 +2,22 @@
 
 ## REST API
 
+### Endpoint index
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | [`/package/<package_id>`](#get-package-status) | Get package status |
+| `PATCH` | [`/package/<package_id>`](#update-package-information) | Update package information |
+| `POST` | [`/packages`](#create-a-package) | Create a package from a remote source |
+| `POST` | [`/packages/upload`](#upload-a-package) | Create a package from a source archive |
+| `POST` | [`/packages/import/<package_id>`](#re-import-a-package) | Re-import an existing package |
+| `GET` | [`/package/<package_id>/report.txt`](#get-a-package-report) | Get a plain-text legal report |
+| `POST` | [`/requests`](#create-a-review-request) | Create a package review request |
+| `GET` | [`/requests`](#list-review-requests) | List open review requests |
+| `DELETE` | [`/requests`](#delete-review-requests) | Delete review requests |
+| `PATCH` | [`/products/<product_name>`](#update-a-product) | Update the packages in a product |
+| `DELETE` | [`/products`](#delete-a-product) | Delete a product |
+
 ### Authentication
 
 All bot API endpoints use previously configured access tokens for authentication. These tokens are passed with every
@@ -66,6 +82,8 @@ Content-Encoding: gzip
 
 ### Packages
 
+#### Get package status
+
 `GET /package/<package_id>`
 
 Get package status in JSON format.
@@ -114,7 +132,7 @@ Content-Type: application/json
 }
 ```
 
----
+#### Update package information
 
 `PATCH /package/<package_id>`
 
@@ -172,7 +190,7 @@ Content-Type: application/json
 }
 ```
 
----
+#### Create a package
 
 `POST /packages`
 
@@ -195,6 +213,12 @@ Create package.
                               source links with labels.
 
 * `priority` (optional): Priority of this package review.
+
+* `tags` (optional): Free-form labels to attach to the review, shown to reviewers and usable for prioritization. Repeat
+                     the parameter for multiple values (`tags=security&tags=needs-legal`) or pass a JSON array string as
+                     `tags_json`. For Open Build Service imports, a single `CVE` tag is added automatically when the
+                     request references any CVE. Tags are merged with any already on the package (deduplicated); a
+                     maximum of 16 tags of up to 32 characters each is enforced.
 
 ```
 POST /packages
@@ -248,7 +272,100 @@ Content-Type: application/json
 }
 ```
 
----
+#### Upload a package
+
+`POST /packages/upload`
+
+Create a package by uploading a source archive directly, instead of having Cavil check it out from a remote. Useful
+when the sources are prepared elsewhere (for example a CI pipeline that has already resolved dependencies) and pushed
+in. The review (unpack, indexing, report) is started automatically, just like for `POST /packages`.
+
+The request is a `multipart/form-data` upload rather than a URL-encoded form.
+
+**Request parameters:**
+
+* `name` (required): Package name, used for the checkout directory and queue.
+
+* `priority` (required): Priority of this package review.
+
+* `tarball` (required): The source archive file. Its size is limited by the instance's `max_request_size` setting
+                        (250 MiB by default).
+
+* `checksum` (required): MD5 checksum of the archive, in lower-case hex. The upload is rejected with a `Checksum
+                         mismatch` error if the received bytes do not match, so a truncated or corrupt archive can
+                         never start a review over incomplete sources.
+
+* `external_link` (optional): Short string describing the package source. Configured `external_link_sources` can render
+                              values like `obs#123`, `ibs#123`, `soo#org/package!123` and `ssd#org/package!123` as
+                              source links with labels.
+
+```
+POST /packages/upload
+Authorization: Token configured_access_token_here
+Accept: application/json
+Content-Type: multipart/form-data; boundary=...
+
+...multipart body with name, priority, checksum, external_link and the tarball file...
+```
+
+**Request body:**
+
+The `multipart/form-data` encoded form values, including the archive as the `tarball` file part.
+
+**Response:**
+
+Uploading the same archive under the same name again is idempotent: the existing package is returned with `duplicate`
+set to `true`, and no second review is started.
+
+```
+HTTP/1.1 200 OK
+Content-Length: 458
+Content-Type: application/json
+
+{
+  "duplicate": false,
+  "saved": {
+    "checkout_dir": "c1ffb4256878c64eb0e40c48f36d24d2",
+    "checksum": null,
+    "created": "2024-02-23 15:59:28+01",
+    "created_epoch": "1708700368.000000",
+    "export_restricted": 0,
+    "cla": 0,
+    "eula": 0,
+    "external_link": "gh#org/package!123",
+    "id": 23,
+    "imported": "2024-02-23 15:59:28.521134+01",
+    "indexed": null,
+    "login": null,
+    "name": "perl-Mojolicious",
+    "obsolete": 0,
+    "patent": 0,
+    "priority": 5,
+    "requesting_user": 1,
+    "result": null,
+    "reviewed": null,
+    "reviewed_epoch": null,
+    "reviewing_user": null,
+    "source": 1,
+    "state": "new",
+    "trademark": 0,
+    "unpacked": null
+  }
+}
+```
+
+A `checksum` that does not match the uploaded archive is rejected.
+
+```
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+
+{
+  "error": "Checksum mismatch"
+}
+```
+
+#### Re-import a package
 
 `POST /packages/import/<package_id>`
 
@@ -263,6 +380,9 @@ Re-import package. Usually used to reopen a review after it has already been obs
 * `external_link` (optional): Short string describing the package source. Configured `external_link_sources` can render
                               values like `obs#123`, `ibs#123`, `soo#org/package!123` and `ssd#org/package!123` as
                               source links with labels.
+
+* `tags` (optional): Free-form labels to merge onto the review (see `POST /packages`). Repeat the parameter or pass a
+                     JSON array string as `tags_json`.
 
 ```
 POST /packages/import/23
@@ -316,11 +436,12 @@ Content-Type: application/json
 }
 ```
 
----
+#### Get a package report
 
 `GET /package/<package_id>/report.txt`
 
-Get package legal report in plain text format.
+Get package legal report in plain text format. Limitations set for the package come first, under their own
+heading.
 
 **Request parameters:**
 
@@ -347,9 +468,12 @@ Checkout: 4fcfdab0e71b0bebfdf8b5cc3badfec4
 
 ### Requests
 
+#### Create a review request
+
 `POST /requests`
 
-Create request for package.
+Create request for package. An accepted package whose name has a limitation note goes back to `new` for a human
+review when a request it has not seen before is added.
 
 **Request parameters:**
 
@@ -385,7 +509,7 @@ Content-Type: application/json
 }
 ```
 
----
+#### List review requests
 
 `GET /requests`
 
@@ -417,7 +541,7 @@ Content-Type: application/json
 }
 ```
 
----
+#### Delete review requests
 
 `DELETE /requests`
 
@@ -458,6 +582,8 @@ Content-Type: application/json
 
 ### Products
 
+#### Update a product
+
 `PATCH /products/<product_name>`
 
 Update packages belonging to product.
@@ -492,7 +618,7 @@ Content-Type: application/json
 }
 ```
 
----
+#### Delete a product
 
 `DELETE /products`
 

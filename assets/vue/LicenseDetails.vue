@@ -29,16 +29,38 @@
           >
           <span v-for="risk in risks" :key="risk" class="badge" :class="riskClass(risk)">Risk {{ risk }}</span>
         </div>
-        <form v-if="canCurate" class="license-spdx-form" @submit.prevent="saveSpdx">
-          <input type="hidden" name="license" :value="details.license" />
-          <label class="form-label" for="license-spdx">SPDX</label>
-          <div class="license-spdx-control">
-            <input v-model="spdx" type="text" id="license-spdx" name="spdx" class="form-control" />
-            <button type="submit" class="btn btn-secondary" :disabled="savingSpdx">
-              <i v-if="savingSpdx" class="fa-solid fa-rotate fa-spin"></i>
+        <form
+          v-if="canCurate && details.license"
+          id="license-edit-form"
+          class="license-edit-form"
+          @submit.prevent="saveLicense"
+        >
+          <div class="license-edit-grid">
+            <label class="license-edit-field" for="license-edit-name">
+              <span class="form-label">License name</span>
+              <input v-model="newLicense" type="text" id="license-edit-name" class="form-control" />
+            </label>
+            <label class="license-edit-field" for="license-edit-risk">
+              <span class="form-label">Risk</span>
+              <select v-model="riskChoice" id="license-edit-risk" class="form-select">
+                <option value="">Keep current</option>
+                <option v-for="r in 10" :key="r - 1" :value="String(r - 1)">{{ r - 1 }}</option>
+              </select>
+            </label>
+            <label class="license-edit-field" for="license-edit-spdx">
+              <span class="form-label">SPDX</span>
+              <input v-model="spdx" type="text" id="license-edit-spdx" class="form-control" />
+            </label>
+            <button type="submit" class="btn btn-secondary license-edit-save" :disabled="saving">
+              <i v-if="saving" class="fa-solid fa-rotate fa-spin"></i>
               Save
             </button>
           </div>
+          <p v-if="risks.length > 1" class="license-edit-warning">
+            <i class="fa-solid fa-triangle-exclamation"></i>
+            These patterns span multiple risk levels ({{ risks.join(', ') }}). Choosing a risk sets all
+            {{ patterns.length }} patterns to it.
+          </p>
         </form>
         <div v-else class="license-details-spdx">
           <span class="license-details-spdx-label">SPDX</span>
@@ -166,6 +188,7 @@
 <script>
 import LegalLoading from './components/LegalLoading.vue';
 import PatternEditor from './components/PatternEditor.vue';
+import {PATTERN_FLAGS} from './components/PatternFlags.vue';
 import ToastNotifier from './components/ToastNotifier.vue';
 import UserAgent from '@mojojs/user-agent';
 import moment from 'moment';
@@ -183,7 +206,9 @@ export default {
       riskFilter: 'all',
       scopeFilter: 'all',
       spdx: '',
-      savingSpdx: false,
+      newLicense: '',
+      riskChoice: '',
+      saving: false,
       editingId: null,
       editorVersion: 0,
       expandedIds: new Set(),
@@ -253,6 +278,8 @@ export default {
         this.details = details;
         this.patterns = details.patterns;
         this.spdx = details.spdx ?? '';
+        this.newLicense = details.license ?? '';
+        this.riskChoice = this.risks.length === 1 ? String(this.risks[0]) : '';
         loaded = true;
       } catch (error) {
         this.error = error.message;
@@ -286,13 +313,7 @@ export default {
       return 'cavil-risk-unknown-badge';
     },
     flagsFor(pattern) {
-      const flags = [];
-      if (pattern.patent) flags.push('Patent');
-      if (pattern.trademark) flags.push('Trademark');
-      if (pattern.export_restricted) flags.push('Export restricted');
-      if (pattern.cla) flags.push('CLA');
-      if (pattern.eula) flags.push('EULA');
-      return flags;
+      return PATTERN_FLAGS.filter(flag => pattern[flag.name]).map(flag => flag.label);
     },
     countsKnown(pattern) {
       return (
@@ -331,23 +352,40 @@ export default {
       this.editingId = this.editingId === id ? null : id;
       this.editorVersion++;
     },
-    async saveSpdx() {
-      this.savingSpdx = true;
+    async saveLicense() {
+      const renamed = this.newLicense !== this.details.license;
+      const changes = [];
+      if (renamed) changes.push(`rename "${this.details.license}" to "${this.newLicense}"`);
+      if (this.riskChoice !== '')
+        changes.push(`set the risk of all ${this.patterns.length} patterns to ${this.riskChoice}`);
+      changes.push(this.spdx ? `set the SPDX identifier to "${this.spdx}"` : 'clear the SPDX identifier');
+      if (!window.confirm(`This will ${changes.join(', ')}, and reindex every affected package. Continue?`)) return;
+
+      this.saving = true;
       try {
-        const res = await this.ua.post(this.detailUrl, {form: {license: this.details.license, spdx: this.spdx}});
+        const form = {license: this.details.license, new_license: this.newLicense, spdx: this.spdx};
+        if (this.riskChoice !== '') form.risk = this.riskChoice;
+        const res = await this.ua.post(this.detailUrl, {form});
         const data = await res.json();
-        if (!res.isSuccess) throw new Error(data.error || `SPDX update failed with HTTP ${res.statusCode}`);
+        if (!res.isSuccess) throw new Error(data.error || `Update failed with HTTP ${res.statusCode}`);
+
+        // The whole page keys on the license name, so a rename has to reload under the new name.
+        if (data.renamed) {
+          window.location = `/licenses/${encodeURIComponent(this.newLicense)}`;
+          return;
+        }
         this.details.spdx = data.spdx;
         this.details.spdx_html = data.spdx_html;
         this.patterns.forEach(pattern => {
           pattern.spdx = data.spdx;
           pattern.spdx_html = data.spdx_html;
+          if (this.riskChoice !== '') pattern.risk = Number(this.riskChoice);
         });
         this.$refs.toaster?.notify(`${data.updated} patterns updated`);
       } catch (error) {
         this.$refs.toaster?.notify(error.message, 'danger', 5000);
       } finally {
-        this.savingSpdx = false;
+        this.saving = false;
       }
     },
     async onPatternSaved() {
@@ -370,22 +408,22 @@ export default {
 }
 .license-details-loading,
 .license-empty-state {
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   padding: 1rem;
   text-align: center;
 }
 .license-details-header {
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
   margin-bottom: 1rem;
   overflow: hidden;
 }
 .license-details-title-row {
   align-items: flex-start;
-  background: #f6f8fa;
-  border-bottom: 1px solid #d0d7de;
+  background: var(--cavil-canvas-subtle);
+  border-bottom: 1px solid var(--cavil-border);
   display: flex;
   gap: 1rem;
   justify-content: space-between;
@@ -398,13 +436,12 @@ export default {
   overflow-wrap: anywhere;
 }
 .license-details-kicker {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 13px;
   margin-bottom: 0.25rem;
 }
 .license-details-meta-row,
-.license-details-spdx,
-.license-spdx-form {
+.license-details-spdx {
   align-items: center;
   display: flex;
   flex-wrap: wrap;
@@ -413,20 +450,37 @@ export default {
 }
 .license-details-stat,
 .license-details-spdx-label {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 14px;
 }
-.license-spdx-form {
-  border-top: 1px solid #d0d7de;
+.license-edit-form {
+  border-top: 1px solid var(--cavil-border);
+  padding: 0.75rem 1rem;
 }
-.license-spdx-form .form-label {
+.license-edit-grid {
+  align-items: end;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: minmax(220px, 2fr) minmax(120px, auto) minmax(160px, 1fr) auto;
+}
+.license-edit-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
   margin: 0;
 }
-.license-spdx-control {
+.license-edit-field .form-label {
+  color: var(--cavil-fg-muted);
+  font-size: 13px;
+  margin: 0;
+}
+.license-edit-warning {
+  align-items: baseline;
+  color: var(--cavil-attention-deep);
   display: flex;
-  flex: 1;
-  gap: 0.5rem;
-  min-width: 260px;
+  font-size: 13px;
+  gap: 0.4rem;
+  margin: 0.75rem 0 0;
 }
 .license-details-toolbar {
   align-items: center;
@@ -439,7 +493,7 @@ export default {
   position: relative;
 }
 .license-filter-search i {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   left: 0.75rem;
   position: absolute;
   top: 50%;
@@ -453,13 +507,13 @@ export default {
   min-width: 130px;
 }
 .license-details-count {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-size: 14px;
   text-align: right;
   white-space: nowrap;
 }
 .license-pattern-card {
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
   margin-bottom: 1rem;
   overflow: hidden;
@@ -467,18 +521,18 @@ export default {
 .license-pattern-header,
 .license-pattern-footer {
   align-items: center;
-  background: #f6f8fa;
+  background: var(--cavil-canvas-subtle);
   display: flex;
   gap: 0.75rem;
   justify-content: space-between;
   padding: 0.6rem 0.75rem;
 }
 .license-pattern-header {
-  border-bottom: 1px solid #d0d7de;
+  border-bottom: 1px solid var(--cavil-border);
 }
 .license-pattern-footer {
-  border-top: 1px solid #d0d7de;
-  color: #57606a;
+  border-top: 1px solid var(--cavil-border);
+  color: var(--cavil-fg-muted);
   flex-wrap: wrap;
   font-size: 13px;
 }
@@ -490,15 +544,15 @@ export default {
   gap: 0.4rem;
 }
 .license-pattern-id {
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   font-family: monospace;
   font-size: 13px;
 }
 .license-chip {
   align-items: center;
-  border: 1px solid #d0d7de;
+  border: 1px solid var(--cavil-border);
   border-radius: 999px;
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   display: inline-flex;
   font-size: 12px;
   gap: 0.3rem;
@@ -506,12 +560,12 @@ export default {
   padding: 0.2rem 0.45rem;
 }
 .license-chip-flag {
-  background: #fff8c5;
-  border-color: #d4a72c;
-  color: #7d4e00;
+  background: var(--cavil-attention-bg);
+  border-color: var(--cavil-attention-5);
+  color: var(--cavil-attention-deep);
 }
 .license-pattern-code {
-  background: #ffffff;
+  background: var(--cavil-canvas);
   overflow: auto;
 }
 .license-pattern-code table {
@@ -529,8 +583,8 @@ export default {
   vertical-align: top;
 }
 .license-pattern-code td.linenumber {
-  border-right: 1px solid #ddd;
-  color: rgba(27, 31, 35, 0.3);
+  border-right: 1px solid var(--cavil-border-faint);
+  color: var(--cavil-linenumber);
   min-width: 25px;
   padding: 0 0.5em;
   margin-right: 0.5em;
@@ -539,27 +593,27 @@ export default {
   width: 1%;
 }
 .license-pattern-code td.code {
-  color: #24292f;
+  color: var(--cavil-fg-emphasis);
   padding-left: 0.75rem;
   padding-right: 0.75rem;
   white-space: pre-wrap;
   word-break: break-word;
 }
 .license-expand-button {
-  background: #ffffff;
+  background: var(--cavil-canvas);
   border: 0;
-  border-top: 1px solid #d0d7de;
-  color: #0969da;
+  border-top: 1px solid var(--cavil-border);
+  color: var(--cavil-accent);
   font-size: 13px;
   padding: 0.45rem 0.75rem;
   text-align: left;
   width: 100%;
 }
 .license-expand-button:hover {
-  background: #f6f8fa;
+  background: var(--cavil-canvas-subtle);
 }
 .license-inline-editor {
-  border-top: 1px solid #d0d7de;
+  border-top: 1px solid var(--cavil-border);
   padding: 1rem;
 }
 @media (max-width: 800px) {
@@ -569,9 +623,11 @@ export default {
   .license-details-count {
     text-align: left;
   }
-  .license-spdx-control,
   .license-details-title-row {
     flex-direction: column;
+  }
+  .license-edit-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

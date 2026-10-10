@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 use Mojo::Base -strict, -signatures;
 
 # Coverage
@@ -36,6 +39,9 @@ $config->{snippet_fold}
   = {enabled => 1, threshold => 0.95, min_margin => 0.15, max_risk => 5, overlap_clear => 1, overlap_guard => 0.9}
   if $fixtures eq 'snippet_overlap';
 
+# Small enough that a few kilobytes of source already trips the file browser's truncation path
+$config->{max_file_browser_size} = 2000 if $fixtures eq 'large_file';
+
 my $app = Test::Mojo->new(Cavil => $config)->app;
 $daemon->app($app);
 $app->log->level('warn');
@@ -44,9 +50,12 @@ elsif ($fixtures eq 'snippet_clear')   { $cavil_test->snippet_clear_fixtures($ap
 elsif ($fixtures eq 'snippet_triage')  { $cavil_test->snippet_triage_fixtures($app) }
 elsif ($fixtures eq 'snippet_overlap') { $cavil_test->snippet_overlap_fixtures($app) }
 elsif ($fixtures eq 'report_notice')   { $cavil_test->report_notice_fixtures($app) }
+elsif ($fixtures eq 'large_file')      { $cavil_test->large_file_fixtures($app) }
 elsif ($fixtures eq 'compatibility')   { $cavil_test->compatibility_fixtures($app) }
+elsif ($fixtures eq 'legal_documents') { $cavil_test->legal_documents_fixtures($app) }
 elsif ($fixtures eq 'obligations')     { $cavil_test->obligations_fixtures($app) }
 else                                   { $cavil_test->ui_fixtures($app) }
+
 my %report_state_original;
 
 sub _save_report_state ($c, $id) {
@@ -89,6 +98,18 @@ $app->routes->get(
       login => 'contrib_tester',
       email => 'contrib_tester@example.com',
       roles => ['contributor']
+    );
+    $c->session(user => $user->{login});
+    $c->redirect_to('dashboard');
+  }
+);
+
+$app->routes->get(
+  '/login_as_uploader' => sub ($c) {
+    my $user = $c->users->find_or_create(
+      login => 'uploader_tester',
+      email => 'uploader_tester@example.com',
+      roles => ['uploader']
     );
     $c->session(user => $user->{login});
     $c->redirect_to('dashboard');
@@ -150,6 +171,51 @@ $app->routes->get(
     my $db = $c->app->pg->db;
     $db->update('bot_packages', {obsolete => $original->{obsolete}, state => $original->{state}}, {id => $id});
     $db->update('bot_reports', {ldig_report => $original->{ldig_report}}, {package => $id});
+    $c->render(text => 'ok');
+  }
+);
+
+# Two AI proposals about one legal text, carrying the server-computed evidence the MCP propose tool stores
+$app->routes->get(
+  '/test/evidence_proposals' => sub ($c) {
+    my $patterns = $c->app->patterns;
+    my $snippet  = $c->app->pg->db->query('SELECT id FROM snippets ORDER BY id LIMIT 1')->hash->{id};
+    for my $n (1, 2) {
+      my $pattern = "Copyright \$SKIP5 Evidence Corp spec notice $n. All rights reserved";
+      $patterns->_insert_pattern_proposal(
+        $c->app->pg->db,
+        'create_pattern',
+        Cavil::Util::pattern_checksum($pattern),
+        snippet     => $snippet,
+        pattern     => $pattern,
+        license     => 'Any Proprietary',
+        risk        => 7,
+        owner       => $c->app->users->find(login => 'tester')->{id},
+        ai_assisted => 1,
+        reason      => "**Any Proprietary, risk 7.** Follows #1",
+        family      => 'Evidence Corp spec notice',
+        evidence    => {
+          alignment => {
+            lines => [1, 1],
+            text  => "Copyright 2024 Evidence Corp spec notice $n. All rights reserved.",
+            skips => [{skip => 5, words => '2024 evidence corp'}]
+          },
+          precedent => {
+            verdict => {status => 'consensus', classes => [{license => 'Any Proprietary', risk => 7, ids => [1]}]},
+            rows    => [
+              {id => 1, license => 'Any Proprietary', risk => 7, contained => 1, pattern_cov => 1, text_cov => 0.9},
+              {id => 2, license => 'Any specification license', risk => 3, pattern_cov => 0.6, text_cov => 0.3}
+            ]
+          },
+          impact => {
+            snippets => 3,
+            packages => 2,
+            capped   => 0,
+            samples => [{snippet => $snippet, package => 1, name => 'evidence-pkg', filename => 'a/NOTICE', sline => 4}]
+          }
+        }
+      );
+    }
     $c->render(text => 'ok');
   }
 );

@@ -6,7 +6,7 @@
     filter-aria-label="Open review filters"
     filter-input-id="open-reviews-filter-input"
     filter-label="Filter reviews"
-    filter-placeholder="Filter reviews"
+    filter-placeholder="Filter reviews (try tag=CVE)"
     plural="open reviews"
     singular="open review"
     :start="start"
@@ -17,6 +17,17 @@
     @update:filter="filter = $event"
   >
     <template #controls>
+      <button
+        id="cavil-pkg-annotated"
+        @click="toggleFilter('annotated')"
+        :aria-pressed="params.annotated.toString()"
+        :class="{'is-active': params.annotated}"
+        type="button"
+        class="cavil-list-toggle"
+      >
+        <i v-if="params.annotated" class="fa-solid fa-check" aria-hidden="true"></i>
+        Annotated
+      </button>
       <button
         id="cavil-pkg-in-progress"
         @click="toggleFilter('inProgress')"
@@ -55,7 +66,7 @@
       </label>
     </template>
 
-    <table class="cavil-list-table table">
+    <table class="cavil-list-table cavil-review-docket-table table">
       <thead>
         <tr>
           <th class="priority">Priority</th>
@@ -75,7 +86,12 @@
       <tbody v-else-if="reviews.length > 0">
         <tr v-for="review in reviews" :key="review.id">
           <td class="cavil-list-priority"><PriorityBadge :priority.sync="review.priority" /></td>
-          <td class="cavil-list-link"><ExternalLink :link="review.externalLink" /></td>
+          <td class="cavil-list-link">
+            <div class="cavil-list-link-inner">
+              <ExternalLink :link="review.externalLink" />
+              <CveBadge :tags="review.tags" @filter="applyFilter" />
+            </div>
+          </td>
           <td class="relative-time cavil-list-time">{{ review.imported }}</td>
           <td class="cavil-list-package" v-html="review.package"></td>
           <td class="cavil-list-report" v-html="review.report"></td>
@@ -94,6 +110,7 @@
 
 <script>
 import CavilListLayout from './components/CavilListLayout.vue';
+import CveBadge from './components/CveBadge.vue';
 import EmptyState from './components/EmptyState.vue';
 import ExternalLink from './components/ExternalLink.vue';
 import LegalLoading from './components/LegalLoading.vue';
@@ -106,12 +123,13 @@ import moment from 'moment';
 export default {
   name: 'OpenReviews',
   mixins: [Refresh],
-  components: {CavilListLayout, EmptyState, ExternalLink, LegalLoading, PriorityBadge},
+  components: {CavilListLayout, CveBadge, EmptyState, ExternalLink, LegalLoading, PriorityBadge},
   data() {
     const params = getParams({
       limit: 10,
       offset: 0,
       inProgress: false,
+      annotated: false,
       priority: 2,
       filter: ''
     });
@@ -152,10 +170,11 @@ export default {
         reviews.push({
           id: review.id,
           externalLink: review.external_link_data ?? review.external_link,
-          imported: moment(review.imported_epoch * 1000).fromNow(),
+          imported: review.imported_epoch ? moment(review.imported_epoch * 1000).fromNow() : '',
           package: packageLink(review),
           priority: review.priority,
-          report: reportLink(review)
+          report: reportLink(review),
+          tags: review.tags
         });
       }
       this.reviews = reviews;
@@ -169,10 +188,16 @@ export default {
       this.cancelApiRefresh();
       this.reviews = null;
       this.doApiRefresh();
+    },
+    applyFilter(val) {
+      // filterNow must run after the `filter` watcher has copied the value into params, or the refresh
+      // fires with the old filter and the table does not actually change.
+      this.filter = val;
+      this.$nextTick(this.filterNow);
     }
   },
   watch: {
-    ...genParamWatchers('limit', 'offset', 'inProgress', 'priority'),
+    ...genParamWatchers('limit', 'offset', 'inProgress', 'annotated', 'priority'),
     filter: function (val) {
       this.params.filter = val;
       this.params.offset = 0;

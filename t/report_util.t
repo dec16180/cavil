@@ -1,17 +1,5 @@
-# Copyright (C) 2024 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -19,11 +7,13 @@ use Test::More;
 use Mojo::File qw(path);
 use Mojo::JSON qw(from_json);
 use Cavil::ReportUtil (
-  qw(estimated_risk hard_incompatibilities is_license_filename license_classification license_compatibility),
-  qw(license_obligations license_obligation_ids minimal_snippet new_license_names new_unresolved_files),
-  qw(overlapping_licenses report_checksum report_shortname),
+  qw(estimated_risk hard_incompatibilities incompatibility_location is_license_filename is_vendored_path),
+  qw(license_classification license_compatibility license_document_candidates license_obligations),
+  qw(license_obligation_ids minimal_snippet),
+  qw(new_license_names new_unresolved_files overlapping_licenses peripheral_scope ranked_incompatibilities),
+  qw(report_checksum report_risk report_shortname),
   qw(should_clear_boilerplate should_cover_snippet should_fold_snippet should_overlap_clear smart_edit_snippet),
-  qw(spdx_edit_snippet summary_delta summary_delta_score)
+  qw(spdx_edit_snippet summary_delta summary_delta_score unexplained_lines)
 );
 
 # A small injectable OSADL-style matrix (outbound -> inbound), so the compatibility tests do not depend
@@ -40,6 +30,19 @@ my $TEST_MATRIX = {
   'Zlib'         => {'libpng-2.0'   => {compatibility => 'Unknown', explanation => 'zlib<-libpng unknown'}}
 };
 use Cavil::Util qw(SNIPPET_SCORE_VERSION extract_spdx_identifiers);
+
+subtest 'is_vendored_path' => sub {
+  ok is_vendored_path($_), "$_ is vendored" for qw(
+    vendor/foo.c third_party/foo.c 3rdparty/foo.c node_modules/pkg/index.js src/vendor/foo.c
+    gomodcache/x.go a/b/vendored/c.rb
+  );
+  ok is_vendored_path('vendor.obscpio._/curl/http.c'), 'an OBS vendored cpio segment is vendored';
+
+  # The package's own code - source, tests, docs - is not vendored, so its declared license applies.
+  ok !is_vendored_path($_), "$_ is not vendored" for qw(
+    src/main.c lib/Mojo/DOM.pm README.md t/basic.t test/foo.c docs/guide.md examples/demo.c COPYING
+  );
+};
 
 subtest 'estimated_risk' => sub {
   subtest 'Risk 0' => sub {
@@ -152,8 +155,10 @@ subtest 'estimated_risk' => sub {
 
 subtest 'license_compatibility' => sub {
   subtest 'No present licenses' => sub {
-    is_deeply license_compatibility({},               $TEST_MATRIX), {licenses => [], matrix => {}}, 'nothing present';
-    is_deeply license_compatibility({licenses => {}}, $TEST_MATRIX), {licenses => [], matrix => {}}, 'no spdx';
+    is_deeply license_compatibility({}, $TEST_MATRIX), {licenses => [], matrix => {}, proximity => {}},
+      'nothing present';
+    is_deeply license_compatibility({licenses => {}}, $TEST_MATRIX), {licenses => [], matrix => {}, proximity => {}},
+      'no spdx';
   };
 
   subtest 'Directional sub-matrix among present licenses' => sub {
@@ -178,7 +183,7 @@ subtest 'license_compatibility' => sub {
 
     # A pair whose only relationship is "Unknown" does not put the licenses on the axes.
     my $unknown = license_compatibility({licenses => {map { $_ => {spdx => $_} } qw(Zlib libpng-2.0)}}, $TEST_MATRIX);
-    is_deeply $unknown, {licenses => [], matrix => {}}, 'Unknown-only relationship is not surfaced';
+    is_deeply $unknown, {licenses => [], matrix => {}, proximity => {}}, 'Unknown-only relationship is not surfaced';
   };
 
   subtest 'Compound expressions, keyword matches and the Classpath exception' => sub {
@@ -188,7 +193,8 @@ subtest 'license_compatibility' => sub {
     my $compat = license_compatibility($report, $TEST_MATRIX);
     is $compat->{matrix}{'MIT'}{'GPL-2.0-only'}{compatibility}, 'No', 'compound expression split into identifiers';
 
-    # Keyword-matched files contribute their spdx (missed_files element [3]).
+    # Keyword-matched files contribute their guessed spdx (missed_files element [3]) so a reviewer sees the
+    # possible incompatibility; proximity carries the low confidence, the matrix never hides the pair.
     $report = {
       licenses     => {'Apache-2.0' => {spdx => 'Apache-2.0'}},
       missed_files => {9            => [7, '0.5', 'GPL-2.0', 'GPL-2.0-only']}
@@ -201,7 +207,7 @@ subtest 'license_compatibility' => sub {
       = {licenses =>
         {'Excepted' => {spdx => 'GPL-2.0-only WITH Classpath-exception-2.0'}, 'Apache' => {spdx => 'Apache-2.0'}}
       };
-    is_deeply license_compatibility($report, $TEST_MATRIX), {licenses => [], matrix => {}},
+    is_deeply license_compatibility($report, $TEST_MATRIX), {licenses => [], matrix => {}, proximity => {}},
       'Classpath exception permits combining GPL with Apache-2.0';
 
     # ... but a plain GPL-2.0-only elsewhere in the same expression is still counted.
@@ -224,6 +230,280 @@ subtest 'license_compatibility' => sub {
   };
 };
 
+subtest 'license_compatibility proximity ranking' => sub {
+
+  # A raw dig report (pre-sanitize): files keyed by id, licensed matches in risks{risk}{name}{pid} =>
+  # [file ids] with the SPDX string on licenses{name}, keyword matches in missed_files{filename}[3].
+  subtest 'Deepest common directory per flagged pair' => sub {
+    my $report = {
+      files    => {1 => 'src/net/tls.c', 2 => 'src/net/http.c', 3 => 'docs/readme.txt'},
+      licenses => {'Apache-2.0' => {spdx => 'Apache-2.0'}, 'GPL-2.0-only' => {spdx => 'GPL-2.0-only'}},
+      risks    => {
+        5 => {
+          'Apache-2.0'   => {100 => [1]},      # src/net/tls.c
+          'GPL-2.0-only' => {101 => [2, 3]}    # src/net/http.c and docs/readme.txt
+        }
+      }
+    };
+    my $prox = license_compatibility($report, $TEST_MATRIX)->{proximity};
+
+    # Closest Apache/GPL files share src/net (depth 2), not the shallower shared root.
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{lca_depth}, 2, 'ranked by the deepest shared directory';
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{same_file}, 0, 'not a same-file co-occurrence';
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{tier},      0, 'src co-location is shipped source';
+    is_deeply $prox->{'Apache-2.0'}{'GPL-2.0-only'}{files}, ['src/net/tls.c', 'src/net/http.c'],
+      'representative closest file pair';
+  };
+
+  subtest 'Distant licenses meet only at the package root' => sub {
+    my $report = {
+      files    => {1 => 'vendor/apache/a.c', 2 => 'core/gpl/b.c'},
+      licenses => {'Apache-2.0' => {spdx => 'Apache-2.0'}, 'GPL-2.0-only' => {spdx => 'GPL-2.0-only'}},
+      risks    => {5 => {'Apache-2.0' => {100 => [1]}, 'GPL-2.0-only' => {101 => [2]}}}
+    };
+    my $prox = license_compatibility($report, $TEST_MATRIX)->{proximity};
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{lca_depth}, 0, 'only co-located at the root (least interesting)';
+  };
+
+  subtest 'Same file carrying both licenses is the strongest signal' => sub {
+    my $report = {
+      files    => {1       => 'lib/mix.c'},
+      licenses => {'Combo' => {spdx    => 'Apache-2.0 AND GPL-2.0-only'}},
+      risks    => {5       => {'Combo' => {100 => [1]}}}
+    };
+    my $prox = license_compatibility($report, $TEST_MATRIX)->{proximity};
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{same_file}, 1, 'same-file co-occurrence flagged';
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{lca_depth}, 1, 'depth is that of the file directory';
+    is_deeply $prox->{'Apache-2.0'}{'GPL-2.0-only'}{files}, ['lib/mix.c', 'lib/mix.c'], 'both sides are the one file';
+  };
+
+  subtest 'Same-file overrides a shallower directory-level co-location' => sub {
+    my $report = {
+      files    => {1 => 'a/only_apache.c', 2 => 'b/mix.c'},
+      licenses => {'Apache-2.0' => {spdx => 'Apache-2.0'}, 'Combo' => {spdx => 'Apache-2.0 AND GPL-2.0-only'}},
+      risks    => {5 => {'Apache-2.0' => {100 => [1]}, 'Combo' => {101 => [2]}}}
+    };
+    my $prox = license_compatibility($report, $TEST_MATRIX)->{proximity};
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{same_file}, 1, 'the same-file hit wins over the root-level pair';
+  };
+
+  subtest 'Vendored and peripheral files are ranked below source' => sub {
+
+    # The pair meets deep inside src (depth 2) and also in a test fixture: the source co-location wins.
+    my $report = {
+      files    => {1 => 'src/net/tls.c', 2 => 'src/net/http.c', 3 => 'tests/fixtures/both_licenses.c'},
+      licenses => {'Apache-2.0' => {spdx => 'Apache-2.0'}, 'GPL-2.0-only' => {spdx => 'GPL-2.0-only'}},
+      risks    => {5 => {'Apache-2.0' => {100 => [1]}, 'GPL-2.0-only' => {101 => [2]}, 'Combo' => {102 => [3]}}}
+    };
+
+    # A file that carries both, but only under tests/, must not outrank the real source pair.
+    $report->{licenses}{'Combo'} = {spdx => 'Apache-2.0 AND GPL-2.0-only'};
+    my $prox = license_compatibility($report, $TEST_MATRIX)->{proximity};
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{tier},      0, 'source co-location preferred over a peripheral same-file';
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{same_file}, 0, 'the peripheral same-file does not win';
+    is $prox->{'Apache-2.0'}{'GPL-2.0-only'}{lca_depth}, 2, 'keeps the real src/net depth';
+
+    # With only the vendored evidence, the pair is surfaced in the vendored tier: that code can still be
+    # linked into the build, so it is not as dismissible as a test fixture.
+    my $only = {
+      files    => {1       => 'third_party/foo/mix.c'},
+      licenses => {'Combo' => {spdx    => 'Apache-2.0 AND GPL-2.0-only'}},
+      risks    => {5       => {'Combo' => {100 => [1]}}}
+    };
+    my $pp = license_compatibility($only, $TEST_MATRIX)->{proximity};
+    is $pp->{'Apache-2.0'}{'GPL-2.0-only'}{tier},      1, 'vendored-only evidence is the vendored tier';
+    is $pp->{'Apache-2.0'}{'GPL-2.0-only'}{same_file}, 1, 'still reports it as a same-file co-occurrence';
+
+    # A vendored dependency's own tests are as ignorable as the package's own, so they lose to vendored code
+    # even though the test file is the stronger (same-file) evidence.
+    my $mixed = {
+      files    => {1 => 'vendor/foo/lib.c', 2 => 'vendor/foo/a.c', 3 => 'vendor/bar/test/mix.c'},
+      licenses => {
+        'Apache-2.0'   => {spdx => 'Apache-2.0'},
+        'GPL-2.0-only' => {spdx => 'GPL-2.0-only'},
+        'Combo'        => {spdx => 'Apache-2.0 AND GPL-2.0-only'}
+      },
+      risks => {5 => {'Apache-2.0' => {100 => [1]}, 'GPL-2.0-only' => {101 => [2]}, 'Combo' => {102 => [3]}}}
+    };
+    my $mp = license_compatibility($mixed, $TEST_MATRIX)->{proximity};
+    is $mp->{'Apache-2.0'}{'GPL-2.0-only'}{tier},      1, 'vendored code beats a test tree inside a vendored one';
+    is $mp->{'Apache-2.0'}{'GPL-2.0-only'}{same_file}, 0, 'so the vendored test fixture does not win';
+    is_deeply $mp->{'Apache-2.0'}{'GPL-2.0-only'}{files}, ['vendor/foo/lib.c', 'vendor/foo/a.c'],
+      'and it points at the vendored code';
+  };
+
+  subtest 'Confidence-first selection prefers real files over folds' => sub {
+
+    # Apache-2.0 and GPL-2.0-only both have real matches co-located in top/ (confidence 3), and also meet
+    # in one folded file deep/x/y/mix.c (confidence 2, same-file). The stronger real co-location must win,
+    # so the reviewer is sent to the real files - not the folded snippet - even though the fold is closer.
+    my $report = {
+      files           => {1 => 'top/a.c', 2 => 'top/b.c', 3 => 'deep/x/y/mix.c'},
+      licenses        => {'Apache-2.0' => {spdx => 'Apache-2.0'}, 'GPL-2.0-only' => {spdx => 'GPL-2.0-only'}},
+      risks           => {4 => {'Apache-2.0' => {10 => [1, 3]}, 'GPL-2.0-only' => {11 => [2, 3]}}},
+      file_confidence =>
+        {1 => {'Apache-2.0' => 3}, 2 => {'GPL-2.0-only' => 3}, 3 => {'Apache-2.0' => 3, 'GPL-2.0-only' => 2}}
+    };
+    my $p = license_compatibility($report, $TEST_MATRIX)->{proximity}{'Apache-2.0'}{'GPL-2.0-only'};
+    is $p->{confidence}, 3, 'chosen co-location is the real-match one';
+    is $p->{same_file},  0, 'the fold same-file is not chosen despite being closer';
+    is_deeply [sort @{$p->{files}}], ['top/a.c', 'top/b.c'], 'representative files are the real ones';
+  };
+
+  subtest 'Unresolved (missed) guesses co-locate same-file only, at low confidence' => sub {
+
+    # File 1 has a real Apache-2.0 match and an unresolved snippet the scorer guessed is GPL-2.0-only
+    # (missed_files, same file id). That same-file co-occurrence is surfaced at the lowest confidence - the
+    # kernel's ldcw.h case. An unresolved guess in a *sibling* file is deliberately NOT walked (too many
+    # unresolved matches in a big package to trace directories for), so only same-file guesses co-locate.
+    my $report = {
+      files        => {1            => 'src/app.c'},
+      licenses     => {'Apache-2.0' => {spdx         => 'Apache-2.0'}},
+      risks        => {5            => {'Apache-2.0' => {100 => [1]}}},
+      missed_files => {1            => [7, '0.5', 'GPL-2.0', 'GPL-2.0-only']}
+    };
+    my $compat = license_compatibility($report, $TEST_MATRIX);
+    is $compat->{matrix}{'Apache-2.0'}{'GPL-2.0-only'}{compatibility}, 'No', 'guessed license still on the matrix axes';
+    my $p = $compat->{proximity}{'Apache-2.0'}{'GPL-2.0-only'};
+    is $p->{same_file},  1, 'a real match and an unresolved guess in the one file';
+    is $p->{confidence}, 1, 'the weaker side is an unresolved guess, so confidence is lowest';
+  };
+
+  subtest 'Core evidence beats a higher-signal peripheral co-location' => sub {
+
+    # Both licenses' real texts sit adjacent in a license catalog (peripheral, same directory), while their
+    # real code matches are far apart (they meet only at the package root). The core root co-location must be
+    # chosen for research over the tidy peripheral catalog adjacency - the LICENSES/dual case.
+    my $report = {
+      files =>
+        {1 => 'LICENSES/dual/Apache-2.0', 2 => 'LICENSES/dual/GPL-2.0-only', 3 => 'drivers/a/x.c', 4 => 'net/b/y.c'},
+      licenses => {'Apache-2.0' => {spdx => 'Apache-2.0'}, 'GPL-2.0-only' => {spdx => 'GPL-2.0-only'}},
+      risks    => {5 => {'Apache-2.0' => {100 => [1, 3]}, 'GPL-2.0-only' => {101 => [2, 4]}}}
+    };
+    my $p = license_compatibility($report, $TEST_MATRIX)->{proximity}{'Apache-2.0'}{'GPL-2.0-only'};
+    is $p->{tier},      0, 'the core co-location is chosen over the peripheral license catalog';
+    is $p->{lca_depth}, 0, 'the real code meets only at the package root';
+  };
+
+  subtest 'No file evidence yields no proximity' => sub {
+    my $report = {licenses => {map { $_ => {spdx => $_} } qw(Apache-2.0 GPL-2.0-only)}};
+    my $compat = license_compatibility($report, $TEST_MATRIX);
+    is_deeply $compat->{licenses}, ['Apache-2.0', 'GPL-2.0-only'], 'still on the axes';
+    is_deeply $compat->{proximity}, {}, 'but nothing to rank without per-file data';
+  };
+
+  subtest 'An unresolved-only license is flagged and links to its unresolved match' => sub {
+
+    # GPL-3.0-only appears only as an unresolved-snippet guess (docs/notes.txt) and never shares a file with
+    # GPL-2.0-only. It still lands on the matrix axes and the pair is flagged, but there is no co-location -
+    # so proximity marks it no_colocation and points at the unresolved match's file so the reviewer can open
+    # and judge it. This is the linux GPL-3.0-only x Apache-2.0 case.
+    my $report = {
+      files        => {1              => 'src/app.c', 2 => 'docs/notes.txt'},
+      licenses     => {'GPL-2.0-only' => {spdx           => 'GPL-2.0-only'}},
+      risks        => {5              => {'GPL-2.0-only' => {100 => [1]}}},
+      missed_files => {2              => [9, '0.2', 'GPL-3.0', 'GPL-3.0-only']}
+    };
+    my $compat = license_compatibility($report, $TEST_MATRIX);
+    ok + (grep { $_ eq 'GPL-3.0-only' } @{$compat->{licenses}}), 'unresolved-only license is on the axes';
+    ok $compat->{matrix}{'GPL-2.0-only'}{'GPL-3.0-only'},        'and the pair is flagged';
+    my $p = $compat->{proximity}{'GPL-2.0-only'}{'GPL-3.0-only'};
+    ok $p->{no_colocation}, 'marked not co-located';
+    is_deeply $p->{files}, ['docs/notes.txt'], 'links to the unresolved match file, not the resolved side';
+  };
+
+  subtest 'Peripheral directory classification' => sub {
+
+    # A single file carrying both licenses is a same-file co-location whose tier is exactly the directory
+    # classification, so this pins the full test/docs/examples/vendored/license-catalog policy (and its
+    # non-matches) through the public API: 0 shipped source, 1 vendored code, 2 tests/docs/examples. Segments
+    # match at any depth and case-insensitively; a mere substring of a segment (testicular) or a
+    # license-named source file must NOT be demoted.
+    #
+    # OBS packs vendored trees into cpio archives, so a "node_modules"/"vendor" directory arrives decorated
+    # with the app name and the ".obscpio._" unpack marker (portal_node_modules.obscpio._); those must still
+    # be demoted. But the decoration alone is NOT enough: a package whose *primary* source is shipped as
+    # <name>.obscpio (obs_scm cpio mode) must stay core, or its real incompatibilities would be hidden - so
+    # only a decorated segment whose base is a known vendored marker is demoted.
+    my %expect = (
+      'src/app.c'                                                                       => 0,
+      'lib/net/x.c'                                                                     => 0,
+      'gpl.c'                                                                           => 0,
+      'src/testicular/x.c'                                                              => 0,
+      'test/x.c'                                                                        => 2,
+      'tests/x.c'                                                                       => 2,
+      'a/testing/b/x.c'                                                                 => 2,
+      'doc/x.c'                                                                         => 2,
+      'docs/x.c'                                                                        => 2,
+      'documentation/x.c'                                                               => 2,
+      'examples/x.c'                                                                    => 2,
+      'sample/x.c'                                                                      => 2,
+      'vendor/x.c'                                                                      => 1,
+      'src/pip/_vendor/chardet/x.py'                                                    => 1,
+      'third_party/x.c'                                                                 => 1,
+      'third-party/x.c'                                                                 => 1,
+      '3rdparty/x.c'                                                                    => 1,
+      'contrib/x.c'                                                                     => 1,
+      'app/node_modules/foo/x.js'                                                       => 1,
+      'gomodcache/cache/download/golang.org/toolchain/@v/src/internal/profile/graph.go' => 1,
+      'LICENSES/x'                                                                      => 2,
+
+      # Tests, docs and examples stay ignorable inside a vendored tree, whichever segment comes first.
+      'app/node_modules/foo/test/x.js' => 2,
+      'vendor/foo/docs/x.md'           => 2,
+      'examples/vendor/foo/x.c'        => 2,
+
+      # OBS cpio-decorated vendored trees: demoted.
+      'portal_node_modules.obscpio._/package._1132/README.md' => 1,
+      'node_modules.obscpio._/foo/x.js'                       => 1,
+      'vendor.obscpio._/github.com/pkg/errors/x.go'           => 1,
+      'app_vendor.obscpio._/x.c'                              => 1,
+      'THIRD_PARTY.obscpio._/x.c'                             => 1,
+
+      # Decoration without a vendored marker base stays core: a main source packed as <name>.obscpio, and a
+      # dotted directory the gate must not over-match.
+      'linux.obscpio._/kernel/sched.c' => 0,
+      'mypackage.obscpio._/src/core.c' => 0,
+      'config.d/settings.c'            => 0,
+      'src/my_vendored_helpers/x.c'    => 0,
+
+      # Fixture directories whose names are language conventions rather than the bare word "test"
+      'harbor-2.15.1/src/pkg/chart/testdata/harbor-schema1/LICENSE' => 2,
+      'src/parser/test-data/sample.c'                               => 2,
+      'src/parser/test_data/sample.c'                               => 2,
+      'app/__tests__/helper.js'                                     => 2,
+      'lib/fixtures/payload.json'                                   => 2,
+
+      # The generic Go module cache path (pkg/mod) is deliberately NOT matched: "pkg" is a legitimate
+      # source directory in most Go projects, so demoting it would hide real code. Neither is "spec",
+      # which is a test directory in Ruby but a specification in plenty of other trees, nor Perl's "t".
+      'src/pkg/mod/golang.org/x/y.go' => 0,
+      'src/spec/parser.rb'            => 0,
+      't/basic.t'                     => 0
+    );
+    for my $path (sort keys %expect) {
+      my $report = {
+        files    => {1       => $path},
+        licenses => {'Combo' => {spdx    => 'Apache-2.0 AND GPL-2.0-only'}},
+        risks    => {5       => {'Combo' => {100 => [1]}}}
+      };
+      my $p = license_compatibility($report, $TEST_MATRIX)->{proximity}{'Apache-2.0'}{'GPL-2.0-only'};
+      is $p->{tier}, $expect{$path}, "$path -> tier $expect{$path}";
+    }
+  };
+};
+
+subtest 'incompatibility_location' => sub {
+  is incompatibility_location({same_file => 1, files => ['a/b/x.c', 'a/b/x.c']}), 'same file `a/b/x.c`', 'same file';
+  is incompatibility_location({files => ['a/b/x.c', 'a/b/x.c']}), 'same file `a/b/x.c`',
+    'identical paths read as same file';
+  is incompatibility_location({files => ['a/b/x.c', 'a/b/y.c']}), 'same directory `a/b`: `a/b/x.c`, `a/b/y.c`',
+    'same directory names both files';
+  is incompatibility_location({files => ['a/x.c', 'b/y.c']}), undef, 'different directories are not a location';
+  is incompatibility_location({files => ['x.c',   'y.c']}),   undef, 'meeting only at the root is not a location';
+  is incompatibility_location({files => []}), undef, 'no files';
+};
+
 subtest 'hard_incompatibilities' => sub {
   is_deeply hard_incompatibilities({}),                             [], 'empty';
   is_deeply hard_incompatibilities({licenses => [], matrix => {}}), [], 'nothing present';
@@ -235,6 +515,120 @@ subtest 'hard_incompatibilities' => sub {
   # so it is NOT a hard incompatibility.
   is_deeply hard_incompatibilities($compat), [['Apache-2.0', 'GPL-2.0-only'], ['GPL-2.0-only', 'GPL-3.0-only']],
     'mutual No pairs only, sorted; one-directional No excluded';
+};
+
+subtest 'ranked_incompatibilities' => sub {
+  my $compat = {
+    licenses => ['A', 'B', 'C', 'D'],
+    matrix   => {
+      'A' => {'B' => {compatibility => 'No'}},
+      'B' =>
+        {'A' => {compatibility => 'No'}, 'C' => {compatibility => 'No'}, 'D' => {compatibility => 'Check dependency'}},
+      'C' => {'B' => {compatibility => 'No'}}
+    },
+    proximity => {
+      'A' => {'B' => {confidence => 3, same_file => 0, lca_depth => 0, tier => 0, files => ['x.c', 'y.c']}},
+      'B' => {
+        'C' => {confidence => 2, same_file => 1, lca_depth => 2, tier => 0, files => ['s/m.c',      's/m.c']},
+        'D' => {confidence => 1, same_file => 0, lca_depth => 4, tier => 2, files => ['t/deep/a.c', 't/deep/b.c']}
+      }
+    }
+  };
+
+  subtest 'Confidence leads, then proximity' => sub {
+    my $ranked = ranked_incompatibilities($compat);
+    is scalar @$ranked, 3, 'one row per flagged pair (A-B, B-C mutual; B-D one-way check)';
+
+    # A-B is a real-match co-location (confidence 3), so it leads despite being root-only; B-C is a folded
+    # same-file (2); B-D is an unresolved guess (1). Confidence dominates proximity.
+    is_deeply [map {"$_->{a}-$_->{b}"} @$ranked], ['A-B', 'B-C', 'B-D'],
+      'real match first even at the root, fold next, unresolved last';
+
+    is_deeply $ranked->[0],
+      {
+      a             => 'A',
+      b             => 'B',
+      mutual        => 1,
+      no_colocation => 0,
+      confidence    => 3,
+      same_file     => 0,
+      lca_depth     => 0,
+      tier          => 0,
+      files         => ['x.c', 'y.c']
+      },
+      'row carries the pair, severity and proximity annotations';
+    is $ranked->[2]{mutual}, 0, 'B-D is one-directional (Check dependency), not mutual';
+    is $ranked->[2]{tier},   2, 'B-D evidence is a test tree';
+  };
+
+  is_deeply ranked_incompatibilities({}), [], 'no compatibility data';
+};
+
+subtest 'peripheral_scope' => sub {
+  is_deeply peripheral_scope(['a/vendor/x/LICENSE', 'a/node_modules/y/LICENSE']), ['vendored'],
+    'every file in a vendored tree';
+  is_deeply peripheral_scope(['a/testdata/x/LICENSE']),      ['test'],                  'Go fixture data';
+  is_deeply peripheral_scope(['a/doc/x', 'a/tests/y']),      ['documentation', 'test'], 'more than one kind, sorted';
+  is_deeply peripheral_scope(['vendor.obscpio._/pkg/x.go']), ['vendored'],              'an OBS-packed vendored tree';
+  is_deeply peripheral_scope(['a/vendor/foo/test/x.c']),     ['test'], 'a dependency test reads as a test';
+  is_deeply peripheral_scope(['a/licenses/GPL-2.0', 'a/LICENSES/MIT']), ['license catalog'],
+    'a license text collection';
+
+  # One file in shipped code is enough to say nothing: the marker exists to let a reader skip a license,
+  # so it must never appear while any of its matches could be the package's own code.
+  is peripheral_scope(['a/vendor/x/LICENSE', 'a/src/main.c']), undef, 'a single core file withholds it';
+  is peripheral_scope(['src/main.c']),                         undef, 'plain shipped code';
+  is peripheral_scope([]),                                     undef, 'no files at all is not vacuously peripheral';
+};
+
+subtest 'license_document_candidates' => sub {
+  my $report = sub {
+    my %files;
+    my $id = 1;
+    $files{$id++} = $_ for @_;
+    return {files => \%files};
+  };
+
+  subtest 'Picks the package license files and nothing else' => sub {
+    my $found = license_document_candidates(
+      $report->('LICENSE', 'src/engine.c', 'COPYING.LESSER', 'legal/NOTICE', 'README.md'));
+    is_deeply [map { $_->{path} } @{$found->{documents}}], ['COPYING.LESSER', 'LICENSE', 'legal/NOTICE'],
+      'shallowest first, then alphabetical';
+    is $found->{dropped}, 0, 'nothing dropped';
+  };
+
+  subtest 'Vendored trees and license-list reference data are left out' => sub {
+    my $found = license_document_candidates(
+      $report->('LICENSE', 'node_modules/foo/LICENSE', 'vendor/bar/COPYING', 'licenses/OGDL-Taiwan-1.0'));
+    is_deeply [map { $_->{path} } @{$found->{documents}}], ['LICENSE'], 'only the package own license file survives';
+  };
+
+  # The peripheral classifier is shared with the incompatibility proximity ranking, where docs are
+  # correctly uninteresting. It costs a license file that a project chose to keep under doc/, which is
+  # the deliberate trade for having one classifier rather than two that can disagree.
+  subtest 'Documentation directories are peripheral' => sub {
+    my $found = license_document_candidates($report->('LICENSE', 'doc/legal/COPYRIGHT', 'docs/LICENSE'));
+    is_deeply [map { $_->{path} } @{$found->{documents}}], ['LICENSE'], 'doc and docs are excluded with the rest';
+  };
+
+  subtest 'A big aggregation reports what it left out' => sub {
+    my $found = license_document_candidates($report->(map {"d$_/LICENSE"} 1 .. 30), 25);
+    is scalar @{$found->{documents}}, 25, 'capped';
+    is $found->{dropped},             5,  'and says how many were not listed';
+  };
+};
+
+subtest 'unexplained_lines' => sub {
+  my $lines = ['SPDX-License-Identifier: MIT', '', 'No evil.', 'No commercial use.', '   '];
+
+  is unexplained_lines([[1, 1]], $lines), 2, 'blank and whitespace-only lines never count';
+  is unexplained_lines([[1, 4]], $lines), 0, 'a match covering the text explains all of it';
+  is unexplained_lines([],       $lines), 3, 'nothing matched, every line of text is unexplained';
+  is unexplained_lines(undef,    $lines), 3, 'no spans at all behaves the same';
+  is unexplained_lines([[1, 1]], []),     0, 'an empty file has nothing to explain';
+
+  is unexplained_lines([[1, 3], [2, 4]],  $lines), 0, 'overlapping matches do not double count';
+  is unexplained_lines([[0, 1], [4, 99]], $lines), 1, 'spans reaching outside the file are clamped';
 };
 
 subtest 'license_obligation_ids' => sub {
@@ -615,34 +1009,37 @@ subtest 'spdx_edit_snippet' => sub {
 subtest 'report_checksum' => sub {
   subtest 'Specfile license' => sub {
     is report_checksum({}, {}), '1709a28fde41022c01762131a1711875', 'empty report';
-    is report_checksum({main => {license => 'MIT'}}, {}), '2d5198bd51f0617d05bf585eb3dc4758', 'specfile license only';
-    is report_checksum({main => {license => 'GPL-2.0+'}}, {}), '10371a26faed4e5fe9bac58c3b7b2c25',
+    is report_checksum({declarations => [{license => 'MIT'}]}, {}), '2d5198bd51f0617d05bf585eb3dc4758',
+      'declared license only';
+    is report_checksum({declarations => [{license => 'GPL-2.0+'}]}, {}), '10371a26faed4e5fe9bac58c3b7b2c25',
       'canonicalize license';
-    is report_checksum({main => {license => 'GPL-2.0-or-later'}}, {}), '10371a26faed4e5fe9bac58c3b7b2c25',
+    is report_checksum({declarations => [{license => 'GPL-2.0-or-later'}]}, {}), '10371a26faed4e5fe9bac58c3b7b2c25',
       'already caninicallized license';
   };
 
   subtest 'Dig licenses' => sub {
-    is report_checksum({main => {license => 'MIT'}}, {licenses => {'Apache-2.0' => {risk => 2}}}),
-      'e91c43850ffd197cee057b93e1f00e0a', 'specfile and dig licenses';
-    is report_checksum({main => {license => 'MIT'}}, {licenses => {'Apache-2.0' => {risk => 2}, 'Foo' => {risk => 0}}}),
+    is report_checksum({declarations => [{license => 'MIT'}]}, {licenses => {'Apache-2.0' => {risk => 2}}}),
+      'e91c43850ffd197cee057b93e1f00e0a', 'declared and dig licenses';
+    is report_checksum({declarations => [{license => 'MIT'}]},
+      {licenses => {'Apache-2.0' => {risk => 2}, 'Foo' => {risk => 0}}}),
       'e91c43850ffd197cee057b93e1f00e0a', 'ignore risk 0 licenses';
-    is report_checksum({main => {license => 'MIT'}},
+    is report_checksum({declarations => [{license => 'MIT'}]},
       {licenses => {'Apache-2.0' => {risk => 2}, 'BSD-3-Clause' => {risk => 1}}}),
       '9c6028aac6ea076c135afa22bb1af168', 'two dig licenses';
   };
 
   subtest 'Flags' => sub {
-    is report_checksum({main => {license => 'MIT'}}, {licenses => {'Apache-2.0' => {risk => 2, flags => ['patent']}}}),
+    is report_checksum({declarations => [{license => 'MIT'}]},
+      {licenses => {'Apache-2.0' => {risk => 2, flags => ['patent']}}}),
       '44145ca2199684606c72e444d16c10b5', 'one license flag';
-    is report_checksum({main => {license => 'MIT'}},
+    is report_checksum({declarations => [{license => 'MIT'}]},
       {licenses => {'Apache-2.0' => {risk => 2, flags => ['patent', 'trademark']}}}),
       '4bbcf593950c619f3beb693643925559', 'two license flags';
   };
 
   subtest 'Snippets' => sub {
     is report_checksum(
-      {main => {license => 'MIT'}},
+      {declarations => [{license => 'MIT'}]},
       {
         licenses        => {'Apache-2.0' => {risk => 2}, 'BSD-3-Clause' => {risk => 1}},
         missed_snippets => {2            => [[10, 20, 4, '6d5198bd51f0617d05bf585rb3dc475f']]}
@@ -650,7 +1047,7 @@ subtest 'report_checksum' => sub {
       ),
       'e53a9998d69ce6a27f198c415abaf363', 'one snippet present';
     is report_checksum(
-      {main => {license => 'MIT'}},
+      {declarations => [{license => 'MIT'}]},
       {
         licenses        => {'Apache-2.0' => {risk => 2}, 'BSD-3-Clause' => {risk => 1}},
         missed_snippets => {
@@ -661,7 +1058,7 @@ subtest 'report_checksum' => sub {
       ),
       '1715f865453e0ab679688cf0c219fbe4', 'multiple snippets present';
     is report_checksum(
-      {main => {license => 'MIT'}},
+      {declarations => [{license => 'MIT'}]},
       {
         licenses        => {'Apache-2.0' => {risk => 2}, 'BSD-3-Clause' => {risk => 1}},
         missed_snippets => {
@@ -679,9 +1076,9 @@ subtest 'report_checksum' => sub {
 
     # The compatibility matrix is informational and derived from the (already hashed) license set, so
     # it deliberately does not change the report checksum - incompatibilities must not drive re-reviews.
-    my $without = report_checksum({main => {license => 'MIT'}}, {licenses => $licenses});
+    my $without = report_checksum({declarations => [{license => 'MIT'}]}, {licenses => $licenses});
     my $with    = report_checksum(
-      {main => {license => 'MIT'}},
+      {declarations => [{license => 'MIT'}]},
       {
         licenses              => $licenses,
         license_compatibility => {
@@ -700,15 +1097,15 @@ subtest 'report_checksum' => sub {
 subtest 'summary_delta_score' => sub {
   subtest 'Specfile' => sub {
     is summary_delta_score(
-      {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {}},
-      {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {}}
+      {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {}},
+      {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {}}
       ),
-      0, 'same specfile';
+      0, 'same declared license';
     is summary_delta_score(
-      {id => 1, specfile => 'MIT',      missed_snippets => {}, licenses => {}},
-      {id => 2, specfile => 'GPL-2.0+', missed_snippets => {}, licenses => {}}
+      {id => 1, declared => 'MIT',      missed_snippets => {}, licenses => {}},
+      {id => 2, declared => 'GPL-2.0+', missed_snippets => {}, licenses => {}}
       ),
-      1000, 'different specfile';
+      1000, 'different declared license';
   };
 
   subtest 'Snippets' => sub {
@@ -716,7 +1113,7 @@ subtest 'summary_delta_score' => sub {
       is summary_delta_score(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE' => ['641e8cc6ac467ffcbb5b2c27088def99', '741e8cc6ac467ffcbb5b2c27088def9a']
@@ -725,7 +1122,7 @@ subtest 'summary_delta_score' => sub {
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE' => ['641e8cc6ac467ffcbb5b2c27088def99', '741e8cc6ac467ffcbb5b2c27088def9a']
@@ -737,7 +1134,7 @@ subtest 'summary_delta_score' => sub {
       is summary_delta_score(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE' => ['641e8cc6ac467ffcbb5b2c27088def99', '741e8cc6ac467ffcbb5b2c27088def9a']
@@ -746,7 +1143,7 @@ subtest 'summary_delta_score' => sub {
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['741e8cc6ac467ffcbb5b2c27088def9a']
@@ -758,7 +1155,7 @@ subtest 'summary_delta_score' => sub {
       is summary_delta_score(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['641e8cc6ac467ffcbb5b2c27088def99']
@@ -767,7 +1164,7 @@ subtest 'summary_delta_score' => sub {
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {'Mojolicious-7.25/LICENSE' => ['641e8cc6ac467ffcbb5b2c27088def99']},
           licenses        => {}
         }
@@ -776,7 +1173,7 @@ subtest 'summary_delta_score' => sub {
       is summary_delta_score(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/Changes'            => ['641e8cc6ac467ffcbb5b2c27088def99']
@@ -785,7 +1182,7 @@ subtest 'summary_delta_score' => sub {
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['641e8cc6ac467ffcbb5b2c27088def99']
@@ -800,13 +1197,13 @@ subtest 'summary_delta_score' => sub {
       is summary_delta_score(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98']},
           licenses        => {}
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['641e8cc6ac467ffcbb5b2c27088def99']
@@ -818,13 +1215,13 @@ subtest 'summary_delta_score' => sub {
       is summary_delta_score(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98']},
           licenses        => {}
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['641e8cc6ac467ffcbb5b2c27088def99'],
@@ -837,7 +1234,7 @@ subtest 'summary_delta_score' => sub {
       is summary_delta_score(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['641e8cc6ac467ffcbb5b2c27088def99']
@@ -846,7 +1243,7 @@ subtest 'summary_delta_score' => sub {
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['741e8cc6ac467ffcbb5b2c27088def9a']
@@ -858,7 +1255,7 @@ subtest 'summary_delta_score' => sub {
       is summary_delta_score(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['641e8cc6ac467ffcbb5b2c27088def99']
@@ -867,7 +1264,7 @@ subtest 'summary_delta_score' => sub {
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => [
@@ -885,41 +1282,41 @@ subtest 'summary_delta_score' => sub {
   subtest 'Licenses' => sub {
     subtest 'Not noteworthy' => sub {
       is summary_delta_score(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}}
         ),
         0, 'same licenses';
       is summary_delta_score(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'MIT' => 3, 'Apache-2.0' => 5}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'MIT' => 3}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'MIT' => 3, 'Apache-2.0' => 5}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'MIT' => 3}}
         ),
         0, 'License removed';
       is summary_delta_score(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 4}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 4}}
         ),
         0, 'different risk';
     };
 
     subtest 'Noteworthy' => sub {
       is summary_delta_score(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5, 'MIT' => 3}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5, 'MIT' => 3}}
         ),
         30, 'new license';
       is summary_delta_score(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {},
           licenses        => {'Apache-2.0' => 5, 'MIT' => 3, 'GPL-2.0+' => 1}
         }
         ),
         40, 'new licenses';
       is summary_delta_score(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5, 'MIT' => 3}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5, 'MIT' => 3}}
         ),
         80, 'more new licenses';
     };
@@ -929,15 +1326,15 @@ subtest 'summary_delta_score' => sub {
 subtest 'summary_delta' => sub {
   subtest 'Specfile' => sub {
     is summary_delta(
-      {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {}},
-      {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {}}
+      {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {}},
+      {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {}}
       ),
-      '', 'same specfile';
+      '', 'same declared license';
     is summary_delta(
-      {id => 1, specfile => 'MIT',      missed_snippets => {}, licenses => {}},
-      {id => 2, specfile => 'GPL-2.0+', missed_snippets => {}, licenses => {}}
+      {id => 1, declared => 'MIT',      missed_snippets => {}, licenses => {}},
+      {id => 2, declared => 'GPL-2.0+', missed_snippets => {}, licenses => {}}
       ),
-      "Diff to closest match 1\n\n  Spec file license  MIT -> GPL-2.0+\n", 'different specfile';
+      "Diff to closest match 1\n\n  Declared license  MIT -> GPL-2.0+\n", 'different declared license';
   };
 
   subtest 'License incompatibilities are not part of the diff' => sub {
@@ -945,8 +1342,8 @@ subtest 'summary_delta' => sub {
     # Even when a new mutually-incompatible license appears, the diff only reports the new license
     # itself - incompatibilities are informational context and never show up here.
     is summary_delta(
-      {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 2}},
-      {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 2, 'GPL-2.0-only' => 1}}
+      {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 2}},
+      {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 2, 'GPL-2.0-only' => 1}}
       ),
       "Diff to closest match 1\n\n  New licenses (by risk)\n    1  GPL-2.0-only\n",
       'new license shown, no incompatibility block';
@@ -957,7 +1354,7 @@ subtest 'summary_delta' => sub {
       is summary_delta(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE' => ['641e8cc6ac467ffcbb5b2c27088def99', '741e8cc6ac467ffcbb5b2c27088def9a']
@@ -966,7 +1363,7 @@ subtest 'summary_delta' => sub {
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE' => ['641e8cc6ac467ffcbb5b2c27088def99', '741e8cc6ac467ffcbb5b2c27088def9a']
@@ -978,7 +1375,7 @@ subtest 'summary_delta' => sub {
       is summary_delta(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE' => ['641e8cc6ac467ffcbb5b2c27088def99', '741e8cc6ac467ffcbb5b2c27088def9a']
@@ -987,7 +1384,7 @@ subtest 'summary_delta' => sub {
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['741e8cc6ac467ffcbb5b2c27088def9a']
@@ -999,7 +1396,7 @@ subtest 'summary_delta' => sub {
       is summary_delta(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['641e8cc6ac467ffcbb5b2c27088def99']
@@ -1008,7 +1405,7 @@ subtest 'summary_delta' => sub {
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {'Mojolicious-7.25/LICENSE' => ['641e8cc6ac467ffcbb5b2c27088def99']},
           licenses        => {}
         }
@@ -1023,13 +1420,13 @@ subtest 'summary_delta' => sub {
       is summary_delta(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98']},
           licenses        => {}
         },
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {
             'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98'],
             'Mojolicious-7.25/LICENSE'            => ['641e8cc6ac467ffcbb5b2c27088def99']
@@ -1044,11 +1441,11 @@ subtest 'summary_delta' => sub {
       is summary_delta(
         {
           id              => 1,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {'Mojolicious-7.25/lib/Mojolicious.pm' => ['541e8cc6ac467ffcbb5b2c27088def98']},
           licenses        => {}
         },
-        {id => 2, specfile => 'MIT', missed_snippets => \%many, licenses => {}}
+        {id => 2, declared => 'MIT', missed_snippets => \%many, licenses => {}}
         ),
         "Diff to closest match 1\n\n  New unresolved matches in 6 files\n", 'multiple new files (count only)';
     };
@@ -1057,41 +1454,41 @@ subtest 'summary_delta' => sub {
   subtest 'Licenses' => sub {
     subtest 'Not noteworthy' => sub {
       is summary_delta(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}}
         ),
         '', 'same licenses';
       is summary_delta(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'MIT' => 3, 'Apache-2.0' => 5}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'MIT' => 3}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'MIT' => 3, 'Apache-2.0' => 5}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'MIT' => 3}}
         ),
         '', 'License removed';
       is summary_delta(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 4}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 4}}
         ),
         '', 'different risk';
     };
 
     subtest 'Noteworthy' => sub {
       is summary_delta(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5, 'MIT' => 3}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5, 'MIT' => 3}}
         ),
         "Diff to closest match 1\n\n  New licenses (by risk)\n    3  MIT\n", 'new license';
       is summary_delta(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5}},
         {
           id              => 2,
-          specfile        => 'MIT',
+          declared        => 'MIT',
           missed_snippets => {},
           licenses        => {'Apache-2.0' => 5, 'MIT' => 3, 'GPL-2.0+' => 1}
         }
         ),
         "Diff to closest match 1\n\n  New licenses (by risk)\n    3  MIT\n    1  GPL-2.0+\n", 'new licenses';
       is summary_delta(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5, 'MIT' => 3}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'Apache-2.0' => 5, 'MIT' => 3}}
         ),
         "Diff to closest match 1\n\n  New licenses (by risk)\n    5  Apache-2.0\n    3  MIT\n", 'more new licenses';
     };
@@ -1101,13 +1498,13 @@ subtest 'summary_delta' => sub {
       # Detection is by license name; a license that only gains a flag between
       # versions is the same UI row and is not reported as new.
       is summary_delta(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'MIT'        => 3}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'MIT:patent' => 3}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'MIT'        => 3}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'MIT:patent' => 3}}
         ),
         '', 'existing license gaining a flag is not new';
       is summary_delta(
-        {id => 1, specfile => 'MIT', missed_snippets => {}, licenses => {'MIT'        => 3}},
-        {id => 2, specfile => 'MIT', missed_snippets => {}, licenses => {'MIT:patent' => 3, 'Apache-2.0' => 5}}
+        {id => 1, declared => 'MIT', missed_snippets => {}, licenses => {'MIT'        => 3}},
+        {id => 2, declared => 'MIT', missed_snippets => {}, licenses => {'MIT:patent' => 3, 'Apache-2.0' => 5}}
         ),
         "Diff to closest match 1\n\n  New licenses (by risk)\n    5  Apache-2.0\n",
         'only the genuinely new name is reported';
@@ -1167,18 +1564,19 @@ subtest 'new_license_names' => sub {
 
 subtest 'report_shortname' => sub {
   is report_shortname('jemn9u', {}, {}), 'Unknown-0:jemn9u', 'minimal shortname';
-  is report_shortname('jemn8u', {main => {license => 'Artistic-2.0'}}, {}), 'Artistic-2.0-0:jemn8u', 'same license';
-  is report_shortname('jemn7u', {main => {license => 'MIT OR BSD-2-Clause'}}, {}), 'BSD-2-Clause-0:jemn7u',
+  is report_shortname('jemn8u', {declarations => [{license => 'Artistic-2.0'}]}, {}), 'Artistic-2.0-0:jemn8u',
+    'same license';
+  is report_shortname('jemn7u', {declarations => [{license => 'MIT OR BSD-2-Clause'}]}, {}), 'BSD-2-Clause-0:jemn7u',
     'multiple licenses';
   is report_shortname(
     'jemn6u',
-    {main  => {license => 'MIT OR BSD-2-Clause'}},
-    {risks => {5       => {'Apache-2.0' => {1 => [13, 13], 2 => [12, 13, 13]}, 'SUSE-NotALicense' => {4 => [10, 11]}}}}
+    {declarations => [{license => 'MIT OR BSD-2-Clause'}]},
+    {risks        => {5 => {'Apache-2.0' => {1 => [13, 13], 2 => [12, 13, 13]}, 'SUSE-NotALicense' => {4 => [10, 11]}}}}
     ),
     'BSD-2-Clause-5:jemn6u', 'license risk';
   is report_shortname(
     'jemn5u',
-    {main => {license => 'MIT OR BSD-2-Clause'}},
+    {declarations => [{license => 'MIT OR BSD-2-Clause'}]},
     {
       risks => {5 => {'Apache-2.0' => {1 => [13, 13], 2 => [12, 13, 13]}, 'SUSE-NotALicense' => {4 => [10, 11]}}},
       missed_files => {12 => [9, 0, undef], 14 => [9, 0, undef], 8 => [9, 0, undef], 9 => [9, 0, undef]}
@@ -1190,7 +1588,7 @@ subtest 'report_shortname' => sub {
   # reflects the actual license/snippet risk (here risk 3), not 9.
   is report_shortname(
     'jemn5u',
-    {main => {license => 'MIT OR BSD-2-Clause'}},
+    {declarations => [{license => 'MIT OR BSD-2-Clause'}]},
     {
       risks => {3 => {'Apache-2.0' => {1 => [13, 13], 2 => [12, 13, 13]}, 'GPL-2.0-only' => {3 => [10, 11]}}},
       license_compatibility => {
@@ -1203,6 +1601,19 @@ subtest 'report_shortname' => sub {
     }
     ),
     'BSD-2-Clause-3:jemn5u', 'incompatibilities no longer elevate the risk';
+};
+
+subtest 'report_risk' => sub {
+  is report_risk('Artistic-2.0-3:xK1e'),   3, 'risk parsed from the checksum shortname';
+  is report_risk('Unknown-0:abcd'),        0, 'a zero risk is preserved, not treated as missing';
+  is report_risk('BSD-2-Clause-9:jemn5u'), 9, 'a risk-9 checksum';
+
+  is report_risk('MIT-2:abcd', 0), 2, 'no unresolved matches leaves the parsed risk alone';
+  is report_risk('MIT-2:abcd', 5), 9, 'unresolved matches force the risk to 9';
+
+  is report_risk(undef),    undef, 'no checksum (never analyzed) is undef';
+  is report_risk(''),       undef, 'an empty checksum is undef';
+  is report_risk(undef, 3), 9,     'unresolved matches force 9 even before a checksum exists';
 };
 
 subtest 'should_fold_snippet' => sub {
@@ -1393,6 +1804,59 @@ subtest 'is_license_filename' => sub {
   ok !is_license_filename('foo/MIT-LICENSE.txt'),
     'not start-anchored: MIT-LICENSE is deliberately excluded (matches the corpus estimate)';
   ok !is_license_filename('foo/NOTICE_TO_USERS'), 'NOTICE followed by "_" is not a boundary';
+
+  # Only the basename counts. Anchoring on the whole path used to match any segment, so a package or
+  # directory that merely happens to be named after a license word turned every file under it into a
+  # license file - which put ordinary source into the report's legal-document list.
+  ok !is_license_filename('license-decl-1.0/src/engine.c'), 'a license-named package directory is not a license file';
+  ok !is_license_filename('notice-board/app.js'),           'nor a notice-named directory';
+  ok !is_license_filename('legal-tools/main.c'),            'nor a legal-named one';
+  ok !is_license_filename('copyright-2024/x.c'),            'nor a copyright-named one';
+  ok is_license_filename('license-decl-1.0/LICENSE'), 'the real license file inside such a directory still counts';
+
+  # Source files really are named this way (amazon-ecs-agent ships two license.go), and listing them as
+  # legal documents puts an "unexplained" count on what is only code.
+  ok !is_license_filename('agent/utils/license.go'), 'a Go source file named license.go is not a document';
+  ok !is_license_filename('pkg/license.py'),         'nor a Python one';
+  ok !is_license_filename('src/licence.rb'),         'nor a Ruby one, British spelling included';
+};
+
+# The source-extension blocklist is hand-maintained, so it is walked rather than sampled: a typo in one
+# entry, a stray space, or a duplicate would otherwise sit in the middle of the alternation unnoticed.
+subtest 'is_license_filename source extension blocklist' => sub {
+  my @extensions = @Cavil::ReportUtil::SOURCE_EXTENSIONS;
+  ok @extensions > 20, 'the list is populated';
+
+  subtest 'the list itself stays clean' => sub {
+    my %seen;
+    my @duplicates = grep { $seen{$_}++ } @extensions;
+    is_deeply \@duplicates, [], 'no duplicates';
+
+    my @malformed = grep { !/^[a-z0-9]+$/ } @extensions;
+    is_deeply \@malformed, [], 'every entry is lowercase alphanumeric, so none can be read as a pattern';
+  };
+
+  subtest 'every entry is actually rejected' => sub {
+    for my $extension (@extensions) {
+      ok !is_license_filename("pkg/LICENSE.$extension"),   "LICENSE.$extension is source, not a document";
+      ok !is_license_filename("pkg/license.\U$extension"), "and case does not smuggle it back in (.\U$extension)";
+    }
+  };
+
+  subtest 'document extensions are untouched by it' => sub {
+    ok is_license_filename("pkg/LICENSE.$_"), "LICENSE.$_ is still a document"
+      for qw(txt md rst html docs processed LESSER GPL);
+    ok is_license_filename('pkg/LICENSE'),         'no extension at all';
+    ok is_license_filename('pkg/LICENSE-2.0.txt'), 'a versioned document name';
+  };
+
+  subtest 'only the final extension decides' => sub {
+    ok is_license_filename('pkg/license.go.txt'),  'a document that mentions a language in the middle';
+    ok !is_license_filename('pkg/license.txt.go'), 'source that mentions a document type in the middle';
+  };
+
+  # The blocklist must not become a way for a non-license name to sneak in the other direction
+  ok !is_license_filename('pkg/main.txt'), 'a document extension does not make an unrelated name a license file';
 };
 
 done_testing;

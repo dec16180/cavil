@@ -5,26 +5,19 @@ package Cavil::Controller::Reviewer;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
 
 use Mojo::File  qw(path);
-use Mojo::Util  qw(humanize_bytes);
-use Cavil::Util qw(lines_context PRIORITY_WAITING);
+use Mojo::Util  qw(encode url_escape);
+use Cavil::Util qw(checkout_path lines_context path_within tags_from_request PRIORITY_WAITING);
 
-my $SMALL_REPORT_RE = qr/
-  (?:
-    \.spec
-  |
-    \/(?:copying|copyright|legal|license|readme)(?:\.\w+)?
-  )$
-/xi;
+use constant WINDOW_LINES => 2000;
 
 sub details ($self) {
   my $id   = $self->stash('id');
   my $pkgs = $self->packages;
   return $self->render(text => 'Package not found', status => 404) unless my $pkg = $pkgs->find($id);
-  my $report = $self->reports->specfile_report($id);
 
   my $should_reindex = $self->patterns->has_new_patterns($pkg->{name}, $pkg->{indexed});
 
-  $self->render(spec => $report, package => $pkg, should_reindex => $should_reindex);
+  $self->render(package => $pkg, should_reindex => $should_reindex);
 }
 
 sub meta ($self) {
@@ -32,6 +25,22 @@ sub meta ($self) {
   return $self->render(json => {error => 'Package not found'}, status => 404)
     unless my $summary = $self->helpers->package_summary($id);
   $self->render(json => $summary);
+}
+
+sub tags ($self) {
+  $self->render(json => {tags => $self->packages->all_tags});
+}
+
+# Curators replace the whole tag set; CVE tags removed here return on the next reindex (derived facts).
+sub set_tags ($self) {
+  my $id = $self->stash('id');
+  return $self->render(json => {error => 'Package not found'}, status => 404) unless $self->packages->find($id);
+
+  my ($tags, $error) = tags_from_request($self->req, qr/^CVE(-|$)/i);
+  return $self->render(json => {error => $error}, status => 400) if $error;
+
+  $self->packages->set_tags($id, $tags);
+  $self->render(json => {tags => $tags});
 }
 
 sub fasttrack_package ($self) {
@@ -44,6 +53,10 @@ sub fasttrack_package ($self) {
   my $id  = $self->stash('id');
   my $pkg = $self->packages->find($id);
   return $self->render(json => {error => 'Package not found'}, status => 404) unless $pkg;
+  return $self->render(
+    json   => {error => 'Limitations apply to this package, it needs a review by a curator or lawyer'},
+    status => 403
+  ) if @{$self->notes->limitations($pkg->{name})};
 
   $pkg->{reviewing_user} = $self->users->find(login => $user)->{id};
   my $result = $pkg->{result} = $validation->param('comment') || 'Reviewed ok';
@@ -71,9 +84,7 @@ sub file_view_meta ($self) {
   my $filename = $ctx->{filename};
   my $package  = $ctx->{package};
 
-  # The browser turns read-only for the same reason the report page does: it decides against a report
-  # that is about to be replaced, and the server would refuse the whole batch anyway. Sent with the very
-  # first payload so the actions never appear and then vanish; kept fresh by /reviews/report_state.
+  # Disable actions before a pending report replacement can invalidate their context.
   my $state   = $self->helpers->reindex_state($package);
   my $payload = {
     package => {
@@ -97,20 +108,33 @@ sub file_view_meta ($self) {
     $payload->{entries} = $self->_file_browser_entries($package, $file, $filename);
   }
   else {
+    my $from = $self->param('from') // '';
     $payload->{kind}   = 'file';
-    $payload->{source} = $self->_file_browser_source($package, $file, $filename);
+    $payload->{source} = $self->_file_browser_source($package, $file, $filename, $from =~ /^[1-9]\d*$/ ? $from : 1);
   }
 
   return $self->render(json => $payload);
 }
 
+# Package content is untrusted, so it must never render on this origin: always a download, never sniffed
+sub file_raw ($self) {
+  return unless my $ctx = $self->_file_browser_context;
+  return $self->reply->not_found if $ctx->{unavailable} || -d $ctx->{file};
+
+  my $name    = $ctx->{file}->basename;
+  my $ascii   = $name =~ s/[^\x20-\x7e]|["\\]/_/gr;
+  my $headers = $self->res->headers;
+  $headers->content_type('application/octet-stream');
+  $headers->header('X-Content-Type-Options' => 'nosniff');
+  $headers->content_disposition(
+    qq{attachment; filename="$ascii"; filename*=UTF-8''} . url_escape(encode('UTF-8', $name)));
+  return $self->reply->file($ctx->{file});
+}
+
 sub _file_browser_context ($self) {
   my $filename = $self->stash('file');
 
-  # There are unfortunately few limits on what file can be - but it
-  # can't be a backward compat
-  # technically Foo..bar is allowed as file name, but we forbid this
-  # here for simplicity
+  # Reject parent traversal; this also forbids otherwise valid names containing "..".
   if ($filename =~ qr/\.\./) {
     $self->render(text => 'Bad Request', status => 400);
     return undef;
@@ -124,7 +148,8 @@ sub _file_browser_context ($self) {
     return undef;
   }
 
-  my $unpacked = path($self->app->config->{checkout_dir}, $package->{name}, $package->{checkout_dir}, '.unpacked');
+  my $unpacked
+    = checkout_path($self->app->config->{checkout_dir}, $package->{name}, $package->{checkout_dir}, '.unpacked');
 
   # No unpacked tree at all, which normally means it is being torn down and rebuilt right now (an admin
   # running "script/cavil unpack", a re-import). The report itself keeps working throughout, so this is a
@@ -132,7 +157,7 @@ sub _file_browser_context ($self) {
   return {filename => $filename, package => $package, unavailable => 1} unless -d $unpacked;
 
   my $file = $unpacked->child($filename);
-  unless (-e $file) {
+  unless (-e $file && path_within($unpacked, $file)) {
     $self->reply->not_found;
     return undef;
   }
@@ -193,7 +218,7 @@ sub _file_browser_entries ($self, $package, $file, $filename) {
   return \@entries;
 }
 
-sub _file_browser_source ($self, $package, $file, $filename) {
+sub _file_browser_source ($self, $package, $file, $filename, $from) {
   my $file_id = 0;
   my %info_by_line;
   if (
@@ -206,34 +231,77 @@ sub _file_browser_source ($self, $package, $file, $filename) {
     %info_by_line = %{$self->snippets->file_line_info($package->{id}, $file_id)};
   }
 
-  my $size = -s $file;
-  my $max  = $self->app->config->{max_file_browser_size} // 1_000_000;
-  if ($max && $size > $max) {
-    return {
-      id           => $file_id,
-      name         => $package->{name},
-      filename     => $filename,
-      oversized    => 1,
-      size         => $size,
-      maxSize      => $max,
-      sizeLabel    => humanize_bytes($size),
-      maxSizeLabel => humanize_bytes($max)
-    };
+  # Above the budget the file is shown one window at a time, starting wherever the reviewer asked for (a
+  # deep link to a line, or paging on from the previous window), so every part of it stays reachable
+  my $max      = $self->app->config->{max_file_browser_size} // 256_000;
+  my $windowed = $max && -s $file > $max;
+  my ($bytes, $more);
+  if ($windowed) {
+    (my $window, $more) = _read_window($file, $from, $max);
+    $bytes = join '', map {"$_\n"} @$window;
   }
+  else { ($bytes, $from) = ($file->slurp, 1) }
 
-  my @lines;
-  my $number = 1;
-  my @text   = split /\n/, $self->maybe_utf8($file->slurp), -1;
+  my @text = split /\n/, $self->maybe_utf8($bytes), -1;
   pop @text if @text && $text[-1] eq '';
-  for my $line (@text) {
-    push @lines, [$number, {%{$info_by_line{$number} // {risk => 0}}}, $line];
-    $number++;
-  }
+  my @lines = map { my $nr = $from + $_; [$nr, {%{$info_by_line{$nr} // {risk => 0}}}, $text[$_]] } 0 .. $#text;
 
-  return {id => $file_id, lines => lines_context(\@lines), name => $package->{name}, filename => $filename};
+  my $source = {
+    id       => $file_id,
+    lines    => lines_context(\@lines),
+    name     => $package->{name},
+    filename => $filename,
+    rawUrl   => $self->url_for('file_raw', id => $package->{id}, file => $filename)->to_string
+  };
+  return $source unless $windowed;
+
+  # The match map from indexing covers the whole file, so the reviewer can see what lies outside the window.
+  # Real pattern matches (any risk, keyed on the pattern id) and unresolved snippets (risk 9) count the same;
+  # cleared and covered boilerplate asserts no license and has neither.
+  my $to = $from + @lines - 1;
+  my ($above, $below) = (0, 0);
+  for my $nr (keys %info_by_line) {
+    my $info = $info_by_line{$nr};
+    next unless defined $info->{pid} || ($info->{risk} // 0) == 9;
+    $above++ if $nr < $from;
+    $below++ if $nr > $to;
+  }
+  $source->{window}
+    = {from => $from, to => $to, more => $more ? \1 : \0, matchesAbove => $above, matchesBelow => $below};
+
+  return $source;
+}
+
+# Stream fixed-size chunks, so neither the lines before the window nor one enormous line (minified code) is
+# ever held whole. A line running past the byte budget is clipped and ends the window.
+sub _read_window ($file, $from, $budget) {
+  my $handle = $file->open('<');
+  my ($nr, $used, $line, $open, $more, @lines) = (1, 0, '');
+CHUNK: while (read $handle, my $chunk, 65536) {
+    for my $piece (split /(?<=\n)/, $chunk) {
+      my $ends = $piece =~ s/\n\z//;
+      if ($nr >= $from) {
+        if (!$open && (@lines >= WINDOW_LINES || $used >= $budget)) { $more = 1; last CHUNK }
+        my $take = substr $piece, 0, $budget > $used ? $budget - $used : 0;
+        $line .= $take;
+        $used += length($take) + 1;
+      }
+      $open = !$ends;
+      next if $open;
+      push @lines, $line if $nr >= $from;
+      ($line, $nr) = ('', $nr + 1);
+    }
+  }
+  push @lines, $line if $open && $nr >= $from;
+
+  return (\@lines, $more);
 }
 
 sub list_recent ($self) {
+  $self->render;
+}
+
+sub list_ephemeral ($self) {
   $self->render;
 }
 

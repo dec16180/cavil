@@ -1,17 +1,5 @@
-# Copyright (C) 2023 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -317,6 +305,7 @@ subtest 'Show pattern match' => sub {
 
 subtest 'Inherit SPDX expressions from license name' => sub {
   $app->pg->db->query('UPDATE license_patterns SET spdx = ? WHERE id = 1', '');
+  my $ref    = $app->patterns->create(pattern => 'Broadcom standard terms', license => 'LicenseRef-scancode-broadcom');
   my $before = $app->pg->db->query('SELECT * FROM license_patterns WHERE id = 1')->hash;
 
   my $buffer = '';
@@ -331,6 +320,11 @@ subtest 'Inherit SPDX expressions from license name' => sub {
   my $after = $app->pg->db->query('SELECT * FROM license_patterns WHERE id = 1')->hash;
   is $before->{spdx}, '',           'no SPDX expression';
   is $after->{spdx},  'Apache-2.0', 'correct SPDX expression';
+
+  like $buffer, qr/LicenseRef-scancode-broadcom: skipped/, 'LicenseRef name skipped';
+  is $app->pg->db->query('SELECT spdx FROM license_patterns WHERE id = ?', $ref->{id})->hash->{spdx}, '',
+    'LicenseRef not copied into spdx';
+  $app->patterns->remove($ref->{id});
 };
 
 subtest 'Check SPDX' => sub {
@@ -412,7 +406,7 @@ subtest 'Catch-all flag' => sub {
   my $patterns = $app->patterns;
   my $db       = $app->pg->db;
 
-  # create() derives the flag from the license name (and inherits it for further patterns)
+  # create() derives the flag from the license name, for every pattern of the license
   $patterns->create(pattern => 'catch all marker one', license => 'Any Permissive');
   $patterns->create(pattern => 'catch all marker two', license => 'Any Permissive');
   is $db->query("SELECT count(*) c FROM license_patterns WHERE license = 'Any Permissive' AND catch_all")->hash->{c},
@@ -482,6 +476,46 @@ subtest 'Catch-all flag' => sub {
     is $db->select('license_patterns', 'catch_all', {id => $p->{id}})->hash->{catch_all}, 0,
       'editing back to a concrete license clears catch_all';
   };
+
+  subtest 'The "-Unspecified" suffix is the other half of the rule' => sub {
+    my $p = $patterns->create(pattern => 'a version-less family marker', license => 'Fictional-Unspecified');
+    is $p->{catch_all}, 1, 'a family named without a version is catch_all on create';
+
+    $patterns->update($p->{id}, pattern => 'a version-less family marker', license => 'Fictional-1.0');
+    is $db->select('license_patterns', 'catch_all', {id => $p->{id}})->hash->{catch_all}, 0,
+      'pinning the version down clears catch_all';
+
+    $patterns->update($p->{id}, pattern => 'a version-less family marker', license => 'Fictional-Unspecified');
+    is $db->select('license_patterns', 'catch_all', {id => $p->{id}})->hash->{catch_all}, 1,
+      'and taking it away again sets it back';
+
+    # Both conventions have to be spelled exactly, or the name stops announcing the flag
+    $patterns->update($p->{id}, pattern => 'a version-less family marker', license => 'Fictional Unspecified');
+    is $db->select('license_patterns', 'catch_all', {id => $p->{id}})->hash->{catch_all}, 0,
+      'the space-separated variant is not the convention';
+  };
+
+  subtest 'A mislabelled sibling cannot teach a new pattern the wrong flag' => sub {
+    $db->query("UPDATE license_patterns SET catch_all = false WHERE license = 'Any Permissive'");
+    my $grab_bag = $patterns->create(pattern => 'a sibling of a mislabelled grab-bag', license => 'Any Permissive');
+    is $grab_bag->{catch_all}, 1, 'the name decides, not the rows already stored under it';
+
+    $db->query("UPDATE license_patterns SET catch_all = true WHERE license = 'Apache-2.0'");
+    my $concrete = $patterns->create(pattern => 'a sibling of a mislabelled concrete license', license => 'Apache-2.0');
+    is $concrete->{catch_all}, 0, 'and it decides in the other direction too';
+
+    $patterns->update(
+      $concrete->{id},
+      pattern => 'a sibling of a mislabelled concrete license',
+      license => 'Apache-2.0'
+    );
+    is $db->select('license_patterns', 'catch_all', {id => $concrete->{id}})->hash->{catch_all}, 0,
+      'an edit that leaves the license alone does not pick the wrong flag up either';
+
+    # The mislabelled rows are hand-written, so hand them back before the next subtest reads them
+    $db->query("UPDATE license_patterns SET catch_all = true  WHERE license = 'Any Permissive'");
+    $db->query("UPDATE license_patterns SET catch_all = false WHERE license = 'Apache-2.0'");
+  };
 };
 
 subtest 'Shingle backfill' => sub {
@@ -501,6 +535,58 @@ subtest 'Shingle backfill' => sub {
   my $rows     = $db->query('SELECT count(*) AS c FROM pattern_shingles')->hash->{c};
   my $patterns = $db->query('SELECT count(DISTINCT pattern_id) AS c FROM pattern_shingles')->hash->{c};
   ok $rows > 0, "backfill repopulated the table ($rows rows across $patterns patterns)";
+};
+
+subtest 'Backfill SPDX identifier patterns' => sub {
+
+  # Reset to a known state: Apache-2.0 (spdx set) x2, Artistic-2.0 (spdx set) x1, SUSE-NotALicense (no spdx)
+  $cavil_test->mojo_fixtures($app);
+  my $db = $app->pg->db;
+
+  my $count = sub {
+    $db->query('SELECT count(*) AS c FROM license_patterns WHERE pattern = ?', shift)->hash->{c};
+  };
+  is $count->('SPDX-License-Identifier: Apache-2.0'), 0, 'identifier pattern does not exist yet';
+
+  my $buffer = '';
+  {
+    open my $handle, '>', \$buffer;
+    local *STDOUT = $handle;
+    $app->start('patterns', '--backfill-spdx-ids');
+  }
+  like $buffer,   qr/Apache-2\.0 -> SPDX-License-Identifier: Apache-2\.0/,     'Apache-2.0 identifier created';
+  like $buffer,   qr/Artistic-2\.0 -> SPDX-License-Identifier: Artistic-2\.0/, 'Artistic-2.0 identifier created';
+  unlike $buffer, qr/SUSE-NotALicense/,                      'license without an SPDX expression is skipped';
+  like $buffer,   qr/^2 SPDX identifier patterns created$/m, 'reports the number created';
+
+  subtest 'Identifier pattern inherits the license properties' => sub {
+    my $new
+      = $db->query('SELECT * FROM license_patterns WHERE pattern = ?', 'SPDX-License-Identifier: Apache-2.0')->hash;
+    is $new->{license},   'Apache-2.0', 'license name';
+    is $new->{spdx},      'Apache-2.0', 'inherited SPDX expression';
+    is $new->{risk},      5,            'inherited risk';
+    is $new->{catch_all}, 0,            'catch_all derived from the license name';
+  };
+
+  subtest 'Identifier pattern is matchable' => sub {
+    my $pattern
+      = $db->query('SELECT id FROM license_patterns WHERE pattern = ?', 'SPDX-License-Identifier: Apache-2.0')->hash;
+    ok $app->patterns->find($pattern->{id}), 'pattern is stored';
+    is $db->query('SELECT count(*) AS c FROM pattern_shingles WHERE pattern_id = ?', $pattern->{id})->hash->{c} > 0, 1,
+      'shingles were maintained for the new pattern';
+  };
+
+  subtest 'A second run is a clean no-op' => sub {
+    my $buffer = '';
+    {
+      open my $handle, '>', \$buffer;
+      local *STDOUT = $handle;
+      $app->start('patterns', '--backfill-spdx-ids');
+    }
+    like $buffer,   qr/^0 SPDX identifier patterns created$/m, 'nothing left to create';
+    unlike $buffer, qr/->/,                                    'no per-license lines on a no-op run';
+    is $count->('SPDX-License-Identifier: Apache-2.0'), 1, 'still exactly one identifier pattern';
+  };
 };
 
 done_testing();

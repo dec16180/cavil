@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 use Mojo::Base -strict;
 
 use FindBin;
@@ -68,7 +71,7 @@ my $conf   = $dir->child('cavil.conf')->spew(<<"EOF");
   tokens               => ['staging:123'],
   pg                   => '$online',
   acceptable_risk      => 4,
-  index_bucket_average => 100,
+  index_bucket_average => 600,
   cleanup_bucket_average => 50,
   days_to_keep_orphaned_packages => 30,
   days_to_keep_orphaned_duplicate_packages => 7,
@@ -77,7 +80,7 @@ my $conf   = $dir->child('cavil.conf')->spew(<<"EOF");
   max_task_memory       => 5_000_000_000,
   max_worker_rss        => 100000,
   max_expanded_files    => 100,
-  max_file_browser_size => 1000000,
+  max_file_browser_size => 256_000,
   snippet_fold          => {
     enabled         => 1,
     threshold       => 0.95,
@@ -158,7 +161,9 @@ unless ($clean) {
   $pkgs->imported($pkg_id);
   my $mojo = $pkgs->find($pkg_id);
   $mojo->{external_link} = 'obs#456712';
+  $mojo->{target}        = 'openSUSE:Factory/perl-Mojolicious';
   $pkgs->update($mojo);
+  $pkgs->add_tags($pkg_id, ['CVE', 'needs-second-opinion']);
   $pkgs->unpack($pkg_id);
   $pkg_id = $pkgs->add(
     name            => 'perl-Mojolicious',
@@ -194,6 +199,8 @@ unless ($clean) {
   my $notes = $app->notes;
   $notes->add($mojo_id,  'perl-Mojolicious', $user_id, "Just a note $_", 0) for 1 .. 25;
   $notes->add($mojo3_id, 'perl-Mojolicious', $user_id, 'Another test',   0);
+  $notes->add($mojo_id, 'perl-Mojolicious', $user_id, 'Recommend accepting, Artistic-2.0 throughout.', 0, 1,
+    ['review']);
 
   # "ceph-image" example data
   $pkg_id = $pkgs->add(
@@ -278,8 +285,10 @@ unless ($clean) {
   $pkgs->imported($pkg_id);
   my $obsprj = $pkgs->find($pkg_id);
   $obsprj->{external_link} = 'soo#products/PackageHub!123';
+  $obsprj->{target}        = 'products/PackageHub';
   $pkgs->update($obsprj);
   $pkgs->unpack($pkg_id);
+  $app->requests->add('soo#products/PackageHub!124', $pkg_id, 'products/PackageHub');
 
   # "cavil-compatibility-lab" example data: a large, dense OSADL sub-matrix (~45 licenses, hundreds of
   # mutual "No" pairs plus one-directional and check-dependency relationships) to exercise the license
@@ -326,6 +335,21 @@ unless ($clean) {
     'CC-BY-4.0', 'MPL-1.0', 'CC-BY-SA-4.0 OR GFDL-1.3-or-later'
     );
 
+  # Proximity placement for the matrix heat ramp. Written flat, every flagged pair co-locates only at
+  # the package root, so the ramp never showed anything but its coolest step. Moving a few licenses into
+  # nested and peripheral directories gives each tier a real mutually-incompatible pair to colour:
+  # a deep shared directory, a shallow one, and a peripheral one. Everything else stays at the root and
+  # keeps demonstrating the neutral step.
+  my %compat_dirs = (
+    'GPL-2.0-only' => 'src/core/net',
+    'CDDL-1.0'     => 'src/core/net',
+    'Apache-2.0'   => 'src/core/net',
+    'MPL-1.1'      => 'src',
+    'OSL-3.0'      => 'src',
+    'EPL-2.0'      => 'docs',
+    'MS-RL'        => 'docs'
+  );
+
   my $compat_checkout = 'compatibilitylab00000000000000001';
   my $compat_dir      = $checkouts->child('cavil-compatibility-lab', $compat_checkout)->make_path;
   my $compat_i        = 0;
@@ -338,11 +362,46 @@ unless ($clean) {
       unique_id => sprintf('cccccccc-cccc-4ccc-8ccc-%012d', $compat_i)
     );
     (my $fn = $lic) =~ s/[^A-Za-z0-9._-]/_/g;
-    $compat_dir->child("$fn.txt")
-      ->spurt("$marker\n\nSynthetic license declaration for the compatibility matrix lab.\n");
+    my $target = $compat_dir;
+    if (my $sub = $compat_dirs{$lic}) { $target = $compat_dir->child(split m{/}, $sub)->make_path }
+    $target->child("$fn.txt")->spurt("$marker\n\nSynthetic license declaration for the compatibility matrix lab.\n");
     $compat_i++;
   }
+
+  # The hottest tier is same-file evidence, which no directory layout can produce: it needs one file
+  # declaring two licenses that OSADL calls mutually incompatible.
+  $compat_dir->child('src', 'core', 'net')->make_path->child('dual-licensed.txt')
+    ->spurt("compatibility lab license GPL-2.0-only\n\ncompatibility lab license CDDL-1.0\n");
   $app->pg->db->query(q{UPDATE license_patterns SET spdx = license WHERE pattern LIKE 'compatibility lab license %'});
+
+  # Both states of the "full license text" flag: one license with curated terms, one that stays a gap in the
+  # NOTICE. Neither marker may match the SPDX-setting update above, hence the different wording.
+  my $lab_eula = <<'EULA';
+Compatibility Lab End User License Agreement, version 1.0
+
+1. Grant. Permission is granted to use this synthetic agreement for the sole purpose of exercising
+   Cavil's handling of licenses that have no SPDX identifier.
+
+2. Attribution. This notice must be reproduced in full wherever the agreement is redistributed.
+
+3. Disclaimer. This text is a fixture. It grants nothing and identifies no real license.
+EULA
+  $compat_dir->child('LICENSE.eula')->spurt($lab_eula);
+  $app->patterns->create(
+    pattern           => $lab_eula,
+    license           => 'Compatibility-Lab-EULA',
+    risk              => 5,
+    full_license_text => 1,
+    unique_id         => sprintf('cccccccc-cccc-4ccc-8ccc-%012d', $compat_i++)
+  );
+
+  $compat_dir->child('src')->make_path->child('unwritten.txt')->spurt("compatibility lab custom terms apply here\n");
+  $app->patterns->create(
+    pattern   => 'compatibility lab custom terms apply here',
+    license   => 'Compatibility-Lab-Unwritten',
+    risk      => 5,
+    unique_id => sprintf('cccccccc-cccc-4ccc-8ccc-%012d', $compat_i++)
+  );
 
   $pkg_id = $pkgs->add(
     name            => 'cavil-compatibility-lab',
@@ -366,6 +425,32 @@ unless ($clean) {
   my $leap_id    = $products->find_or_create('openSUSE:Leap:15.0')->{id};
   $products->update($factory_id, [$mojo_id]);
   $products->update($leap_id,    [$mojo_id]);
+
+  # Example codestreams for the product annotation/grouping feature. The names are real-world OBS/Gitea
+  # project paths in different pipeline stages (GA vs :Update, an :Update Tools stream, a Gitea src path).
+  # Several are annotated to one human deliverable ("Multi-Linux Manager") to demonstrate how many cryptic
+  # codestreams collapse into a single row; "Devel:Orchid:RPMs" shows a name unrelated to its product; and
+  # "soo:PackageHub:Leap:16.0" is left unannotated to show the raw-name fallback still works.
+  my %pid = map { $_->{name} => $_->{id} }
+    @{$app->pg->db->query(q{SELECT id, name FROM bot_packages WHERE name != 'perl-Mojolicious'})->hashes->to_array};
+
+  my %codestreams = (
+    'SUSE:SLE-15-SP7:Update:Products:MultiLinuxManager51:Update' => [$mojo_id,  $pid{'ceph-image'}],
+    'SUSE:SLE-15-SP7:Update:Products:MultiLinuxManager51'        => [$mojo3_id, $pid{'go1.16-devel-container'}],
+    'SUSE:SLE-12:Update:Products:MultiLinuxManagerTools:Update'  => [$pid{'libfsverity0'}],
+    'Devel:Orchid:RPMs'                                          => [$pid{'go1.16-devel-container'}],
+    'soo:PackageHub:Leap:16.0'                                   => [$pid{'PackageHub'}]
+  );
+  for my $name (sort keys %codestreams) {
+    my $id = $products->find_or_create($name)->{id};
+    $products->update($id, $codestreams{$name});
+  }
+
+  # Curated product annotations (empty/absent = unannotated, rendered as the raw codestream name)
+  $products->set_annotation('SUSE:SLE-15-SP7:Update:Products:MultiLinuxManager51:Update', 'Multi-Linux Manager');
+  $products->set_annotation('SUSE:SLE-15-SP7:Update:Products:MultiLinuxManager51',        'Multi-Linux Manager');
+  $products->set_annotation('SUSE:SLE-12:Update:Products:MultiLinuxManagerTools:Update',  'Multi-Linux Manager');
+  $products->set_annotation('Devel:Orchid:RPMs', 'SUSE Application Collection');
 
   # Synthetic fold/clear/overlap playground. Snippets are AI-classified after the initial index below,
   # so it works in staging without a classifier server.
@@ -587,6 +672,45 @@ SPEC
   $comp->{external_link} = 'obs#components-lab';
   $pkgs->update($comp);
   $pkgs->unpack($comp_id);
+
+  # Large-file browser playground: two files that both exceed max_file_browser_size, so the file browser
+  # shows only their top and appends the end-of-file marker. "top-heavy.txt" carries its one license
+  # match in the shown header, so the marker reassures ("no further matches below"); "hidden-match.txt"
+  # repeats the match far past the cut, so the marker warns that matches remain below.
+  my $large_checkout = 'largefilelab0000000000000000000001';
+  my $large_dir      = $checkouts->child('cavil-large-file-lab', $large_checkout)->make_path;
+  $app->patterns->create(
+    pattern   => 'large file lab license marker',
+    license   => 'MIT',
+    risk      => 3,
+    unique_id => '44444444-4444-4444-8444-444444444441'
+  );
+  $app->pg->db->query(q{UPDATE license_patterns SET spdx = 'MIT' WHERE pattern = 'large file lab license marker'});
+
+  # Filler line is ~58 bytes, so 8000 of them clear ~450 KB, comfortably past the 256 KB display budget.
+  my $filler = sub {
+    join '', map { sprintf "large file lab filler line %06d padding padding padding\n", $_ } $_[0] .. $_[1];
+  };
+  $large_dir->child('top-heavy.txt')->spurt("large file lab license marker\n" . $filler->(1, 8000));
+  $large_dir->child('hidden-match.txt')
+    ->spurt(
+    "large file lab license marker\n" . $filler->(1, 6000) . "large file lab license marker\n" . $filler->(6001, 8000));
+
+  $pkg_id = $pkgs->add(
+    name            => 'cavil-large-file-lab',
+    checkout_dir    => $large_checkout,
+    api_url         => 'https://api.opensuse.org',
+    requesting_user => $user_id,
+    project         => 'cavil:staging',
+    package         => 'cavil-large-file-lab',
+    srcmd5          => $large_checkout,
+    priority        => 5
+  );
+  $pkgs->imported($pkg_id);
+  my $large = $pkgs->find($pkg_id);
+  $large->{external_link} = 'obs#large-file-lab';
+  $pkgs->update($large);
+  $pkgs->unpack($pkg_id);
 
   # Synthetic diff playground: two versions of one package whose report diff
   # exercises every "why this needs review" block at once - a spec license

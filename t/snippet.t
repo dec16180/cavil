@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -22,6 +10,7 @@ use Test::More;
 use Test::Mojo;
 use Cavil::Test;
 use Cavil::Util qw(SNIPPET_SCORE_VERSION);
+use Mojo::File  qw(path);
 use Mojo::JSON  qw(true false);
 
 plan skip_all => 'set TEST_ONLINE to enable this test' unless $ENV{TEST_ONLINE};
@@ -101,6 +90,48 @@ subtest 'approval refreshes the stored resolution of affected packages' => sub {
   is $app->minion->jobs({states => ['failed']})->total, 0, 'no failed jobs';
   is $d->query('SELECT resolution FROM file_snippets WHERE snippet = ? LIMIT 1', $sid)->hash->{resolution}, undef,
     'the stale fold is cleared once the snippet is no longer legal text';
+};
+
+# The file browser addresses a range by path when the file has no id of its own, which is every file
+# indexing found nothing in.
+subtest 'Snippet from a file path' => sub {
+  $t->get_ok('/login')->status_is(302);
+
+  my $pkg      = $t->app->packages->find(1);
+  my $unpacked = path($cavil_test->checkout_dir, $pkg->{name}, $pkg->{checkout_dir}, '.unpacked');
+  $unpacked->make_path->child('UNINDEXED.txt')->spew("Terms of the fixture.\nSecond line.\n");
+
+  $t->get_ok(
+    '/snippets/from_path/1/UNINDEXED.txt?start=1&end=2&from=perl-Mojolicious' => {Accept => 'application/json'})
+    ->status_is(200)
+    ->json_has('/snippet')
+    ->json_is('/from', 'perl-Mojolicious');
+  my $snippet = $t->tx->res->json->{snippet};
+
+  # No hash was passed (a fresh selection has none yet), so the response has to carry the created
+  # snippet's own checksum - that is the context the inline editor needs to offer the ignore,
+  # missing-license and no-legal-text actions immediately instead of only after a reload.
+  my $created_hash = $t->tx->res->json->{hash};
+  like $created_hash, qr/^manual:/, 'response carries the created snippet checksum';
+  is $created_hash, $t->app->snippets->find($snippet)->{hash}, 'checksum matches the stored snippet';
+
+  $t->get_ok(
+    '/snippets/from_path/1/UNINDEXED.txt?start=1&end=2&from=perl-Mojolicious' => {Accept => 'application/json'})
+    ->status_is(200)
+    ->json_is('/snippet', $snippet, 'the same range comes back as the same snippet');
+
+  # Without JSON it lands the reviewer in the editor, the way the file browser links do
+  $t->get_ok('/snippets/from_path/1/UNINDEXED.txt?start=1&end=2')
+    ->status_is(302)
+    ->header_like(Location => qr!/snippet/edit/$snippet!);
+
+  subtest 'refusals' => sub {
+    $t->get_ok('/snippets/from_path/1/UNINDEXED.txt?start=2&end=1')->status_is(400);
+    $t->get_ok('/snippets/from_path/1/UNINDEXED.txt')->status_is(400);
+    $t->get_ok('/snippets/from_path/1/nothing/here.txt?start=1&end=2')->status_is(404);
+    $t->get_ok('/snippets/from_path/999999/UNINDEXED.txt?start=1&end=2')->status_is(404);
+    $t->get_ok('/snippets/from_path/1/..%2F..%2F..%2F..%2F..%2Fetc%2Fhostname?start=1&end=1')->status_is(404);
+  };
 };
 
 done_testing();

@@ -1,4 +1,4 @@
-# Copyright SUSE LLC
+# SPDX-FileCopyrightText: SUSE LLC
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Controller::Report;
@@ -6,38 +6,66 @@ use Mojo::Base 'Mojolicious::Controller', -signatures;
 
 use Mojo::Asset::File;
 use Cavil::Util 'lines_context';
+use Cavil::ReportUtil 'report_risk';
 use IO::Uncompress::Gunzip ();
+
+# Far above any real package, so only a pathological one is ever truncated
+use constant API_ARTIFACT_LIMIT => 50_000;
 
 sub report ($self) {
   my $id = $self->stash('id');
   return $self->render(text => 'unknown package', status => 408) unless my $pkg = $self->packages->find($id);
 
   # Jobs working on the package are deliberately not a reason to refuse it one. A rebuild is assembled
-  # beside the live report and swapped in with a single commit, so there is always a whole report to hand
-  # out - and refusing while anything is queued would refuse after every single build, because the
-  # spdx_report job that ends one holds the package for its duration while leaving the report alone.
-  return $self->render(text => 'not indexed', status => 408) unless $pkg->{indexed};
-
-  return $self->render(text => 'no report', status => 408)
-    unless my $report = $self->reports->sanitized_dig_report($id);
+  # beside the live report and swapped in with a single commit, so there is always a whole report to hand out.
+  # While there is no report yet, a JSON client (a polling CLI) gets the pipeline stage so it can show progress.
+  return _pending($self, $pkg->{index_stage} // 'queued', 'not indexed') unless $pkg->{indexed};
+  return _pending($self, 'finalizing', 'no report') unless my $report = $self->reports->sanitized_dig_report($id);
 
   $self->respond_to(
-    json => sub { $self->render(json => {report => $report, package => $pkg}) },
-    txt  => sub {
+    json => sub {
 
-      # Only notes relevant to this review (native or an identical license report) go into the plain
-      # text report. Lawyer-only notes are deliberately excluded: these reports are shared publicly.
-      my $notes = $self->notes->list(
+      # Part of the published response shape, so served here even though the dig report leaves them to the tables.
+      my $artifacts = $self->reports->artifacts($id, API_ARTIFACT_LIMIT);
+      my %full      = (%$report, map { $_ => $artifacts->{$_}{values} } qw(emails urls copyrights));
+
+      # Verdict fields so a CLI/CI client can gate in one request; risk matches the web header (shared helper).
+      $self->render(
+        json => {
+          report          => \%full,
+          package         => $pkg,
+          risk            => report_risk($pkg->{checksum}, $pkg->{unresolved_matches}),
+          acceptable_risk => $self->reports->acceptable_risk
+        }
+      );
+    },
+    txt => sub {
+
+      # Only notes relevant to this review go into the plain text report, never lawyer-only ones, with
+      # limitations and pinned notes first so the limit never cuts them off.
+      my $notes = $self->notes->paginate_for_package(
         $pkg->{name},
         relevant_only => 1,
         package_id    => $id,
         checksum      => $pkg->{checksum},
         limit         => 100
-      )->{notes};
-      $self->render('reviewer/report', report => $report, package => $pkg, notes => $notes);
+      )->{page};
+      $self->render(
+        'reviewer/report',
+        report          => $report,
+        package         => $pkg,
+        notes           => $notes,
+        legal_documents => $self->helpers->legal_documents($id)
+      );
     },
     mcp => sub { $self->render(text => $self->helpers->mcp_report($id)) }
   );
+}
+
+# A report that is not ready yet: 408 so a client keeps polling, with the pipeline stage for a JSON client to
+# show and the existing plain-text reason for everyone else.
+sub _pending ($self, $stage, $text) {
+  return $self->respond_to(json => {json => {stage => $stage}, status => 408}, any => {text => $text, status => 408});
 }
 
 sub details ($self) {
@@ -64,6 +92,13 @@ sub details ($self) {
   return $self->render(json => {error => 'no report',   %{_stage_payload($pkg)}}, status => 408);
 }
 
+# Kept off the report payload: a large package has tens of thousands and most reviews never open them
+sub artifacts ($self) {
+  my $id = $self->stash('id');
+  return $self->render(json => {error => 'unknown package'}, status => 404) unless $self->packages->find($id);
+  $self->render(json => $self->reports->artifacts($id));
+}
+
 # Cheap poll for a report page that is already on screen: just the rebuild state, with none of the work
 # that assembling a dig report costs. A page left open while its package is reindexed asks for this every
 # few seconds and only refetches the full report once the state says a new one has been promoted.
@@ -87,61 +122,66 @@ sub source ($self) {
   my $validation = $self->validation;
   $validation->optional('start')->num;
   $validation->optional('end')->num;
+  $validation->optional('license');
+  $validation->required('risk')->num if defined $validation->param('license');
+  $validation->optional('unresolved')->in(1);
+  $validation->optional('groups')->num(1, undef);
   return $self->reply->json_validation_error if $validation->has_error;
 
   my $id    = $self->stash('id');
   my $start = $validation->param('start') || 0;
   my $end   = $validation->param('end')   || 0;
+  my $scope = {
+    license    => $validation->param('license'),
+    risk       => $validation->param('risk'),
+    unresolved => $validation->param('unresolved'),
+    groups     => $validation->param('groups') // 10
+  };
   return $self->render(json => {error => 'unknown file'}, status => 404)
-    unless my $source = $self->reports->source_for($id, $start, $end);
+    unless my $source = $self->reports->source_for($id, $start, $end, $scope);
 
   $source->{lines} = lines_context($source->{lines});
   $self->render(json => {source => $source});
 }
 
-# Ask for a report to be built. The report page polls report_state afterwards, so the answer is the same
-# state payload that poll returns and the button can go straight into its "generating" animation.
-sub generate_spdx ($self) {
+# Ask for the documents to be built. The report page polls report_state afterwards, so the answer is the
+# same state payload that poll returns and the button can go straight into its "generating" animation.
+sub generate_documents ($self) {
   my $id = $self->stash('id');
   return $self->render(json => {error => 'unknown package'}, status => 404) unless my $pkg = $self->packages->find($id);
 
-  my $state = $self->helpers->spdx_state($pkg);
+  my $state = $self->helpers->documents_state($pkg);
   return $self->render(json => $state, status => 410) if $state->{state} eq 'unavailable';
 
-  # Idempotent: does nothing if the report is already there or already queued, so a double click (or two
-  # reviewers on the same report) costs one job between them
-  $self->packages->generate_spdx_report($id);
-  $self->render(json => $self->helpers->spdx_state($pkg));
+  # Idempotent: does nothing if the documents are already there or already queued, so a double click (or
+  # two reviewers on the same report) costs one job between them
+  $self->packages->generate_documents($id);
+  $self->render(json => $self->helpers->documents_state($pkg));
 }
 
-sub spdx ($self) {
+sub document ($self) {
   my $id   = $self->stash('id');
   my $pkgs = $self->app->packages;
 
-  return $self->render(text     => 'package is obsolete', status => 410) if $pkgs->is_obsolete($id);
-  return $self->render(template => 'report/waiting',      status => 408) unless $pkgs->is_indexed($id);
+  return $self->reply->not_found unless my $doc = $pkgs->document($self->stash('key'));
+  return $self->render(text => 'package is obsolete', status => 410) if $pkgs->is_obsolete($id);
+  return $self->render(text => 'not indexed',         status => 408) unless $pkgs->is_indexed($id);
 
-  if ($pkgs->has_spdx_report($id)) {
-    my $path    = $pkgs->spdx_report_path($id);
+  if ($pkgs->has_document($id, $doc->{key})) {
+    my $path    = $pkgs->document_path($id, $doc->{key});
     my $headers = $self->res->headers;
-    $headers->content_type('application/json');
+    $headers->content_type($doc->{type});
+    $headers->content_disposition(qq{attachment; filename="$id.$doc->{name}"});
+    return $self->reply->asset(Mojo::Asset::File->new(path => $path)) unless $doc->{gzip};
+
     $headers->vary('Accept-Encoding');
-
-    # Nobody reads one of these in a browser tab, so hand it over as a file. The name is the one the
-    # report page's download link advertises. Gzip below is a transfer encoding, which the browser undoes
-    # before saving, so what lands on disk is the JSON this names.
-    $headers->content_disposition(qq{attachment; filename="$id.spdx.json"});
-
-    # The report is stored gzip-compressed. Hand it over untouched to clients that accept gzip (the
-    # common case, no extra work), and decompress on the fly for those that do not.
     if (($self->req->headers->accept_encoding // '') =~ /gzip/i) {
       $headers->content_encoding('gzip');
       return $self->reply->asset(Mojo::Asset::File->new(path => $path));
     }
 
-    # Rare client without gzip support: stream-decompress to a temporary file so we never hold the
-    # whole (potentially large) report in memory
-    return $self->render(text => 'Could not read SPDX report', status => 500)
+    # Stream decompression bounds memory for clients without gzip support.
+    return $self->render(text => 'Could not read document', status => 500)
       unless my $gz = IO::Uncompress::Gunzip->new("$path");
     my $asset = Mojo::Asset::File->new;
     my $buffer;
@@ -149,8 +189,9 @@ sub spdx ($self) {
     return $self->reply->asset($asset);
   }
 
-  $pkgs->generate_spdx_report($id);
-  $self->render(template => 'report/waiting', status => 408);
+  # No page here: the report UI never links a document before it exists, and a client watches the status
+  $pkgs->generate_documents($id);
+  $self->render(text => 'being generated', status => 408);
 }
 
 1;

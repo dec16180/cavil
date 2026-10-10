@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: SUSE LLC
 # SPDX-License-Identifier: GPL-2.0-or-later
+
 use Mojo::Base -strict, -signatures;
 
 use FindBin;
@@ -26,7 +27,9 @@ my $set_roles = sub (@roles) { $db->update('bot_users', {roles => [@roles]}, {lo
 my $code      = sub ($method, $url) { $t->$method($url); return $t->tx->res->code };
 
 my @probes = (
-  {cap => 'infra',          method => 'get_ok',  url => '/upload',                        allow => [qw(admin)]},
+  {cap => 'upload_ephemeral', method => 'get_ok',  url => '/upload', allow => [qw(admin lawyer uploader)]},
+  {cap => 'upload_ephemeral', method => 'post_ok', url => '/upload', allow => [qw(admin lawyer uploader)]},
+  {cap => 'infra',            method => 'get_ok',  url => '/minion', allow => [qw(admin)]},
   {cap => 'curate',         method => 'get_ok',  url => '/licenses/new_pattern',          allow => [qw(admin lawyer)]},
   {cap => 'curate/review',  method => 'post_ok', url => '/reviews/review_package/999999', allow => [qw(admin lawyer)]},
   {cap => 'curate/reindex', method => 'post_ok', url => '/reviews/reindex/999999',        allow => [qw(admin lawyer)]},
@@ -34,6 +37,12 @@ my @probes = (
     cap    => 'propose',
     method => 'get_ok',
     url    => '/snippets/from_file/999999/1/2',
+    allow  => [qw(admin contributor lawyer)]
+  },
+  {
+    cap    => 'propose',
+    method => 'get_ok',
+    url    => '/snippets/from_path/999999/some/file.txt?start=1&end=2',
     allow  => [qw(admin contributor lawyer)]
   },
   {cap => 'classify', method => 'post_ok', url => '/snippets/999999', allow => [qw(admin classifier lawyer)]},
@@ -51,12 +60,12 @@ my @probes = (
     cap    => 'logged_in/templates',
     method => 'get_ok',
     url    => '/comment-templates/all',
-    allow  => [qw(user classifier contributor manager admin lawyer)]
+    allow  => [qw(user uploader classifier contributor manager admin lawyer)]
   },
 );
 
 subtest 'capability matrix' => sub {
-  for my $role (qw(user classifier contributor manager admin lawyer)) {
+  for my $role (qw(user uploader classifier contributor manager admin lawyer)) {
     $set_roles->($role);
     for my $p (@probes) {
       my $allowed = grep { $_ eq $role } @{$p->{allow}};

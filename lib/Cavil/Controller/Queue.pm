@@ -4,8 +4,43 @@
 package Cavil::Controller::Queue;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
 
-use Cavil::Util qw(PRIORITY_INCOMING);
+use Cavil::Util qw(checkout_path incoming_priority tags_from_request);
 use Mojo::File  qw(path);
+
+sub upload_package ($self) {
+  my $validation = $self->validation;
+  $validation->required('name')->like(qr/^[A-Za-z0-9\-\.]+$/);
+  $validation->required('priority')->num;
+  $validation->required('tarball')->upload->size(1, undef);
+
+  # A content checksum is mandatory here: this is an automated, load-bearing ingress and the client can
+  # always compute it, so we reject truncated/corrupt uploads up front rather than reviewing incomplete
+  # sources (the browser form in Controller::Upload does not require one)
+  $validation->required('checksum')->like(qr/^[a-f0-9]{32}$/i);
+  $validation->optional('external_link');
+  return $self->reply->json_validation_error if $validation->has_error;
+
+  my ($obj, $duplicate) = eval {
+    $self->packages->store_upload(
+      $validation->param('tarball'),
+      {
+        name            => $validation->param('name'),
+        priority        => $validation->param('priority'),
+        requesting_user => $self->users->licensedigger->{id},
+        external_link   => $validation->param('external_link'),
+        checksum        => $validation->param('checksum')
+      }
+    );
+  };
+  if (my $err = $@) {
+    return $self->render(json => {error => 'Checksum mismatch'}, status => 400)
+      if ref $err eq 'HASH' && $err->{checksum_mismatch};
+    $self->app->log->error("Upload of package @{[$validation->param('name')]} failed: $err");
+    return $self->render(json => {error => 'Upload failed'}, status => 500);
+  }
+
+  $self->render(json => {saved => $obj, duplicate => $duplicate ? \1 : \0});
+}
 
 sub create_package ($self) {
   my $validation = $self->validation;
@@ -30,13 +65,16 @@ sub create_package ($self) {
 
   return $self->reply->json_validation_error if $validation->has_error;
 
+  my ($tags, $tag_error) = tags_from_request($self->req, qr/^CVE(-|$)/i);
+  return $self->render(json => {error => $tag_error}, status => 400) if $tag_error;
+
   my $api     = $validation->param('api');
   my $project = $validation->param('project') // '';
   my $pkg     = $validation->param('package');
   my $rev     = $validation->param('rev');
   my $created = $validation->param('created');
   my $link    = $validation->param('external_link');
-  my $prio    = $validation->param('priority') || PRIORITY_INCOMING;
+  my $prio    = $validation->param('priority') || 5;
 
   my $app    = $self->app;
   my $config = $app->config;
@@ -46,8 +84,7 @@ sub create_package ($self) {
     ($srcpkg, $srcmd5, $verifymd5) = ($pkg, $rev, $rev);
   }
 
-  # Get package infomation, rev may be pointing to link, so we need the
-  # canonical srcmd5
+  # Resolve links before using the source checksum as identity.
   else {
     my $obs  = $app->obs;
     my $info = eval { $obs->package_info($api, $project, $pkg, {rev => $rev}) };
@@ -58,8 +95,7 @@ sub create_package ($self) {
     ($srcpkg, $srcmd5, $verifymd5) = @{$info}{qw(package srcmd5 verifymd5)};
   }
 
-  # Check if we need to import
-  my $dir    = path($config->{checkout_dir}, $srcpkg, $verifymd5);
+  my $dir    = checkout_path($config->{checkout_dir}, $srcpkg, $verifymd5);
   my $create = !-e $dir;
 
   my $user = $self->users->licensedigger;
@@ -82,19 +118,25 @@ sub create_package ($self) {
   }
 
   # Product imports are low priority, and we want real requests if possible
+  my $old_link = $obj->{external_link};
   $obj->{external_link} //= $link;
   $obj->{external_link} = $link if $link && $prio >= $obj->{priority};
 
+  # Clear a stale target when the link changed so the async resolver picks the new one up
+  $obj->{target}   = undef if ($obj->{external_link} // '') ne ($old_link // '');
   $obj->{obsolete} = 0;
   $pkgs->update($obj);
+  $pkgs->add_tags($obj->{id}, $tags);
   if ($create) {
 
-    # The import runs at the review priority the request carries, and the whole chain down to the report
-    # follows from there (see Cavil::Util): an ordinary incoming package does not overtake a reviewer
-    # waiting on a rebuild, and a request marked urgent still does.
+    # The import goes in at the incoming band, moved up or down within it by the review priority the
+    # request carries, and the whole chain down to the report follows from there (see Cavil::Util): it does
+    # not overtake a reviewer waiting on a rebuild, and no amount of reindexing gets in front of it.
+    my $queue_prio = incoming_priority($prio);
     if ($type eq 'git') {
       $pkgs->git_import($obj->{id},
-        {url => $api, pkg => $pkg, hash => $rev, external_link => $obj->{external_link}, priority => $prio}, $prio);
+        {url => $api, pkg => $pkg, hash => $rev, external_link => $obj->{external_link}, priority => $prio},
+        $queue_prio);
     }
     else {
       $pkgs->obs_import(
@@ -110,10 +152,13 @@ sub create_package ($self) {
           external_link => $obj->{external_link},
           priority      => $prio
         },
-        $prio
+        $queue_prio
       );
     }
   }
+
+  # Enqueued after the import so the import job keeps the lower id callers may rely on
+  $pkgs->resolve_targets($obj->{id});
 
   $self->render(json => {saved => $obj});
 }
@@ -128,7 +173,10 @@ sub create_request ($self) {
   my $pkgs = $validation->every_param('package');
 
   my $requests = $self->requests;
-  $requests->add($link, $_) for @$pkgs;
+  for my $id (@$pkgs) {
+    $self->packages->rereview_limited($id) if $requests->add($link, $id);
+    $self->packages->resolve_targets($id);
+  }
 
   $self->render(json => {created => $link});
 }
@@ -140,6 +188,9 @@ sub import_package ($self) {
   $validation->optional('external_link');
   return $self->reply->json_validation_error if $validation->has_error;
 
+  my ($tags, $tag_error) = tags_from_request($self->req, qr/^CVE(-|$)/i);
+  return $self->render(json => {error => $tag_error}, status => 400) if $tag_error;
+
   my $pkgs = $self->packages;
   my $id   = $self->stash('id');
   my $obj  = $pkgs->find($id);
@@ -147,6 +198,7 @@ sub import_package ($self) {
   my $reindex;
   if (my $link = $validation->param('external_link')) {
     $obj->{external_link} = $link;
+    $obj->{target}        = undef;
   }
   if (my $priority = $validation->param('priority')) {
     $obj->{priority} = $priority;
@@ -162,6 +214,8 @@ sub import_package ($self) {
     }
   }
   $pkgs->update($obj);
+  $pkgs->add_tags($id, $tags);
+  $pkgs->resolve_targets($id);
   $pkgs->reindex($id) if $reindex;
 
   return $self->render(json => {imported => $obj});
@@ -193,7 +247,7 @@ sub remove_request ($self) {
   my $removed = $self->requests->remove($link);
   my $pkgs    = $self->packages;
   for my $id (@$removed) {
-    $pkgs->obsolete_if_not_in_product($id);
+    $pkgs->obsolete_if_unused($id);
   }
 
   $self->render(json => {removed => $removed});

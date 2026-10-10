@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -22,6 +10,7 @@ use Test::More;
 use Test::Mojo;
 use Cavil::Test;
 use Cavil::ReportUtil qw(report_checksum);
+use Cavil::Util       qw(file_and_checksum);
 use Mojo::File        qw(path);
 
 plan skip_all => 'set TEST_ONLINE to enable this test' unless $ENV{TEST_ONLINE};
@@ -50,7 +39,6 @@ subtest 'Cannot analyze before indexing' => sub {
   like $analyzed_job->info->{result}, qr/Package 1 is not indexed yet/, 'not yet indexed';
 };
 
-# Unpack and index with the job queue
 my $unpack_id = $t->app->minion->enqueue(unpack => [1]);
 my $db        = $t->app->pg->db;
 ok !$db->select('emails',       ['id'], {email => 'sri@cpan.org'})->rows,           'email address does not exist';
@@ -96,10 +84,8 @@ is $analyzed_job->info->{result},       undef,      'job was successful';
 is $t->app->packages->find(1)->{state}, 'new',      'still new';
 
 
-# Check shortname (3 missing snippets)
 like $t->app->packages->find(1)->{checksum}, qr/^Artistic-2.0-9:\w+/, 'right shortname';
 
-# Check email addresses and URLs
 ok $db->select('emails', ['id'], {email => 'sri@cpan.org'})->rows, 'email address has been added';
 
 # Two fewer hits than the raw sources: URLs that only appeared inside HTML attributes (href/src) are
@@ -110,17 +96,14 @@ is $db->select('emails', ['id'], {email => $long})->hash, undef, 'email address 
 $long = 'https://cdn.rawgit.com/google/code-prettify/master/loader/prettify.css';
 is $db->select('urls', ['hits'], {url => $long})->hash, undef, 'URL is too long';
 
-# Check files
 my $file_id = $db->select('matched_files', ['id'], {filename => 'Mojolicious-7.25/lib/Mojolicious.pm'})->hash->{id};
 ok $file_id,                                                               'file has been added';
 ok $db->select('bot_packages', ['unpacked'], {id => 1})->hash->{unpacked}, 'unpacked';
 
-# Verify report checksum
-my $specfile = $t->app->reports->specfile_report(1);
-my $dig      = $t->app->reports->dig_report(1);
-is report_checksum($specfile, $dig), '7d2fa36eff75adc8d7c309b8ff025992', 'right checksum';
+my $declarations = $t->app->reports->declarations(1);
+my $dig          = $t->app->reports->dig_report(1);
+is report_checksum($declarations, $dig), '7d2fa36eff75adc8d7c309b8ff025992', 'right checksum';
 
-# Check matches
 my $res = $db->select(
   ['pattern_matches', ['matched_files', id => 'file']],
   ['sline',           'pattern'],
@@ -179,6 +162,7 @@ subtest 'Pattern change' => sub {
   ok exists $pattern->{matches_capped},  'license meta includes match cap marker';
   ok exists $pattern->{packages_capped}, 'license meta includes package cap marker';
 
+
   $t->post_ok('/licenses/update_patterns' => form => {license => 'Apache-2.0', spdx => 'Apache-2'})
     ->status_is(302)
     ->header_is(Location => '/licenses/Apache-2.0');
@@ -195,6 +179,40 @@ subtest 'Pattern change' => sub {
     ->element_exists('#license-details')
     ->text_like('.alert-success' => qr/2 patterns have been updated/);
   $t->get_ok('/licenses/meta/Apache-2.0')->status_is(200)->json_is('/spdx' => 'Apache-2.0');
+};
+
+subtest 'SPDX identifier follows a license rename' => sub {
+  my $patterns = $t->app->patterns;
+
+  # Two patterns share the target license and carry its curated identifier; the source license has one
+  $patterns->insert_pattern(
+    {pattern => 'spdx rename target one', license => 'SpdxRenameTarget-1.0', spdx => 'MIT', risk => 3});
+  $patterns->insert_pattern(
+    {pattern => 'spdx rename target two', license => 'SpdxRenameTarget-1.0', spdx => 'MIT', risk => 3});
+  my $source = $patterns->insert_pattern(
+    {pattern => 'spdx rename source', license => 'SpdxRenameSource-1.0', spdx => 'Apache-2.0', risk => 5});
+  is $patterns->find($source)->{spdx}, 'Apache-2.0', 'source starts with its own identifier';
+
+  # Renaming to an existing license adopts that license's identifier (this was the reported bug)
+  $patterns->update($source, license => 'SpdxRenameTarget-1.0', pattern => 'spdx rename source', risk => 5);
+  is $patterns->find($source)->{spdx}, 'MIT', 'spdx adopts the new license identifier on rename';
+
+  # Editing an unrelated field without touching the license preserves the identifier
+  $patterns->update($source, license => 'SpdxRenameTarget-1.0', pattern => 'spdx rename source', risk => 6);
+  is $patterns->find($source)->{spdx}, 'MIT', 'spdx preserved when the license is unchanged';
+
+  # Renaming to a brand-new license clears the now-stale identifier
+  $patterns->update($source, license => 'SpdxRenameBrandNew-1.0', pattern => 'spdx rename source', risk => 6);
+  is $patterns->find($source)->{spdx}, '', 'spdx cleared when renamed to a brand-new license';
+};
+
+subtest 'License autocomplete JSON endpoint' => sub {
+  $t->get_ok('/licenses/autocomplete.json')->status_is(200)->json_has('/Apache-2.0/risk');
+
+  # Logging out must put the JSON endpoint back behind the login wall.
+  $t->get_ok('/logout')->status_is(302);
+  $t->get_ok('/licenses/autocomplete.json')->status_is(401)->content_like(qr/Login Required/);
+  $t->get_ok('/login')->status_is(302);
 };
 
 subtest 'Pattern detail JSON endpoint' => sub {
@@ -249,11 +267,12 @@ subtest 'License detail JSON endpoint permissions' => sub {
 
 # Automatic reindexing
 my $list = $t->app->minion->backend->list_jobs(0, 10, {states => ['inactive']});
-is $list->{total},         2,                       'two inactives job';
-is $list->{jobs}[0]{task}, 'reindex_matched_later', 'right task';
-is $list->{jobs}[1]{task}, 'pattern_stats',         'right task';
-is_deeply $list->{jobs}[0]{args}, [1], 'right arguments';
-my $reindex_id = $list->{jobs}[0]{id};
+is $list->{total},         3,                       'three inactive jobs';
+is $list->{jobs}[0]{task}, 'index_later',           'right task';
+is $list->{jobs}[1]{task}, 'reindex_matched_later', 'right task';
+is $list->{jobs}[2]{task}, 'pattern_stats',         'right task';
+is_deeply $list->{jobs}[1]{args}, [1], 'right arguments';
+my $reindex_id = $list->{jobs}[1]{id};
 $t->app->minion->perform_jobs;
 is $t->app->minion->job($reindex_id)->info->{state}, 'finished', 'job is finished';
 ok -f $t->app->patterns->matcher_cache_file, 'cache initialized';
@@ -277,11 +296,11 @@ is_deeply $res,
 $t->app->pg->db->query("update license_patterns set pattern = 'powerful' where id = 1");
 $t->app->patterns->expire_cache;
 $list = $t->app->minion->backend->list_jobs(0, 10, {tasks => ['index_later']});
-is $list->{total}, 1, 'one index_later jobs';
+is $list->{total}, 2, 'two index_later jobs';
 $t->app->minion->enqueue('reindex_all');
 $t->app->minion->perform_jobs;
 $list = $t->app->minion->backend->list_jobs(0, 10, {tasks => ['index_later']});
-is $list->{total},          3,          'three index_later jobs';
+is $list->{total},          4,          'four index_later jobs';
 is $list->{jobs}[0]{state}, 'finished', 'right state';
 is $list->{jobs}[1]{state}, 'finished', 'right state';
 $res = $db->select(
@@ -484,6 +503,90 @@ subtest 'Index gives up after too many retries' => sub {
   like $info->{result}, qr/gave up after \d+ retries/, 'result mentions retry exhaustion';
 
   $db->update('bot_packages', {unpacked => \'now()'}, {id => 1});
+};
+
+subtest 'License text viewer' => sub {
+  $t->get_ok('/licenses/text_meta?license=MIT')
+    ->status_is(200)
+    ->json_is('/license' => 'MIT')
+    ->json_like('/text' => qr/Permission is hereby granted, free of charge/)
+    ->json_is('/about/osi' => 1);
+
+  # spdx_link turns exceptions into links too, so the viewer has to serve them or every WITH link 404s
+  $t->get_ok('/licenses/text_meta?license=Classpath-exception-2.0')->status_is(200)->json_like('/text' => qr/\S/);
+
+  # A license Cavil knows by name only resolves to the pattern a curator marked as its full text
+  my $curated = 'Fixture terms nobody has an identifier for, at some length';
+  $t->app->patterns->create(pattern => $curated, license => 'Index-Fixture-1.0', full_license_text => 1);
+  $t->get_ok('/licenses/text_meta?license=Index-Fixture-1.0')->status_is(200)->json_is('/text' => $curated);
+
+  # A name that cannot be a path segment, which is why the license travels as a query parameter
+  $t->app->patterns->create(
+    pattern           => 'Slashed fixture terms, also at length',
+    license           => 'SLED/SLES EULA',
+    full_license_text => 1
+  );
+  $t->get_ok('/licenses/text_meta?license=SLED%2FSLES+EULA')
+    ->status_is(200)
+    ->json_like('/text' => qr/^Slashed fixture terms/);
+
+  $t->get_ok('/licenses/text_meta?license=Not-A-Real-License')->status_is(404);
+  $t->get_ok('/licenses/text_meta')->status_is(404);
+
+  # The catch-all license route must not swallow the new one
+  $t->get_ok('/licenses/Apache-2.0')->status_is(200)->element_exists('#license-details');
+};
+
+subtest 'Ignore a resolved licensed match' => sub {
+  $t->app->minion->perform_jobs;
+
+  # Any live (generation 0) match that resolved to a real license, not a keyword marker
+  my $match = $db->select(
+    ['pattern_matches', ['matched_files', id => 'file'], ['license_patterns', id => 'pattern']],
+    [\'matched_files.id AS file_id', 'matched_files.filename', 'sline', 'eline', 'pattern_matches.pattern'],
+    {'license_patterns.license' => {'!=' => ''}, 'pattern_matches.ignored' => 0, 'pattern_matches.generation' => 0},
+    {order_by => ['matched_files.filename', 'sline'], limit => 1}
+  )->hash;
+  ok $match, 'found a licensed match to ignore';
+
+  # checksum_for_match is what the ignore-a-match UI resolves through: given the pattern and any line the
+  # match covers (here a line in its interior), it must hash the match's full stored [sline, eline] - the
+  # same range the indexer recomputes - or the ignore silently no-ops.
+  my $inside = int(($match->{sline} + $match->{eline}) / 2);
+  my $hash   = $t->app->snippets->checksum_for_match($match->{file_id}, $match->{pattern}, $inside);
+  ok $hash, 'checksum_for_match produced a hash for the covered line';
+  my $unpacked = $t->app->packages->pkg_checkout_dir(1)->child('.unpacked', $match->{filename});
+  my (undef, $direct) = file_and_checksum($unpacked, $match->{sline}, $match->{eline});
+  is $hash, $direct, 'covered-line resolution hashes the full stored range, matching the indexer';
+
+  my $where = {
+    'matched_files.filename'  => $match->{filename},
+    'pattern_matches.pattern' => $match->{pattern},
+    'pattern_matches.sline'   => $match->{sline}
+  };
+  my $current = sub {
+    $db->select(
+      ['pattern_matches',         ['matched_files', id => 'file']],
+      ['pattern_matches.ignored', 'ignored_line'],
+      {%$where, 'pattern_matches.generation' => 0}
+    )->hash;
+  };
+
+  # ignore_line records the row and returns the packages the caller must reindex (batch_decision does this
+  # in production); reindex here to prove the suppression takes effect.
+  my $ids = $t->app->packages->ignore_line(
+    {package => 'perl-Mojolicious', hash => $hash, owner => undef, contributor => undef});
+  ok @$ids, 'ignore_line reports the packages to reindex';
+  $t->app->packages->reindex($_) for @$ids;
+  $t->app->minion->perform_jobs;
+  my $ignored = $current->();
+  is $ignored->{ignored}, 1, 'licensed match is ignored after reindex';
+  ok $ignored->{ignored_line}, 'match links to its ignored_lines row';
+
+  my $iid = $db->select('ignored_lines', 'id', {hash => $hash, packname => 'perl-Mojolicious'})->hash->{id};
+  $t->app->packages->remove_ignored_line($iid, 'tester');
+  $t->app->minion->perform_jobs;
+  is $current->()->{ignored}, 0, 'match returns once the ignore is removed';
 };
 
 done_testing();

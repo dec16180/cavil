@@ -6,16 +6,14 @@ use Mojo::Base -base, -signatures;
 
 use File::Unpack2;
 use File::Spec::Functions qw(catfile);
-use Mojo::DOM;
 use Mojo::File 'path';
-use Mojo::JSON qw(decode_json encode_json);
-use Mojo::Util 'dumper';
-use Cavil::Util qw(buckets expand_spec_macros parse_service_file slurp_and_decode);
-use Cavil::Licenses 'lic';
+use Cavil::Util (qw(buckets decode_json_fast encode_json_fast extract_copyrights extract_urls_and_emails fs_bytes),
+  qw(original_filename read_lines slurp_and_decode));
 use Cavil::PostProcess;
-use YAML::XS qw(Load);
+use Cavil::ReportUtil qw(is_license_filename);
 
-use constant DEBUG => $ENV{SUSE_CHECKOUT_DEBUG} || 0;
+# Aggregated legal documents are the one place notices are not clustered at the top of the file
+use constant LEGAL_DOCUMENT_SIZE => 1_000_000;
 
 has 'dir';
 
@@ -49,26 +47,23 @@ my $BLACKLIST_MIME_RE = qr!
 )
 !x;
 
-# TODO: Clean up, copied from old code
-#
-# This monstrous regexp is not exact RFC-822 conform, but quite close :-)
-# mee@foo.-oo is illgal. host names should be @(\w([\w-]*\w)?\.)+\w([\w-]*\w)?
-# This is filtered below in an additional regexp.
-#
-my $URL_RE = qr!
-  \b(\S+\s\S+)\s+[\(<]?([\w\.\+%-]+@[\w-]+\.[\w\.-]+\w)[\)>]?\s |
-  mailto:([\w\.\+%-]+@[\w-]+\.[\w\.-]+\w)["' ]*>\s*([^<@\s]+\s+[^<@\s]+)\s*< |
-  \b([\w\.\+%-]+@[\w-]+\.[\w\.-]+\w)\b |
-  \b((https?|ftp|file)://[\w-]+\.[\w\./:\\\+~-]+\w\??)\b
-!ix;
+# Matching ran against the ".processed" copy, so the recorded line numbers mean nothing in the original
+sub evidence_text ($self, $row) {
+  my $base    = path($self->dir)->child('.unpacked');
+  my $scanned = $base->child(fs_bytes($row->{filename}))->to_string;
+  my $path    = _original_file($scanned);
 
-my $LICENSE_COMMENT_RE = qr/^\s*#\s*SPDX-License-Identifier\s*:\s*(.+)\s*$/;
+  my ($sline, $eline) = ($row->{sline}, $row->{eline});
+  if ($path ne $scanned) {
+    my $lines = Cavil::PostProcess->new->original_lines($path, [$sline, $eline]);
+    ($sline, $eline) = ($lines->{$sline}, $lines->{$eline});
+    return () unless $sline && $eline;
+  }
 
-# Legal review notices, non-standard but used in SUSE packages
-my $LEGAL_REVIEW_NOTICE_RE = qr/^\s*#+\s*Legal-Review-Notice:\s*(.+)\s*$/i;
-
-# Plain "Dockerfile", multibuild flavors like "Dockerfile.driver-550", and named "foo.Dockerfile"
-my $DOCKERFILE_RE = qr/^(?:Dockerfile(?:\..+)?|.+\.Dockerfile)$/;
+  my $text = eval { read_lines($path, $sline, $eline) };
+  return () unless defined $text && length $text;
+  return ($text, path($path)->to_rel($base)->to_string . "#L$sline-L$eline");
+}
 
 sub is_unpacked ($self) { -d path($self->dir)->child('.unpacked') }
 
@@ -79,183 +74,23 @@ sub keyword_report ($self, $matcher, $meta, $file) {
   $file = $base->child($file);
   return undef unless -r $file;
 
-  _urls($file, $meta);
+  _text_metadata($base, $file, $meta);
 
   return {path => $file->to_rel($base)->to_string, matches => $matcher->find_matches($file)};
 }
 
 sub new ($class, $dir) { $class->SUPER::new(dir => $dir) }
 
-sub specfile_report ($self, $opts = {}) {
-  my $dir      = path($self->dir);
-  my $basename = $dir->dirname->basename;
-  my $unpacked = $dir->child('.unpacked');
-
-  my $info = {main => undef, sub => [], errors => [], warnings => [], incomplete_checkout => 0};
-
-  my $service_file = $unpacked->child('_service');
-
-  my $specfile_name = $basename . '.spec';
-  my $main_specfile = $unpacked->child($specfile_name);
-
-  my $debian_control_file = $unpacked->child('debian/control');
-
-  my $kiwifile_name = $basename . '.kiwi';
-  my $main_kiwifile = $unpacked->child($kiwifile_name);
-
-  my $dockerfile_name  = $basename . '.Dockerfile';
-  my $main_dockerfile  = $unpacked->child('Dockerfile');
-  my $named_dockerfile = $unpacked->child($dockerfile_name);
-
-  my $helmchart_name = 'Chart.yaml';
-  my $main_helmchart = $unpacked->child($helmchart_name);
-
-  my $is_obsprj = _is_obsprj($unpacked);
-
-  # Archive upload (no user-provided package metadata)
-  if ($opts->{upload}) {
-
-    # Look one level into the unpacked tree (through a single wrapper directory like
-    # "foo-1.0.0/") for a package file we can auto-detect metadata from
-    my $root    = $unpacked;
-    my @entries = $unpacked->list({dir => 1})->each;
-    $root = $entries[0] if @entries == 1 && -d $entries[0];
-
-    my $files          = $root->list->grep(sub { $_ !~ /\.processed\./ });
-    my $debian_control = $root->child('debian/control');
-    my $chart          = $root->child('Chart.yaml');
-    my ($spec)         = $files->grep(qr/\.spec$/)->each;
-    my ($kiwi)         = $files->grep(qr/\.kiwi$/)->each;
-    my ($dockerfile)   = $files->grep(sub { $_->basename =~ $DOCKERFILE_RE })->each;
-
-    # Auto-detect a main package file (any name), in priority order
-    my $main;
-    if    ($spec)              { $main = _specfile($spec) }
-    elsif (-f $debian_control) { $main = _debian_files($debian_control) }
-    elsif ($kiwi)              { $main = _kiwifile($kiwi) }
-    elsif ($dockerfile)        { $main = _dockerfile($dockerfile) }
-    elsif (-f $chart)          { $main = _helmchart($chart) }
-    $main->{license} = $main->{licenses}[0] if $main && @{$main->{licenses}};
-
-    # A package file is not required for an upload, so fall back to a minimal main
-    $info->{main} = $main // {file => 'upload', type => 'upload', license => undef, licenses => []};
-
-    # List all detected package files for display
-    push @{$info->{sub}}, _debian_files($debian_control) if -f $debian_control;
-    push @{$info->{sub}}, _helmchart($chart)             if -f $chart;
-    push @{$info->{sub}}, _specfile($_)   for $files->grep(qr/\.spec$/)->each;
-    push @{$info->{sub}}, _kiwifile($_)   for $files->grep(qr/\.kiwi$/)->each;
-    push @{$info->{sub}}, _dockerfile($_) for $files->grep(sub { $_->basename =~ $DOCKERFILE_RE })->each;
-  }
-
-  else {
-
-    # Service file
-    if (-f $service_file) {
-      my $services = parse_service_file($service_file->slurp);
-      for my $service (@$services) {
-        next if $service->{safe};
-        $info->{incomplete_checkout} = 1;
-        push @{$info->{errors}},
-          "Checkout might be incomplete, remote service in _service file: $service->{name} (mode: $service->{mode})";
-      }
-    }
-
-    # ObsPrj
-    if ($is_obsprj) {
-      push @{$info->{sub}},      $info->{main} = {file => 'workflow.config', type => 'obsprj', licenses => []};
-      push @{$info->{warnings}}, 'Checkout is a product in ObsPrj format and might contain packages in subdirectories';
-    }
-
-    # Main .spec file
-    elsif (-f $main_specfile) {
-      my $specfile = $info->{main} = _specfile($main_specfile);
-      if (@{$specfile->{licenses}}) { $specfile->{license} = $specfile->{licenses}[0] }
-      else {
-        push @{$info->{errors}}, qq{Main specfile contains no license: $specfile_name (expected "License: ..." entry)};
-      }
-    }
-
-    # Debian files
-    elsif (-f $debian_control_file) {
-      my $debian_files = $info->{main} = _debian_files($debian_control_file);
-      if (@{$debian_files->{licenses}}) { $debian_files->{license} = $debian_files->{licenses}[0] }
-      else {
-        push @{$info->{errors}}, qq{Package contains no license: debian/copyright (expected "License: ..." entry)};
-      }
-    }
-
-    # Main .kiwi file
-    elsif (-f $main_kiwifile) {
-      my $kiwifile = $info->{main} = _kiwifile($main_kiwifile);
-      if (@{$kiwifile->{licenses}}) { $kiwifile->{license} = $kiwifile->{licenses}[0] }
-      else {
-        push @{$info->{errors}},
-          qq{Main kiwifile contains no license: $kiwifile_name (expected <label name="org.opencontainers.image.licenses" value="..."> tag)};
-      }
-    }
-
-    # Main .Dockerfile file
-    elsif (-f $main_dockerfile) {
-      my $dockerfile = $info->{main} = _dockerfile($main_dockerfile);
-      if (@{$dockerfile->{licenses}}) { $dockerfile->{license} = $dockerfile->{licenses}[0] }
-      else {
-        push @{$info->{errors}},
-          qq{Main Dockerfile contains no license: Dockerfile (expected "# SPDX-License-Identifier: ..." comment)};
-      }
-    }
-    elsif (-f $named_dockerfile) {
-      my $dockerfile = $info->{main} = _dockerfile($named_dockerfile);
-      if (@{$dockerfile->{licenses}}) { $dockerfile->{license} = $dockerfile->{licenses}[0] }
-      else {
-        push @{$info->{errors}},
-          qq{Main Dockerfile contains no license: $dockerfile_name (expected "# SPDX-License-Identifier: ..." comment)};
-      }
-    }
-
-    # Main Chart.yaml file
-    elsif (-f $main_helmchart) {
-      my $helmchart = $info->{main} = _helmchart($main_helmchart);
-      if (@{$helmchart->{licenses}}) { $helmchart->{license} = $helmchart->{licenses}[0] }
-      else {
-        push @{$info->{errors}},
-          qq{Main Helm chart contains no license: $helmchart_name (expected "# SPDX-License-Identifier: ..." comment)};
-      }
-
-      # For now we only expect one Chart.yaml file
-      push @{$info->{sub}}, $helmchart;
-    }
-
-    # No main files
-    else {
-      push @{$info->{errors}}, "Main package file missing: expected $specfile_name, debian/control, $kiwifile_name,"
-        . " $dockerfile_name, Dockerfile, or Chart.yaml";
-    }
-
-    # Debian files
-    push @{$info->{sub}}, _debian_files($debian_control_file) if -f $debian_control_file;
-
-    # All .spec files
-    my $files = $unpacked->list->grep(sub { $_ !~ /\.processed\./ });
-    push @{$info->{sub}}, _specfile($_) for $files->grep(qr/\.spec$/)->each;
-
-    # All .kiwi files
-    push @{$info->{sub}}, _kiwifile($_) for $files->grep(qr/\.kiwi$/)->each;
-
-    # All Dockerfiles
-    push @{$info->{sub}}, _dockerfile($_) for $files->grep(sub { $_->basename =~ $DOCKERFILE_RE })->each;
-
-    _check($info);
-  }
-
-  warn dumper $info if DEBUG;
-  return $info;
-}
-
 sub unpack ($self, $options = {}) {
   my $dir    = path($self->dir);
   my $unpack = $dir->child('.unpacked')->remove_tree;
-  my $log    = $dir->child('.postprocessed.json');
+
+  # Cavil's own derived documents (Cavil::Model::Packages::DOCUMENTS), stale the moment the tree is rebuilt.
+  # Deleted rather than excluded from the unpack: an exclusion glob matches every directory level, so a
+  # package shipping its own ".report.*" file would silently lose it from the index. Unpacking ours is not
+  # cosmetic either - it decompresses a NOTICE of pure license text back into the package.
+  $_->remove for $dir->list({hidden => 1})->grep(sub { $_->basename =~ /^\.report\./ })->each;
+  my $log = $dir->child('.postprocessed.json');
   unlink $log;
   $log = $dir->child('.unpacked.json');
   unlink $log;
@@ -270,9 +105,6 @@ sub unpack ($self, $options = {}) {
   my $u = File::Unpack2->new(
     verbose => 0,
 
-    # chromium's tar is 23GB (uncompressed, as file::unpack2
-    # first xz -cd before extracting tar, we need to need that
-    # much. And reserve some space for future growth)
     maxfilesize          => '30G',
     one_shot             => 0,
     no_op                => 0,
@@ -298,13 +130,6 @@ sub unpack ($self, $options = {}) {
 
   $u->exclude(vcs => 1);
 
-  # Never unpack Cavil's own generated SPDX report that lives in the checkout dir. On a re-unpack it
-  # would otherwise be exploded into .unpacked (and line-wrapped by postprocess) on every pass -
-  # pure waste, as these reports can be huge. The compact .report.spdx.json.gz stays in the checkout
-  # dir untouched; it is simply not unpacked. Matches both the .report.spdx.* and legacy
-  # .report.processed.spdx.* names.
-  $u->exclude(add => '.report*.spdx*');
-
   if (my $exclude = $options->{exclude}) {
     $u->exclude($_) for @$exclude;
   }
@@ -316,15 +141,33 @@ sub unpack ($self, $options = {}) {
     return;
   }
 
-  my $unpacked  = decode_json($dir->child('.unpacked.json')->slurp);
+  my $unpacked = decode_json_fast($dir->child('.unpacked.json')->slurp);
+  $unpacked->{unpacked} = _byte_names($unpacked->{unpacked});
   my $processor = Cavil::PostProcess->new($unpacked);
   $processor->postprocess;
-  $dir->child('.postprocessed.json')->spew(encode_json($processor->hash));
+  $dir->child('.postprocessed.json')->spew(encode_json_fast($processor->hash));
+
+  # Whatever we had read before is what the previous unpack produced
+  delete $self->{_unpacked};
+}
+
+# The file list of a big package is several megabytes and an index job reads it twice in a row, once
+# for the stats and once for the buckets, so hold on to it for the life of the checkout object
+sub _unpacked ($self) {
+  return $self->{_unpacked}
+    //= _byte_names(decode_json_fast(path($self->dir)->child('.postprocessed.json')->slurp)->{unpacked});
+}
+
+# File names are recorded as the bytes found on disk, and JSON decoding turns those into characters: a
+# name holding any byte above 0x7f then opens nothing, and postprocess erases every file it cannot open.
+# Hand every reader the bytes back, so one name works for the filesystem, the database and the report.
+sub _byte_names ($unpacked) {
+  return {map { fs_bytes($_) => $unpacked->{$_} } keys %$unpacked};
 }
 
 sub unpacked_file_stats ($self) {
   my $dir      = scalar $self->dir;
-  my $unpacked = decode_json(path($self->dir)->child('.postprocessed.json')->slurp)->{unpacked};
+  my $unpacked = $self->_unpacked;
 
   my $stats = {files => scalar keys %$unpacked, size => 0};
   for my $file (keys %{$unpacked}) {
@@ -335,17 +178,13 @@ sub unpacked_file_stats ($self) {
 }
 
 sub unpacked_files ($self, $bucket_size = undef) {
-  my $dir      = path($self->dir);
-  my $unpacked = decode_json($dir->child('.postprocessed.json')->slurp)->{unpacked};
+  my $unpacked = $self->_unpacked;
 
   my @files;
   for my $file (sort keys %{$unpacked}) {
 
-    # Cavil's own SPDX report can reappear when a checkout is unpacked more than once: the previous
-    # .report.spdx.json[.gz] is unpacked again, and postprocess may line-wrap the uncompressed copy
-    # into .report.spdx.processed.json. Never index any of these - the ".processed" marker can land
-    # after ".report" or after ".spdx" depending on which name postprocess rewrote.
-    next if $file =~ /\.report(?:\.processed)?\.spdx(?:\.processed)?(?:\.json)?(?:\.gz)?$/;
+    # Second line of defence, for a tree an older Cavil unpacked before the removal above existed
+    next if $file =~ m{^\.report\.};
 
     my $mime = $unpacked->{$file}{mime};
     next if $mime =~ $BLACKLIST_MIME_RE;
@@ -358,187 +197,31 @@ sub unpacked_files ($self, $bucket_size = undef) {
   return buckets(\@files, $bucket_size);
 }
 
-sub _add_once ($queue, $msg) {
-  return if grep { $_ eq $msg } @$queue;
-  push @$queue, $msg;
-}
-
-sub _check ($info) {
-  my $errors   = $info->{errors};
-  my $warnings = $info->{warnings};
-
-  my $mlicense = $info->{main}{license};
-  my $main     = lic($mlicense);
-  if (my $err = $main->error) { push @$errors, $err and return }
-  _add_once($warnings, "Main license has license exception: $mlicense")         if $main->exception;
-  _add_once($warnings, "Main license had to be normalized: $mlicense -> $main") if $main->normalized;
-
-  for my $file (@{$info->{sub}}) {
-    my $spec = $file->{file};
-    for my $license (@{$file->{licenses}}) {
-      my $sub = lic($license);
-      if (my $err = $sub->error) { push @$errors, $err and next }
-
-      _add_once($warnings, "License from $spec has license exception: $license")        if $sub->exception;
-      _add_once($warnings, "License from $spec had to be normalized: $license -> $sub") if $sub->normalized;
-
-      _add_once($warnings, "License from $spec is not part of main license: $license") unless $main->is_part_of($sub);
-    }
-  }
-}
-
-sub _debian_files ($file) {
-  my $info = {file => 'debian', type => 'debian', licenses => []};
-
-  for my $line (split "\n", $file->slurp) {
-    if    ($line =~ /^Homepage:\s*(.+)\s*$/)          { $info->{url} = $1 }
-    elsif ($line =~ /^Standards-Version:\s*(.+)\s*$/) { $info->{version} ||= $1 }
-  }
-
-  my $copyright_file = $file->sibling('copyright');
-  if (-f $copyright_file) {
-    for my $line (split "\n", $copyright_file->slurp) {
-      if ($line =~ /^License:\s*(.+)\s*$/) { push @{$info->{licenses}}, $1 }
-    }
-  }
-
-  return $info;
-}
-
-sub _dockerfile ($file) {
-  my $info = {file => $file->basename, type => 'dockerfile', licenses => [], legal_review_notices => []};
-  for my $line (split "\n", $file->slurp) {
-    if    ($line =~ $LICENSE_COMMENT_RE)                                 { push @{$info->{licenses}}, $1 }
-    elsif ($line =~ /^.*org.opencontainers.image.version="(.+)".*$/)     { $info->{version} ||= $1 }
-    elsif ($line =~ /^.*org.opencontainers.image.description="(.+)".*$/) { $info->{summary} ||= $1 }
-    elsif ($line =~ $LEGAL_REVIEW_NOTICE_RE)                             { push @{$info->{legal_review_notices}}, $1 }
-  }
-
-  return $info;
-}
-
-sub _helmchart ($file) {
-  my $info = {file => $file->basename, type => 'helm', licenses => [], legal_review_notices => []};
-  for my $line (split "\n", $file->slurp) {
-    if    ($line =~ $LICENSE_COMMENT_RE)     { push @{$info->{licenses}},             $1 }
-    elsif ($line =~ $LEGAL_REVIEW_NOTICE_RE) { push @{$info->{legal_review_notices}}, $1 }
-  }
-
-  my $data = eval { Load($file->slurp) };
-  if (ref $data eq 'HASH') {
-    if (my $version = $data->{version})     { $info->{version} = $version }
-    if (my $summary = $data->{description}) { $info->{summary} = $summary }
-    if (my $url     = $data->{home})        { $info->{url}     = $url }
-  }
-
-  return $info;
-}
-
-sub _is_obsprj ($unpacked) {
-  my $config = $unpacked->child('workflow.config');
-  return 0 unless -f $config;
-  return 0 unless my $data = eval { decode_json($config->slurp) };
-  return 0 unless ref $data eq 'HASH' && exists $data->{Workflows} && exists $data->{GitProjectName};
-  return 1;
-}
-
-sub _kiwifile ($file) {
-  my $info = {file => $file->basename, type => 'kiwi', licenses => []};
-  my $dom  = Mojo::DOM->new($file->slurp);
-
-  # Licenses
-  for my $label ($dom->find('label[name="org.opencontainers.image.licenses"]')->each) {
-    next unless my $value = $label->{value};
-    push @{$info->{licenses}}, $value;
-  }
-
-  # Version
-  if (my $version = $dom->at('image preferences version')) { $info->{version} = $version->text }
-
-  # Summary
-  if (my $summary = $dom->at('image description specification')) { $info->{summary} = $summary->text }
-
-  # URL
-  if (my $url = $dom->at('image description contact')) { $info->{url} = $url->text }
-
-  return $info;
-}
-
-sub _specfile ($file) {
-  my $info = {
-    file                 => $file->basename,
-    type                 => 'spec',
-    licenses             => [],
-    sources              => [],
-    '%doc'               => [],
-    '%license'           => [],
-    legal_review_notices => []
-  };
-  for my $line (split "\n", expand_spec_macros($file->slurp)) {
-
-    # Standard metadata fields
-    if    ($line =~ /^License:\s*(.+)\s*$/)        { push @{$info->{licenses}},   $1 }
-    elsif ($line =~ /^Source(?:\d+)?:\s*(.+)\s*$/) { push @{$info->{sources}},    $1 }
-    elsif ($line =~ /^\%doc\s*(.+)\s*$/)           { push @{$info->{'%doc'}},     $1 }
-    elsif ($line =~ /^\%license\s*(.+)\s*$/)       { push @{$info->{'%license'}}, $1 }
-    elsif ($line =~ /^Version:\s*(.+)\s*$/)        { $info->{version} ||= $1 }
-    elsif ($line =~ /^Summary:\s*(.+)\s*$/)        { $info->{summary} ||= $1 }
-    elsif ($line =~ /^Group:\s*(.+)\s*$/)          { $info->{group}   ||= $1 }
-    elsif ($line =~ /^Url:\s*(.+)\s*$/i)           { $info->{url}     ||= $1 }
-
-    # Legal review notices
-    elsif ($line =~ $LEGAL_REVIEW_NOTICE_RE) { push @{$info->{legal_review_notices}}, $1 }
-  }
-
-  return $info;
-}
-
-# TODO: Clean up, copied from old code
-#
-# If defined, $prefix is prepended to $text; matches in prefix will result in
-# negative offsets.
-# Normal text offsets are always relative to the start of $text.
-# This can be used to give the filename or other meta data that should match
-# too.
-#
-sub _urls ($file, $meta) {
+sub _text_metadata ($base, $file, $meta) {
   my $text = slurp_and_decode($file);
   return undef unless defined $text;
+  extract_urls_and_emails($text, $meta);
 
-# urls with query string have their query strings removed. only the question
-# mark char remains.
-# urls with user@ are currently not supported.
-  while ($text =~ /$URL_RE/g) {
-    my ($name, $email, $email2, $name2, $email3, $url) = ($1, $2, $3, $4, $5, $6);
-    $email = $email2 unless defined $email;
-    $email = $email3 unless defined $email;
-    $name  = $name2  unless defined $name;
+  # Never the ".processed" copy: its line wrapping splits a notice from the holder it names, leaving
+  # "Copyright (c) 2019" with the names gone. Re-reading is skipped where it would read the same bytes.
+  my $original = _original_file($file);
+  $text = _copyright_text($original) // $text if $original ne $file || is_license_filename($original);
 
-    # name: want mixed case, no digits, little punctation
-    # url and email: skip example.org adresses.
+  my $name = path($original)->to_rel($base)->to_string;
+  push @{$meta->{copyrights}{$_}}, $name for keys %{extract_copyrights($text)};
 
-    $email = undef if defined $email and $email =~ m{(\@-|\@.*(\.-|-\.))};             # RFC 822 illegal
-    $email = undef if defined $email and $email =~ m{[\@\.]example\.(net|com|org)};    # RFC 2606
-    $url   = undef if defined $url   and $url   =~ m{[/\.]example\.(net|com|org)};     # RFC 2606
-    $name  = undef if defined $name  and ($name eq lc $name or $name =~ m{[\(\):\d,\n\r]});
+  return undef;
+}
 
-    # file:// urls not wanted in our context.
-    $url = undef if defined $url and $url =~ m{^file:/};
+# Matching runs against the ".processed" copy, but reading content wants the file it was made from
+sub _original_file ($path) {
+  my $original = original_filename($path);
+  return $original ne $path && -f $original ? $original : $path;
+}
 
-    # put each url,email or cve in the list only once. (Once per file.)
-    if (defined $email) {
-      $email = lc $email;
-      $meta->{emails}->{$email} ||= {name => undef, count => 0};
-      $meta->{emails}->{$email}->{count}++;
-      $meta->{emails}->{$email}->{name} ||= $name;
-    }
-    if (defined $url) {
-      $url =~ s{^(\w+://.[^/])}{lc $1}e;
-      $meta->{urls}->{$url} ||= 0;
-      $meta->{urls}->{$url}++;
-    }
-  }
-
+sub _copyright_text ($path) {
+  return undef unless -f $path;
+  return eval { is_license_filename($path) ? slurp_and_decode($path, LEGAL_DOCUMENT_SIZE) : slurp_and_decode($path) };
 }
 
 1;

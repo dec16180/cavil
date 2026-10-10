@@ -23,20 +23,15 @@ t.test('Cavil UI - inline editor on match rows', skipUnlessOnline, async t => {
     await page.click('text=Artistic');
     await page.waitForSelector('#license-chart');
 
-    // Wait until at least one auto-expanded risk-9 file has rendered a
-    // match-start row. That's where the new ▲ button attaches.
-    await page.waitForFunction(() => document.querySelector('.file-container:not(.d-none) tr.match-start'), {
-      timeout: 10000
-    });
-
-    // Pick the first auto-expanded risk-9 file. Both subtests below operate
-    // on the same match-start so the "+" subtest sees a range that has been
-    // extended in both directions.
+    // Open the first risk-9 file. Both subtests below operate on the same match-start so the "+" subtest
+    // sees a range that has been extended in both directions.
+    await page.locator('#filelist-snippets .file-link').first().click();
+    await page.waitForSelector('.report-match-panel tr.match-start');
     const fileId = await page.evaluate(() => {
-      const row = document.querySelector('.file-container:not(.d-none) tr.match-start');
+      const row = document.querySelector('.report-match-panel tr.match-start');
       return Number(row.id.match(/^line-(\d+)-/)[1]);
     });
-    t.ok(fileId, `found auto-expanded risk-9 file: file-${fileId}`);
+    t.ok(fileId, `opened risk-9 file: file-${fileId}`);
 
     await page.locator(`#file-details-${fileId} tr.match-start`).first().scrollIntoViewIfNeeded();
 
@@ -83,7 +78,7 @@ t.test('Cavil UI - inline editor on match rows', skipUnlessOnline, async t => {
     const start0 = await readStartLine();
     const end0 = await readEndLine();
 
-    await t.test('Extend up multiple times — selection grows, button stays under cursor', async t => {
+    await t.test('Extend up multiple times - selection grows, button stays under cursor', async t => {
       t.ok(start0 > 3, `match-start at line ${start0} has room to extend three lines up`);
 
       let currentLine = start0;
@@ -116,7 +111,7 @@ t.test('Cavil UI - inline editor on match rows', skipUnlessOnline, async t => {
       t.equal(currentLine, start0 - 3, 'three clicks decremented the match-start by exactly 3');
     });
 
-    await t.test('Extend down multiple times — selection grows, button stays under cursor', async t => {
+    await t.test('Extend down multiple times - selection grows, button stays under cursor', async t => {
       t.ok(end0, `match has a ▼ button at line ${end0}`);
 
       // Guarantee room below the report so the cursor-stick watcher's
@@ -195,7 +190,7 @@ t.test('Cavil UI - inline editor on match rows', skipUnlessOnline, async t => {
       // known snippet (the previous subtest reset it). The inline editor
       // button must stay rendered (used to be gated on line[1].snippet, which
       // is dropped after extending) AND must open the editor without hanging
-      // — the click handler has to coerce the server's synthetic snippet=0
+      // - the click handler has to coerce the server's synthetic snippet=0
       // marker to null, otherwise openEditor skips the from_file fetch and
       // mounts SnippetEditor against a non-existent snippet.
       const reExtendStartRow = page.locator(`#file-details-${fileId} tr.match-start`).first();
@@ -253,6 +248,83 @@ t.test('Cavil UI - inline editor on match rows', skipUnlessOnline, async t => {
       await closeBtn.click();
       await page.locator('.cavil-pattern-tip-floating').waitFor({state: 'detached'});
       t.pass('close button dismisses the pinned pattern tooltip');
+
+      await page.locator('#inline-snippet-editor [data-action="cancel"]').click();
+      await waitForInlineSnippetEditorClosed(page);
+    });
+
+    // The gutter picker has to coexist with the match rows: mid-pick there is one thing to click, and a
+    // finished range acts through the same button a match group does.
+    await t.test('Picking a range beside the match rows', async t => {
+      const rows = page.locator(`#file-details-${fileId} tbody tr`);
+      const plain = rows.filter({has: page.locator('td.actions .select-line-btn')});
+      t.ok(await plain.count(), 'lines outside every match group offer the gutter');
+
+      // Hovering a match row reveals that whole group's controls, which must not now mean a gutter button
+      // on every one of its lines
+      const groupStart = page.locator(`#file-details-${fileId} tr.match-start`).first();
+      await groupStart.scrollIntoViewIfNeeded();
+      await groupStart.hover();
+      await page.waitForFunction(() => document.querySelectorAll('tr.group-hovered').length > 1, null, {
+        timeout: 5000
+      });
+      const litUp = await page.evaluate(
+        id =>
+          [...document.querySelectorAll(`#file-details-${id} .select-line-btn`)].filter(
+            btn => getComputedStyle(btn).opacity !== '0'
+          ).length,
+        fileId
+      );
+      t.equal(litUp, 0, 'hovering a match group lights up no gutter buttons at all, let alone one per line');
+
+      const first = plain.first();
+      await first.scrollIntoViewIfNeeded();
+      const lineOf = row => row.locator('td.linenumber').evaluate(el => Number(el.innerText.trim()));
+      const start = await lineOf(first);
+      await first.locator('.select-line-btn').click();
+
+      // A half-made selection owns the file: the match rows' own buttons step aside until it is finished
+      t.equal(
+        await page.locator(`#file-details-${fileId} .snippet-tool-btn:not(.select-line-btn):visible`).count(),
+        0,
+        'mid-pick nothing else is clickable'
+      );
+
+      const third = plain.nth(2);
+      const end = await lineOf(third);
+      await third.hover();
+      await third.locator('.select-line-btn').click();
+      t.equal(
+        await page.locator(`#file-details-${fileId} tr.line-selected`).count(),
+        end - start + 1,
+        'the committed range covers anchor to confirmation'
+      );
+
+      const pen = page.locator(`#file-details-${fileId} tr.line-selected td.quick-actions a`);
+      t.match(
+        await pen.getAttribute('href'),
+        new RegExp(`^/snippets/from_file/${fileId}/${start}/${end}`),
+        'and acts on exactly those lines'
+      );
+
+      await pen.click();
+      await waitForInlineSnippetEditor(page);
+      t.equal(await page.locator(`#file-details-${fileId} tr.line-selected`).count(), 0, 'the range is released');
+
+      // Creating the snippet returns its checksum, so the editor has the context that gates the
+      // ignore, missing-license and no-legal-text actions - previously these only appeared after a
+      // reload because a picked selection reached the editor with no hash.
+      await page.locator('#inline-snippet-editor [data-action="propose-missing"]').waitFor({state: 'attached'});
+      t.equal(
+        await page.locator('#inline-snippet-editor [data-action="propose-missing"]').count(),
+        1,
+        'the Missing License action is offered on a freshly picked selection'
+      );
+      t.equal(
+        await page.locator('#inline-snippet-editor [data-action="mark-non-license"]').count(),
+        1,
+        'and so is No Legal Text'
+      );
 
       await page.locator('#inline-snippet-editor [data-action="cancel"]').click();
       await waitForInlineSnippetEditorClosed(page);

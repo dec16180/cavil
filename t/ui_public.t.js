@@ -9,6 +9,23 @@ t.test('Cavil UI - public browsing', skipUnlessOnline, async t => {
   const ui = await launchUi('js_ui_public');
   const {page, url, errorLogs} = ui;
 
+  const assertReviewLinkHierarchy = async (t, listSelector) => {
+    const packageLink = page.locator(`${listSelector} .cavil-list-package a`).first();
+    const reportLink = page.locator(`${listSelector} .cavil-list-report a`).first();
+    await packageLink.waitFor();
+
+    const packageColor = await packageLink.evaluate(link => getComputedStyle(link).color);
+    const reportColor = await reportLink.evaluate(link => getComputedStyle(link).color);
+    t.not(packageColor, reportColor, 'package link is quieter than the report link');
+
+    await packageLink.hover();
+    t.equal(
+      await packageLink.evaluate(link => getComputedStyle(link).color),
+      reportColor,
+      'package link uses the report accent on hover'
+    );
+  };
+
   try {
     await t.test('Navigation', async t => {
       await page.goto(url);
@@ -17,6 +34,7 @@ t.test('Cavil UI - public browsing', skipUnlessOnline, async t => {
       t.equal(await page.innerText('title'), 'List open reviews');
       await page.click('text=Recently Reviewed');
       t.equal(await page.innerText('title'), 'List recent reviews');
+      await page.waitForSelector('#recent-reviews .cavil-review-docket-table');
       await page.click('text=Products');
       t.equal(await page.innerText('title'), 'List products');
     });
@@ -33,22 +51,23 @@ t.test('Cavil UI - public browsing', skipUnlessOnline, async t => {
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(2) > td:nth-child(3)'), /ago/);
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(2) > td:nth-child(4)'), 'perl-Mojolicious');
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(2) > td:nth-child(5)'), /GPL-1\.0/);
-      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(2)'), 'obs#123456');
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(2)'), 'obs#123456\nCVE');
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(3)'), /ago/);
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(4)'), 'harbor-helm');
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(5)'), /Unknown/);
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(2)'), 'test#1');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(3)'), '');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(4)'), 'perl-UI-Test1');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(5)'), 'not yet imported');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(2)'), 'test#6');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(3)'), '');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(4)'), 'perl-UI-Test6');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(5)'), 'not yet imported');
+      await assertReviewLinkHierarchy(t, '#open-reviews');
 
       await page.click('text=Next');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(2)'), 'test#7');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), '');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(4)'), 'perl-UI-Test7');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(5)'), 'not yet imported');
 
@@ -74,38 +93,38 @@ t.test('Cavil UI - public browsing', skipUnlessOnline, async t => {
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(2) > td:nth-child(3)'), /ago/);
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(2) > td:nth-child(4)'), 'perl-Mojolicious');
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(2) > td:nth-child(5)'), /GPL-1\.0/);
-      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(2)'), 'obs#123456');
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(2)'), 'obs#123456\nCVE');
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(3)'), /ago/);
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(4)'), 'harbor-helm');
       t.match(await page.innerText('#open-reviews tbody > tr:nth-child(3) > td:nth-child(5)'), /Unknown/);
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(2)'), 'test#1');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(3)'), '');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(4)'), 'perl-UI-Test1');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(4) > td:nth-child(5)'), 'not yet imported');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(2)'), 'test#6');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(3)'), '');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(4)'), 'perl-UI-Test6');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(5)'), 'not yet imported');
 
       await page.click('text=Next');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(2)'), 'test#7');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), '');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(4)'), 'perl-UI-Test7');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(5)'), 'not yet imported');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(2)'), 'test#17');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(3)'), '');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(4)'), 'perl-UI-Test17');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(10) > td:nth-child(5)'), 'not yet imported');
 
       await page.click('text=Next');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(2)'), 'test#18');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), '');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(4)'), 'perl-UI-Test18');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(5)'), 'not yet imported');
 
       await page.click('text=Previous');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(2)'), 'test#7');
-      t.match(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), /ago/);
+      t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(3)'), '');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(4)'), 'perl-UI-Test7');
       t.equal(await page.innerText('#open-reviews tbody > tr:nth-child(1) > td:nth-child(5)'), 'not yet imported');
 

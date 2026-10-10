@@ -4,45 +4,43 @@
 package Cavil::Model::Patterns;
 use Mojo::Base -base, -signatures;
 
-use Cavil::Util
-  qw(license_is_catch_all normalize_license_expr paginate pattern_checksum spdx_link text_shingle_ids SNIPPET_SCORE_VERSION);
-use List::Util qw(min);
-use Mojo::File qw(path);
+use Cavil::Util qw(license_is_catch_all license_link normalize_license_expr paginate pattern_checksum),
+  qw(pattern_contains_skip),
+  qw(spdx_link text_shingle_ids SNIPPET_SCORE_VERSION PRIORITY_WAITING @LICENSE_FLAGS @PATTERN_FLAGS);
+use List::Util qw(max min sum);
+use Mojo::File qw(path tempfile);
 use Mojo::JSON qw(true false);
 use Mojo::Util qw(md5_sum);
 use Cavil::PatternEngine;
 
-# Candidate licenses pulled from a snippet's most distinctive shingles before precise re-scoring
+# Bounds of the cavil_test_pattern dry run (also run on every AI pattern proposal)
+use constant TEST_PATTERN_CANDIDATES => 1000;
+use constant TEST_PATTERN_TIMEOUT    => 10;
+
 use constant SIMILARITY_PROBE_SHINGLES => 20;
 
-# Tokens per shingle for the snippet similarity scorer. Empirically (eval_fold on the full corpus)
-# k=3 gives the best precision; larger k trades precision for recall.
+# Corpus evaluation found three-token shingles give the best precision.
 use constant SIMILARITY_SHINGLE_SIZE => 3;
 
-# Required-phrase gate: the winning license must share at least MIN_DISTINCTIVE shingles this
-# distinctive (IDF, i.e. present in few licenses) with the snippet. The count requirement (>=2) kills
-# the dominant real-world false fold: tiny generic header fragments ("Disclaimer", "Attribution")
-# matching a pseudo-license on a single token. Calibrate with "cavil eval_fold" / staging snippets.
+# Require two rare shared shingles to reject generic single-token matches.
 use constant SIMILARITY_DISTINCTIVE_IDF => 4.0;
 use constant SIMILARITY_MIN_DISTINCTIVE => 2;
 
 has [qw(cache log pg minion)];
 
-# The compiled matcher and the tf-idf bag are cached under engine-specific filenames, because their
-# on-disk formats differ between engines. This lets an instance switch engines (or run "matcher-diff")
-# without ever reading a cache written by the other one. Snippet-similarity data lives in the database
-# (pattern_shingles / shingle_license), not on disk, so it needs no cache file here.
+# Snippet-similarity data lives in the database (pattern_shingles / shingle_license), not on disk, so only
+# the compiled matcher and the tf-idf bag are cached here.
 sub matcher_cache_file ($self) {
-  return path($self->cache, Cavil::PatternEngine::name() eq 'cavil' ? 'cavil.matcher' : 'cavil.tokens');
+  return path($self->cache, 'cavil.matcher');
 }
 
 sub bag_cache_file ($self) {
-  return path($self->cache, Cavil::PatternEngine::name() eq 'cavil' ? 'cavil.pattern.bag.cavil' : 'cavil.pattern.bag');
+  return path($self->cache, 'cavil.pattern.bag.cavil');
 }
 
 sub _all_cache_files ($self) {
   my $cache = path($self->cache);
-  return map { $cache->child($_) } qw(cavil.tokens cavil.matcher cavil.pattern.bag cavil.pattern.bag.cavil);
+  return map { $cache->child($_) } qw(cavil.matcher cavil.pattern.bag.cavil);
 }
 
 use constant LICENSE_DETAIL_MATCH_LIMIT   => 10_000;
@@ -50,27 +48,34 @@ use constant LICENSE_DETAIL_PACKAGE_LIMIT => 1_000;
 use constant LICENSE_PREDICTION_THRESHOLD => 0.3;
 use constant LICENSE_PREDICTION_LIMIT     => 10;
 
+# One risk/flags combination per license for pre-filling editors. Catch-alls ("Any ...") carry patterns at
+# many risks, so pick deterministically: the most common combination wins (ascending order, last write
+# wins), the higher risk on a tie. Anything that must not guess uses license_risks instead.
 sub autocomplete ($self) {
   my $licenses = {};
 
-  my $patterns
-    = $self->pg->db->query(
-    'SELECT DISTINCT(license), risk, patent, trademark, export_restricted, cla, eula, catch_all FROM license_patterns')
-    ->hashes;
+  my $columns  = join ', ', @LICENSE_FLAGS;
+  my $patterns = $self->pg->db->query(
+    "SELECT license, risk, $columns, catch_all, COUNT(*) AS patterns FROM license_patterns
+      GROUP BY license, risk, $columns, catch_all ORDER BY patterns ASC, risk ASC"
+  )->hashes;
   for my $pattern ($patterns->each) {
-    $licenses->{$pattern->{license}} = {
-      risk              => $pattern->{risk},
-      patent            => $pattern->{patent},
-      trademark         => $pattern->{trademark},
-      export_restricted => $pattern->{export_restricted},
-      cla               => $pattern->{cla},
-      eula              => $pattern->{eula},
-      catch_all         => $pattern->{catch_all}
-    };
+    $licenses->{$pattern->{license}}
+      = {risk => $pattern->{risk}, catch_all => $pattern->{catch_all}, map { $_ => $pattern->{$_} } @LICENSE_FLAGS};
   }
   delete $licenses->{''};
 
   return $licenses;
+}
+
+# Every risk level a license's patterns use, lowest first, with the pattern count and the flags and text of
+# its oldest pattern as an example (the one most likely to be curated rather than derived).
+sub license_risks ($self, $license) {
+  my $columns = join ', ', @LICENSE_FLAGS;
+  return $self->pg->db->query(
+    "SELECT DISTINCT ON (risk) risk, $columns, pattern AS example, COUNT(*) OVER (PARTITION BY risk) AS patterns
+       FROM license_patterns WHERE license = ? ORDER BY risk ASC, id ASC", $license
+  )->hashes->to_array;
 }
 
 sub closest_licenses ($self, $expr) {
@@ -114,11 +119,7 @@ sub closest_matches ($self, $text, $num) {
   return $bag->best_for($text, $num);
 }
 
-# Incrementally maintain pattern_shingles for one pattern: replace its rows with the shingles of its
-# current text, tagged with its current license. Called whenever a pattern's text or license is created,
-# updated or imported; deletes are handled by the table's ON DELETE CASCADE. Runs on the caller's $db so
-# it shares the pattern write's transaction. An empty-license pattern (the keyword-detection layer) is
-# never a fold target, so it is not stored.
+# Use the caller's transaction; empty-license keyword patterns are not fold targets.
 sub sync_pattern_shingles ($self, $db, $id, $license, $text) {
   $db->query('DELETE FROM pattern_shingles WHERE pattern_id = ?', $id);
   return unless defined $license && length $license;
@@ -155,7 +156,6 @@ sub backfill_pattern_shingles ($self) {
   return $self;
 }
 
-# --- Snippet similarity scoring ----------------------------------------------------------------------
 # Snippets are scored by IDF-weighted containment against per-license signatures - the union of a
 # license's patterns' token-shingles. The data lives in two tables maintained incrementally as patterns
 # change (see sync_pattern_shingles): shingle_license is the license-level inverted index (one row per
@@ -379,39 +379,78 @@ sub score_package_snippets ($self, $package_id, $generation = 0) {
   $tx->commit;
 }
 
+# spdx is shared by every pattern of a license, not a per-pattern form field: inherit it from an existing
+# sibling pattern of the same license (a brand-new license has none, and gets an empty identifier). On
+# updates pass the pattern's own id as $exclude_id so it never inherits a stale value from itself.
+# catch_all is not inherited, it follows from the license name, which is what keeps the two in step.
+sub _license_properties ($self, $db, $license, $exclude_id = undef) {
+  my %props = (spdx => '', catch_all => license_is_catch_all($license) ? 1 : 0);
+  return \%props unless defined $license && length $license;
+
+  my $sql  = 'SELECT spdx FROM license_patterns WHERE license = ?';
+  my @bind = ($license);
+  if (defined $exclude_id) {
+    $sql .= ' AND id <> ?';
+    push @bind, $exclude_id;
+  }
+  $sql .= ' LIMIT 1';
+
+  if (my $sibling = $db->query($sql, @bind)->hash) { $props{spdx} = $sibling->{spdx} }
+  return \%props;
+}
+
+# At most one row per license can satisfy this, so the caller never has to choose. The catch_all condition is
+# not redundant: "backfill-catch-all" re-derives that column from the name, long after a text was curated.
+sub full_license_texts ($self, $licenses) {
+  return {} unless @$licenses;
+  my $rows
+    = $self->pg->db->query(
+    'SELECT license, pattern FROM license_patterns WHERE license = ANY(?) AND full_license_text AND NOT catch_all',
+    $licenses);
+  return {map { $_->{license} => $_->{pattern} } $rows->hashes->each};
+}
+
+# The text is printed verbatim, so a wildcard would ship as part of the license, and a catch-all has no
+# license to print
+sub full_license_text_error ($self, %args) {
+  return undef unless $args{full_license_text};
+  return 'A catch-all license has no text to reproduce'      if $args{catch_all};
+  return 'A full license text cannot contain a $SKIP marker' if pattern_contains_skip($args{pattern} // '');
+  return undef;
+}
+
+# Exclusive per license, so the previous answer has to go. Before the write, or the unique index rejects it.
+sub _release_full_license_text ($db, $license, $except = undef) {
+  my $where = {license => $license, full_license_text => 1};
+  $where->{id} = {'!=' => $except} if defined $except;
+  $db->update('license_patterns', {full_license_text => 0}, $where);
+}
+
 sub create ($self, %args) {
   my $checksum = pattern_checksum($args{pattern});
   my $id       = $self->pattern_exists($checksum);
   return {conflict => $id} if $id;
 
-  # Inherit per-license properties (spdx, catch_all) from already known licenses; for a brand-new
-  # license derive catch_all from its name so the "covered" gate treats it consistently right away.
-  my $db        = $self->pg->db;
-  my $spdx      = '';
-  my $catch_all = license_is_catch_all($args{license}) ? 1 : 0;
-  if (my $license = $args{license}) {
-    my $pattern = $db->query('SELECT spdx, catch_all FROM license_patterns WHERE license = ? LIMIT 1', $license)->hash;
-    if ($pattern) {
-      $spdx      = $pattern->{spdx};
-      $catch_all = $pattern->{catch_all};
-    }
+  my $db    = $self->pg->db;
+  my $props = $self->_license_properties($db, $args{license});
+  if (my $error = $self->full_license_text_error(%args, catch_all => $props->{catch_all})) {
+    return {error => $error};
   }
+
+  my $tx = $db->begin;
+  _release_full_license_text($db, $args{license} // '') if $args{full_license_text};
 
   my $mid = $db->insert(
     'license_patterns',
     {
-      pattern           => $args{pattern},
-      token_hexsum      => $checksum,
-      packname          => $args{packname}          // '',
-      patent            => $args{patent}            // 0,
-      trademark         => $args{trademark}         // 0,
-      export_restricted => $args{export_restricted} // 0,
-      cla               => $args{cla}               // 0,
-      eula              => $args{eula}              // 0,
-      catch_all         => $catch_all,
-      license           => $args{license} // '',
-      spdx              => $spdx,
-      risk              => $args{risk} // 5,
+      pattern      => $args{pattern},
+      token_hexsum => $checksum,
+      packname     => $args{packname} // '',
+      catch_all    => $props->{catch_all},
+      (map { $_ => $args{$_} // 0 } @PATTERN_FLAGS),
+      license => $args{license} // '',
+      spdx    => $props->{spdx},
+      risk    => $args{risk} // 5,
       ($args{unique_id}   ? (unique_id   => $args{unique_id})   : ()), ($args{owner} ? (owner => $args{owner}) : ()),
       ($args{contributor} ? (contributor => $args{contributor}) : ())
     },
@@ -419,9 +458,61 @@ sub create ($self, %args) {
   )->hash->{id};
 
   $self->sync_pattern_shingles($db, $mid, $args{license} // '', $args{pattern});
+  $tx->commit;
   $self->expire_cache;
 
   return $self->find($mid);
+}
+
+# Low-level bulk write behind imports and backfills: insert one fully-specified pattern row (deduped on the
+# token_hexsum unique index) and maintain its shingles. Fills in token_hexsum from the pattern text when
+# absent. Returns the new id, or undef when a pattern with the same checksum already exists. Unlike create()
+# it takes the row verbatim (no property inheritance) and does NOT expire caches - the caller expires once
+# when the whole batch is done. catch_all is the one field it will not take on trust: an imported file that
+# claims something other than what the license name says would put drift back into the column.
+sub insert_pattern ($self, $row) {
+  my $db = $self->pg->db;
+  $row->{catch_all} = license_is_catch_all($row->{license}) ? 1 : 0;
+  $row->{token_hexsum} //= pattern_checksum($row->{pattern});
+
+  # After the insert, not before: this ignores every conflict, so a row that turns out to be a duplicate must
+  # not have released the claim already here - and a colliding claim must not take the whole pattern with it.
+  my $claim = delete $row->{full_license_text};
+
+  my $tx = $db->begin;
+  return undef unless my $new = $db->insert('license_patterns', $row, {on_conflict => undef, returning => 'id'})->hash;
+  if ($claim) {
+    _release_full_license_text($db, $row->{license} // '', $new->{id});
+    $db->update('license_patterns', {full_license_text => 1}, {id => $new->{id}});
+  }
+  $self->sync_pattern_shingles($db, $new->{id}, $row->{license} // '', $row->{pattern});
+  $tx->commit;
+
+  return $new->{id};
+}
+
+# Create the highest-value pattern - "SPDX-License-Identifier: <expr>" - for every license that carries an
+# SPDX expression but is still missing it. The identifier comes verbatim from the license's curated "spdx"
+# field (which may be hand-set, not just derived from the name); every other property is inherited from a
+# representative pattern of the license (lowest id carrying an spdx). Returns the created rows; idempotent, as
+# insert_pattern dedupes on the token_hexsum unique index.
+sub backfill_spdx_identifiers ($self) {
+  my @created;
+  for my $row (
+    $self->pg->db->query(
+      "SELECT DISTINCT ON (license) license, spdx, packname, patent, trademark, export_restricted, cla, eula,
+         catch_all, risk
+       FROM license_patterns WHERE license != '' AND spdx != '' ORDER BY license, id"
+    )->hashes->each
+    )
+  {
+    $row->{pattern} = "SPDX-License-Identifier: $row->{spdx}";
+    push @created, $row if $self->insert_pattern($row);
+  }
+
+  # Only churn the matcher/bag when something actually changed - a no-op re-run must not enqueue a rebuild.
+  $self->expire_cache if @created;
+  return \@created;
 }
 
 sub expire_cache ($self) {
@@ -433,7 +524,7 @@ sub expire_cache ($self) {
   unlink $_->to_string for $self->_all_cache_files;
 
   # Rebuild the tf-idf bag
-  $self->minion->enqueue(pattern_stats => [] => {priority => 9});
+  $self->minion->enqueue(pattern_stats => [] => {priority => PRIORITY_WAITING});
 }
 
 # Only ever used as a yes/no, so it stops at the first pattern it finds instead of counting them all -
@@ -510,6 +601,330 @@ sub capped_match_count ($self, $id) {
     matches_capped  => $count->{matches_capped}  ? true : false,
     packages_capped => $count->{packages_capped} ? true : false
   };
+}
+
+# Corpus query over curated patterns - the precedent lookup ("what does Cavil already say about this text?")
+# and the maintenance worklists. %opts:
+#   filters: license, risk, flag (one of @PATTERN_FLAGS), catch_all, search (pattern substring), min_skip
+#   contained_in: text - curated patterns that match inside it (full matcher, same engine as indexing), plus
+#                 the similar_to neighbours so near-variants of the wording show up too
+#   similar_to: text - nearest patterns by shingle containment, both ways (pattern_cov, text_cov)
+#   report: 'inconsistent_risk' - licenses whose patterns disagree on risk
+#   limit, offset
+# Text queries also return a verdict: consensus (one license/risk), conflict, or none. Patterns matching inside
+# the text outrank merely similar ones.
+sub search ($self, %opts) {
+  my $limit  = $opts{limit}  // 20;
+  my $offset = $opts{offset} // 0;
+  return $self->_inconsistent_risk($opts{license}, $limit, $offset) if ($opts{report} // '') eq 'inconsistent_risk';
+
+  my (@where, @bind, %extra);
+  my $hits;
+  if (defined(my $text = $opts{contained_in})) {
+    $hits = $self->_contained_in($text);
+    my $similar = $self->_similar_to($text, keys %$hits);
+    $hits->{$_} = {%{$similar->{$_}}, %{$hits->{$_} // {}}} for keys %$similar;
+  }
+  elsif (defined $opts{similar_to}) { $hits = $self->_similar_to($opts{similar_to}) }
+  if    ($hits) {
+    return {rows => [], verdict => _verdict([]), total => 0} unless %$hits;
+    push @where, 'id = ANY(?)';
+    push @bind,  [keys %$hits];
+    %extra = %$hits;
+  }
+
+  push @where, "license <> ''";
+  if (defined $opts{exclude_id}) { push @where, 'id <> ?';     push @bind, $opts{exclude_id} }
+  if (defined $opts{license})    { push @where, 'license = ?'; push @bind, $opts{license} }
+  if (defined $opts{risk})       { push @where, 'risk = ?';    push @bind, $opts{risk} }
+  if (defined(my $flag = $opts{flag})) {
+    die "Unknown flag: $flag\n" unless grep { $_ eq $flag } @PATTERN_FLAGS;
+    push @where, $flag;
+  }
+  push @where, ($opts{catch_all} ? '' : 'NOT ') . 'catch_all' if defined $opts{catch_all};
+  if (defined $opts{search} && length $opts{search}) {
+    push @where, 'pattern ILIKE ?';
+    push @bind,  '%' . ($opts{search} =~ s/([%_\\])/\\$1/gr) . '%';
+  }
+  if (defined $opts{min_skip}) {
+    push @where, q{(SELECT MAX(m[1]::int) FROM regexp_matches(pattern, '\$SKIP(\d+)', 'g') m) >= ?};
+    push @bind,  $opts{min_skip};
+  }
+
+  my $rows = $self->pg->db->query(
+        'SELECT id, license, risk, pattern, catch_all, '
+      . join(', ', @PATTERN_FLAGS)
+      . ', COUNT(*) OVER() AS total
+     FROM license_patterns WHERE ' . join(' AND ', @where) . ' ORDER BY id', @bind
+  )->hashes;
+
+  my $total = @$rows ? $rows->[0]{total} : 0;
+  for my $row (@$rows) {
+    delete $row->{total};
+    my $pattern = delete $row->{pattern};
+    $row->{length}   = length $pattern;
+    $row->{max_skip} = max(0, map { 0 + $_ } $pattern =~ /\$SKIP(\d+)/g);
+    $row->{flags}    = [grep { delete $row->{$_} } @LICENSE_FLAGS];
+    $row->{$_}       = $row->{$_} ? true : false for qw(catch_all full_license_text);
+    $row->{excerpt}  = substr($pattern =~ s/\s+/ /gr, 0, 160);
+    %$row            = (%$row, %{$extra{$row->{id}}}) if $extra{$row->{id}};
+  }
+
+  # Strongest evidence first: contained, then by how much of each other the pattern and the text share
+  my @sorted = sort {
+         ($b->{contained} // 0)   <=> ($a->{contained} // 0)
+      || ($b->{pattern_cov} // 0) <=> ($a->{pattern_cov} // 0)
+      || $a->{id}                 <=> $b->{id}
+  } @$rows;
+  my @page = grep {defined} @sorted[$offset .. min($offset + $limit, scalar @sorted) - 1];
+  $_->{matches} = $self->capped_match_count($_->{id}) for @page;
+
+  return {rows => \@page, total => 0 + $total, (%extra ? (verdict => _verdict(\@sorted)) : ())};
+}
+
+# Consensus is decided by the patterns that match inside the text and cover at least half of it (a short
+# pattern inside a longer text says nothing about the rest); near-misses only count when nothing matches. Short
+# contained patterns alone make the verdict "partial": curated wording covers part of the text, never "none".
+# Dissent lists close variants of the wording (half the pattern or more, a fifth of the text) classified differently from every
+# strong match - the "precedent itself conflicts" case a reviewer needs to hear about.
+sub _verdict ($rows) {
+  my @strong = grep { $_->{contained} && ($_->{text_cov} // 0) >= 0.5 } @$rows;
+  @strong = grep { ($_->{pattern_cov} // 0) >= 0.8 && ($_->{text_cov} // 0) >= 0.8 } @$rows unless @strong;
+  my $partial = !@strong && (@strong = grep { $_->{contained} } @$rows);
+  return {status => 'none', basis => undef, classes => [], dissent => []} unless @strong;
+
+  my %classes;
+  push @{$classes{"$_->{license}\0$_->{risk}"}}, $_->{id} for @strong;
+  my @classes = map { my ($l, $r) = split /\0/; {license => $l, risk => 0 + $r, ids => $classes{$_}} }
+    sort { @{$classes{$b}} <=> @{$classes{$a}} || $a cmp $b } keys %classes;
+  my @dissent
+    = map { {id => $_->{id}, license => $_->{license}, risk => 0 + $_->{risk}} }
+    grep  { !$classes{"$_->{license}\0$_->{risk}"} && ($_->{pattern_cov} // 0) >= 0.5 && ($_->{text_cov} // 0) >= 0.2 }
+    @$rows;
+  return {
+    status  => $partial ? 'partial' : @classes == 1 ? 'consensus' : 'conflict',
+    basis   => $strong[0]{contained} ? 'contained' : 'similar',
+    classes => \@classes,
+    dissent => $partial ? [] : \@dissent
+  };
+}
+
+sub _contained_in ($self, $text) {
+  my $matcher = Cavil::PatternEngine::init_matcher();
+  $self->load_unspecific($matcher);
+  my $file = tempfile->spew("ABC\n$text\nABC\n", 'UTF-8');
+
+  # Line 1 is the padding line, so shift spans back to the text's own numbering
+  my %hits;
+  for my $m (@{$matcher->find_matches($file)}) {
+    my ($id, $sline, $eline) = @$m;
+    $hits{$id} //= {contained => true, lines => ($sline - 1) . '-' . ($eline - 1)};
+  }
+  return \%hits;
+}
+
+# Candidates come from two sources, because neither sees everything: the shingle index (normalization drops
+# copyright lines, so one-line notices mentioning copyright have no shingles) and the tf-idf bag. Coverage is
+# then measured on raw token shingles in both directions, so the agent sees near-variants as well as supersets.
+sub _similar_to ($self, $text, @always) {
+  my @ids = keys %{text_shingle_ids($text, SIMILARITY_SHINGLE_SIZE)};
+  my $db  = $self->pg->db;
+  my %candidates;
+  if (@ids) {
+    my $licenses = $db->query(
+      'SELECT license FROM shingle_license WHERE shingle = ANY(?::bigint[])
+       GROUP BY license ORDER BY COUNT(*) DESC, license LIMIT 20', \@ids
+    )->arrays->map(sub { $_->[0] })->to_array;
+    $candidates{$_->[0]} = 1
+      for $db->query(
+      'SELECT pattern_id FROM pattern_shingles WHERE license = ANY(?::text[]) AND shingle = ANY(?::bigint[])
+       GROUP BY pattern_id ORDER BY COUNT(*) DESC, pattern_id LIMIT 50', $licenses, \@ids
+      )->arrays->each;
+  }
+  $candidates{$_->{pattern}} = 1 for @{$self->closest_matches($text, 20)};
+  $candidates{$_} = 2 for @always;
+  return {} unless %candidates;
+
+  my $mine = _raw_shingles($text);
+  return {} unless %$mine;
+  my %hits;
+  for
+    my $row ($db->query('SELECT id, pattern FROM license_patterns WHERE id = ANY(?)', [keys %candidates])->hashes->each)
+  {
+    my $theirs = _raw_shingles($row->{pattern});
+    next unless my $size = keys %$theirs;
+    my $shared = grep { $mine->{$_} } keys %$theirs;
+    my ($pattern_cov, $text_cov) = ($shared / $size, $shared / keys(%$mine));
+
+    next if $pattern_cov < 0.3 && $text_cov < 0.3 && $candidates{$row->{id}} != 2;
+    $hits{$row->{id}}
+      = {pattern_cov => int($pattern_cov * 100 + 0.5) / 100, text_cov => int($text_cov * 100 + 0.5) / 100};
+  }
+  return \%hits;
+}
+
+# Token shingles without the scoring normalization; $SKIP tokens (encoded as their small width) are dropped
+sub _raw_shingles ($text) {
+  Cavil::PatternEngine::init_matcher();
+  my @toks = grep { $_ >= 100 } @{Cavil::PatternEngine::parse_tokens($text)};
+  my $k    = SIMILARITY_SHINGLE_SIZE;
+  return {map { $_                                  => 1 } @toks} if @toks < $k;
+  return {map { join(',', @toks[$_ .. $_ + $k - 1]) => 1 } 0 .. @toks - $k};
+}
+
+# Where a pattern matches in a text, and which words each $SKIPn swallowed there - what a reviewer needs to
+# check a long pattern without reading it. Same token semantics as the matcher ($SKIPn = 1..n words), found
+# by a depth-first walk that tries the shortest skips first. Returns undef when the pattern does not match.
+sub align ($self, $pattern, $text) {
+  Cavil::PatternEngine::init_matcher();
+  my @p = @{Cavil::PatternEngine::parse_tokens($pattern)};
+  my @t = @{Cavil::Matcher::normalize($text)};
+  return undef unless @p && @t && $p[0] >= 100;
+
+  # Walk returns the text position after the match plus the [position, words used, declared n] of each skip
+  no warnings 'recursion';
+  my %failed;
+  my $walk;
+  $walk = sub ($i, $j) {
+    return [$j]  if $i == @p;
+    return undef if $j >= @t || $failed{"$i,$j"};
+    if ($p[$i] < 100) {
+      for my $k (1 .. $p[$i]) {
+        my $rest = $walk->($i + 1, $j + $k) or next;
+        return [$rest->[0], [$j, $k, $p[$i]], @$rest[1 .. $#$rest]];
+      }
+    }
+    elsif ($t[$j][2] eq $p[$i]) {
+      my $rest = $walk->($i + 1, $j + 1);
+      return $rest if $rest;
+    }
+    $failed{"$i,$j"} = 1;
+    return undef;
+  };
+
+  my $found;
+  for my $start (grep { $t[$_][2] eq $p[0] } 0 .. $#t) {
+    next unless my $walked = $walk->(0, $start);
+    my ($end, @skips) = @$walked;
+    my @lines = split /\n/, $text, -1;
+    my ($first, $last) = ($t[$start][0], $t[$end - 1][0]);
+    $found = {
+      lines => [$first, $last],
+      text  => join("\n", @lines[$first - 1 .. $last - 1]),
+      skips => [
+        map {
+          {skip => $_->[2], words => join(' ', map { $_->[1] } @t[$_->[0] .. $_->[0] + $_->[1] - 1])}
+        } @skips
+      ]
+    };
+    last;
+  }
+  undef $walk;
+  return $found;
+}
+
+# Dry run of a pattern against the snippet corpus: how many snippets and packages it would match, samples, and
+# what its $SKIPs swallow there. Candidates are prefiltered by full-text search on the pattern's longest
+# literal words, then confirmed with the real matcher. Embargoed, obsolete and ephemeral packages never show.
+sub test_pattern ($self, $pattern, %opts) {
+  Cavil::PatternEngine::init_matcher();
+  (my $literal = $pattern) =~ s/\$SKIP\d+/ /g;
+  my %seen;
+  my @words = grep { !$seen{$_}++ } map { $_->[1] } @{Cavil::Matcher::normalize($literal)};
+  @words = sort { length $b <=> length $a || $a cmp $b } grep {/^\w{3,}$/} @words;
+  splice @words, 4 if @words > 4;
+  return {error => 'Pattern has no searchable words'} unless @words;
+
+  # Production has millions of snippets and file_snippets rows, so every query is capped and the whole dry
+  # run shares one statement timeout; a timeout is reported, never retried
+  my $db = $self->pg->db;
+  my $tx = $db->begin;
+  $db->query("SET LOCAL statement_timeout = '@{[TEST_PATTERN_TIMEOUT]}s'");
+  my $result = eval { $self->_test_pattern_queries($db, $pattern, \@words, $opts{package_id}) };
+  return {error => 'Dry run timed out, narrow it with package_id or more distinctive wording', searched => \@words}
+    if !$result && $@ =~ /statement timeout/;
+  die $@ unless $result;
+  return $result;
+}
+
+sub _test_pattern_queries ($self, $db, $pattern, $words, $package_id) {
+  my $cap  = TEST_PATTERN_CANDIDATES;
+  my @pkg  = defined $package_id ? ($package_id)        : ();
+  my $pkg  = @pkg                ? 'AND fs.package = ?' : '';
+  my $live = 'fs.generation = 0 AND NOT p.embargoed AND NOT p.obsolete AND NOT p.ephemeral';
+
+  # No ORDER BY: with one the planner may walk the primary key and compute to_tsvector for every snippet
+  # instead of using snippets_text_fts_idx
+  my $candidates = $db->query(
+    "SELECT s.id, s.text FROM snippets s
+     WHERE to_tsvector('english', s.text) @@ websearch_to_tsquery('english', ?)
+       AND EXISTS (SELECT 1 FROM file_snippets fs JOIN bot_packages p ON p.id = fs.package
+                   WHERE fs.snippet = s.id AND $live $pkg)
+     LIMIT ?", join(' ', @$words), @pkg, $cap + 1
+  )->hashes;
+  my $capped = @$candidates > $cap;
+  pop @$candidates if $capped;
+
+  my $matcher = Cavil::PatternEngine::init_matcher();
+  $matcher->add_pattern(1, Cavil::PatternEngine::parse_tokens($pattern));
+  my @matched;
+  for my $snippet (@$candidates) {
+    my $file = tempfile->spew("ABC\n$snippet->{text}\nABC\n", 'UTF-8');
+    push @matched, $snippet if @{$matcher->find_matches($file)};
+  }
+
+  my $stats   = {snippets => 0, occurrences => 0, packages => 0, unresolved => 0};
+  my $samples = [];
+  if (my @ids = map { $_->{id} } @matched) {
+
+    # A single snippet (an SPDX line) can occur millions of times, so counts stop at a limit, like
+    # capped_match_count
+    my ($occ_limit, $pkg_limit) = (LICENSE_DETAIL_MATCH_LIMIT, LICENSE_DETAIL_PACKAGE_LIMIT);
+    my $counts = $db->query(
+      "SELECT o.occurrences, o.unresolved, pk.packages
+       FROM (SELECT COUNT(*)::int AS occurrences, COUNT(*) FILTER (WHERE resolution IS NULL)::int AS unresolved
+             FROM (SELECT fs.resolution FROM file_snippets fs JOIN bot_packages p ON p.id = fs.package
+                   WHERE fs.snippet = ANY(?) AND $live $pkg LIMIT ?) l) o,
+            (SELECT COUNT(*)::int AS packages
+             FROM (SELECT DISTINCT fs.package FROM file_snippets fs JOIN bot_packages p ON p.id = fs.package
+                   WHERE fs.snippet = ANY(?) AND $live $pkg LIMIT ?) l) pk", \@ids, @pkg, $occ_limit + 1, \@ids, @pkg,
+      $pkg_limit + 1
+    )->hash;
+    $capped ||= $counts->{occurrences} > $occ_limit || $counts->{packages} > $pkg_limit;
+    $stats = {
+      snippets    => scalar @ids,
+      occurrences => min($counts->{occurrences}, $occ_limit),
+      packages    => min($counts->{packages},    $pkg_limit),
+      unresolved  => min($counts->{unresolved},  $occ_limit)
+    };
+
+    # One occurrence for each of the first 5 matched snippets, never a sort over all occurrences
+    my @first = @ids[0 .. min(4, $#ids)];
+    $samples = $db->query(
+      "SELECT o.* FROM unnest(?::int[]) AS sn(id), LATERAL (
+         SELECT fs.snippet, fs.package, p.name, m.filename, fs.sline, fs.resolution, lp.license AS closest_license
+         FROM file_snippets fs JOIN bot_packages p ON p.id = fs.package JOIN matched_files m ON m.id = fs.file
+           JOIN snippets s ON s.id = fs.snippet LEFT JOIN license_patterns lp ON lp.id = s.like_pattern
+         WHERE fs.snippet = sn.id AND $live $pkg LIMIT 1) o", \@first, @pkg
+    )->hashes->to_array;
+    my %text = map { $_->{id} => $_->{text} } @matched;
+    $_->{skips} = ($self->align($pattern, $text{$_->{snippet}}) // {})->{skips} // [] for @$samples;
+  }
+
+  return {%$stats, capped => $capped ? true : false, searched => $words, samples => $samples};
+}
+
+sub _inconsistent_risk ($self, $license, $limit, $offset) {
+  my $rows = $self->pg->db->query(
+    q{SELECT license, jsonb_object_agg(risk, jsonb_build_object('patterns', n, 'ids', ids)) AS risks, SUM(n)::int AS patterns, COUNT(*) OVER() AS total
+      FROM (SELECT license, risk, COUNT(*) AS n, (array_agg(id ORDER BY id))[1:5] AS ids
+            FROM license_patterns WHERE license <> '' AND (?::text IS NULL OR license = ?) GROUP BY license, risk) r
+      GROUP BY license HAVING COUNT(*) > 1 ORDER BY SUM(n) DESC, license LIMIT ? OFFSET ?}, $license, $license, $limit,
+    $offset
+  )->expand->hashes;
+  my $total = @$rows ? $rows->[0]{total} : 0;
+  delete $_->{total} for @$rows;
+  return {report => 'inconsistent_risk', rows => $rows, total => 0 + $total};
 }
 
 sub remove_proposal ($self, $checksum) {
@@ -636,7 +1051,15 @@ sub paginate_known_licenses ($self, $options) {
       LIMIT ? OFFSET ?
     }, @bind, $options->{limit}, $options->{offset}
   )->hashes->to_array;
-  $_->{spdx_html} = spdx_link($_->{spdx}) for @$results;
+
+  # Reviewers research licenses here, so every readable text needs a way in, identifier or not
+  my $curated = $self->full_license_texts([map { $_->{license} } @$results]);
+  for my $row (@$results) {
+    $row->{text_html}
+      = length $row->{spdx}         ? spdx_link($row->{spdx})
+      : $curated->{$row->{license}} ? license_link($row->{license}, 1, 'Curated text')
+      :                               '';
+  }
 
   return paginate($results, $options);
 }
@@ -651,55 +1074,100 @@ sub proposal_stats($self) {
     "SELECT
        (SELECT COUNT(*) FROM proposed_changes
           WHERE action = 'create_pattern' OR action = 'create_ignore' OR action = 'create_glob') AS proposals,
-       (SELECT COUNT(*) FROM proposed_changes WHERE action = 'missing_license') AS missing"
+
+       -- One per card shown on the Missing Licenses page: every new_license, plus each missing_license
+       -- report NOT already covered by a new_license for the same snippet (same dedup as proposed_changes).
+       -- Counting both would double a snippet that has a kept report and its proposal.
+       (SELECT COUNT(*) FROM proposed_changes pc
+          WHERE pc.action = 'new_license'
+             OR (pc.action = 'missing_license'
+                 AND NOT EXISTS (SELECT 1 FROM proposed_changes np WHERE np.action = 'new_license'
+                                   AND (np.data->>'snippet')::bigint = (pc.data->>'snippet')::bigint))) AS missing"
   )->hash;
 }
 
-sub propose_create ($self, %args) {
-  my $pattern  = $args{pattern};
-  my $checksum = pattern_checksum($pattern);
-  my $id       = $self->pattern_exists($checksum);
+# Shared conflict guards for every pattern-shaped proposal: a live pattern with the same text already
+# exists, or a pending proposal does. Returns the matching error hash, or undef when the checksum is free.
+sub _pattern_proposal_conflict ($self, $checksum) {
+  my $id = $self->pattern_exists($checksum);
   return {conflict => $id} if $id;
-
   my $proposal_id = $self->proposal_exists($checksum);
   return {proposal_conflict => $proposal_id} if $proposal_id;
+  return undef;
+}
 
-  my $db      = $self->pg->db;
-  my $license = $args{license};
-  my $risk    = $args{risk};
-  my $hash
-    = $db->query('SELECT id FROM license_patterns WHERE license = ? AND risk = ? LIMIT 1', $license, $risk)->hash;
-  return {license_conflict => 1} unless $hash;
-
+# Insert a create_pattern / new_license proposal row on the given db handle. Both actions carry the same
+# payload; only the action string and the caller's surrounding logic (license gate / report retirement)
+# differ, so the data shape lives here in one place.
+sub _insert_pattern_proposal ($self, $db, $action, $checksum, %args) {
   $db->insert(
     'proposed_changes',
     {
-      action => 'create_pattern',
+      action => $action,
       data   => {
         -json => {
           snippet              => $args{snippet},
-          pattern              => $pattern,
+          pattern              => $args{pattern},
           highlighted_keywords => $args{highlighted_keywords},
           highlighted_licenses => $args{highlighted_licenses},
-          edited               => $args{edited} // '0',
-          license              => $license,
-          risk                 => $risk,
+          edited               => $args{edited} ? '1' : '0',
+          license              => $args{license},
+          risk                 => $args{risk},
           package              => $args{package},
-          patent               => $args{patent}            // '0',
-          trademark            => $args{trademark}         // '0',
-          export_restricted    => $args{export_restricted} // '0',
-          cla                  => $args{cla}               // '0',
-          eula                 => $args{eula}              // '0',
-          ai_assisted          => $args{ai_assisted}       // 0,
-          reason               => $args{reason}            // ''
+
+          # Always strings, the proposals page and the create-pattern form expect '1'/'0'
+          (map { $_ => $args{$_} ? '1' : '0' } @PATTERN_FLAGS),
+          ai_assisted => $args{ai_assisted} // 0,
+          reason      => $args{reason}      // '',
+
+          # Server-computed facts for the reviewer (precedent, impact, $SKIP alignment) and the grouping key
+          # for proposals about one legal text
+          (map { defined $args{$_} ? ($_ => $args{$_}) : () } qw(evidence family))
         }
       },
       owner        => $args{owner},
       token_hexsum => $checksum
     }
   );
+}
 
+sub propose_create ($self, %args) {
+  my $checksum = pattern_checksum($args{pattern});
+  if (my $conflict = $self->_pattern_proposal_conflict($checksum)) { return $conflict }
+  if (my $error    = $self->full_license_text_error(%args))        { return {error => $error} }
+
+  my $db = $self->pg->db;
+  my $hash
+    = $db->query('SELECT id FROM license_patterns WHERE license = ? AND risk = ? LIMIT 1', $args{license}, $args{risk})
+    ->hash;
+  return {license_conflict => 1} unless $hash;
+
+  $self->_insert_pattern_proposal($db, 'create_pattern', $checksum, %args);
   return {};
+}
+
+sub propose_new_license ($self, %args) {
+  my $checksum = pattern_checksum($args{pattern});
+  if (my $conflict = $self->_pattern_proposal_conflict($checksum)) { return $conflict }
+  if (my $error    = $self->full_license_text_error(%args))        { return {error => $error} }
+
+  # Unlike propose_create there is deliberately no existing-license gate: introducing a license Cavil has
+  # never seen is the whole point. The curator's approval (the create-pattern action) bootstraps the
+  # license via Patterns::create, which needs no sibling row. Routed to the lawyers' Missing Licenses page.
+  #
+  # The originating missing-license report is deliberately LEFT in place as the durable record. While this
+  # proposal exists it is hidden from the page (see proposed_changes), and it is retired only when the
+  # proposal is approved (Snippet::_apply_action create-pattern -> retire_missing_license). That way
+  # dismissing a bad proposal falls back to the report instead of throwing it away.
+  $self->_insert_pattern_proposal($self->pg->db, 'new_license', $checksum, %args);
+  return {};
+}
+
+# Drop the missing-license report(s) for a snippet - called when a pattern is created for it (the report's
+# question is answered) so it does not re-surface on the Missing Licenses page.
+sub retire_missing_license ($self, $snippet_id) {
+  $self->pg->db->query(
+    "DELETE FROM proposed_changes WHERE action = 'missing_license' AND (data->>'snippet')::bigint = ?", $snippet_id);
 }
 
 sub propose_ignore ($self, %args) {
@@ -819,33 +1287,72 @@ sub proposed_changes ($self, $options) {
     $search = "AND (bu.login ILIKE $quoted OR pc.data::text ILIKE $quoted)";
   }
 
+  # A snippet's missing-license report and a new_license proposal for it coexist (the report is the durable
+  # record; dismissing the proposal must fall back to it). Show only the proposal while it exists, so the
+  # snippet is never listed twice: hide a missing_license row when a new_license proposal covers its snippet.
+  my $superseded = "AND NOT (pc.action = 'missing_license' AND EXISTS (SELECT 1 FROM proposed_changes np"
+    . " WHERE np.action = 'new_license' AND (np.data->>'snippet')::bigint = (pc.data->>'snippet')::bigint))";
+
   my $changes = $db->query(
     "SELECT pc.*, EXTRACT(EPOCH FROM created) AS created_epoch, bu.login, COUNT(*) OVER() AS total
      FROM proposed_changes pc JOIN bot_users bu ON (bu.id = pc.owner)
-     WHERE action = ANY (?) $before $search ORDER BY pc.id DESC LIMIT 10", $options->{actions}
+     WHERE action = ANY (?) $before $search $superseded ORDER BY pc.id DESC LIMIT 10", $options->{actions}
   )->expand->hashes;
 
   my $total = 0;
   for my $change (@$changes) {
-    $change->{closest} = undef;
-    if (defined $change->{data}{pattern} && (my $closest = $self->closest_pattern($change->{data}{pattern}))) {
-      $change->{closest} = {
-        id           => $closest->{id},
-        similarity   => $closest->{similarity},
-        license_name => $closest->{license},
-        risk         => $closest->{risk}
-      };
-    }
-
-    $change->{package} = undef;
-    if (my $id = $change->{data}{package}) {
-      $change->{package} = $db->query('SELECT id, name FROM bot_packages WHERE id = ?', $id)->hash;
-    }
-
+    $self->_enrich_proposed_change($db, $change);
     $total = delete $change->{total};
   }
 
   return {total => $total, changes => $changes->to_array};
+}
+
+# Attach the display context a proposed_changes row needs: the closest existing pattern (for the
+# Unidentified card's footer) and the originating package. Shared by the list feed and the single-row
+# fallback lookup below.
+sub _enrich_proposed_change ($self, $db, $change) {
+
+  # closest_pattern reloads the pattern bag from disk per call; new_license rows carry a pattern but the
+  # Missing Licenses page never shows a closest match for them, so skip that work.
+  $change->{closest} = undef;
+  if ( $change->{action} ne 'new_license'
+    && defined $change->{data}{pattern}
+    && (my $closest = $self->closest_pattern($change->{data}{pattern})))
+  {
+    $change->{closest} = {
+      id           => $closest->{id},
+      similarity   => $closest->{similarity},
+      license_name => $closest->{license},
+      risk         => $closest->{risk}
+    };
+  }
+
+  $change->{package} = undef;
+  if (my $id = $change->{data}{package}) {
+    $change->{package} = $db->query('SELECT id, name FROM bot_packages WHERE id = ?', $id)->hash;
+  }
+
+  return $change;
+}
+
+sub proposal_by_checksum ($self, $checksum) {
+  return $self->pg->db->select('proposed_changes', '*', {token_hexsum => $checksum})->expand->hash;
+}
+
+# The missing-license report still on file for a snippet, enriched like a proposed_changes row. Used to
+# swap the fallback report back into the page when a covering new_license proposal is dismissed. Returns
+# undef when no report exists (nothing to fall back to).
+sub report_for_snippet ($self, $snippet_id) {
+  my $db     = $self->pg->db;
+  my $change = $db->query(
+    "SELECT pc.*, EXTRACT(EPOCH FROM created) AS created_epoch, bu.login
+     FROM proposed_changes pc JOIN bot_users bu ON (bu.id = pc.owner)
+     WHERE pc.action = 'missing_license' AND (pc.data->>'snippet')::bigint = ?
+     ORDER BY pc.id DESC LIMIT 1", $snippet_id
+  )->expand->hash;
+  return undef unless $change;
+  return $self->_enrich_proposed_change($db, $change);
 }
 
 sub recent ($self, $options) {
@@ -922,35 +1429,97 @@ sub update ($self, $id, %args) {
     return {conflict => $conflict->{id}};
   }
 
-  # catch_all is a per-license property, not a form field: derive it from the (possibly edited)
-  # license so it stays consistent - inherit from a sibling pattern of that license, else from its name.
-  my $catch_all = license_is_catch_all($args{license}) ? 1 : 0;
-  if (my $license = $args{license}) {
-    my $sibling
-      = $db->query('SELECT catch_all FROM license_patterns WHERE license = ? AND id <> ? LIMIT 1', $license, $id)->hash;
-    $catch_all = $sibling->{catch_all} if $sibling;
-  }
+  # catch_all and spdx are per-license properties, not form fields, so a license rename has to carry them
+  # along. catch_all is always re-derived from the (possibly edited) license. spdx has no derivation from a
+  # name, so we only refresh it when the license actually changes: adopt the new license's identifier, or
+  # clear it for a brand-new license. Leaving spdx untouched on a rename was the bug that kept the stale
+  # identifier after a GPL-3.0-only -> GPL-3.0-or-later correction.
+  my $new_license = $args{license} // '';
+  my $old         = $db->select('license_patterns', ['license', 'spdx'], {id => $id})->hash;
+  my $renamed     = !$old || $old->{license} ne $new_license;
+  my $props       = $self->_license_properties($db, $new_license, $id);
+  my $catch_all   = $props->{catch_all};
+  my $spdx        = $renamed ? $props->{spdx} : $old->{spdx};
+
+  if (my $error = $self->full_license_text_error(%args, catch_all => $catch_all)) { return {error => $error} }
+
+  my $tx = $db->begin;
+  _release_full_license_text($db, $new_license, $id) if $args{full_license_text};
 
   $db->update(
     'license_patterns',
     {
-      pattern           => $args{pattern},
-      token_hexsum      => $checksum,
-      packname          => $args{packname} // '',
-      license           => $args{license},
-      patent            => $args{patent}            // 0,
-      trademark         => $args{trademark}         // 0,
-      export_restricted => $args{export_restricted} // 0,
-      cla               => $args{cla}               // 0,
-      eula              => $args{eula}              // 0,
-      catch_all         => $catch_all,
-      risk              => $args{risk} // 5,
+      pattern      => $args{pattern},
+      token_hexsum => $checksum,
+      packname     => $args{packname} // '',
+      license      => $args{license},
+      catch_all    => $catch_all,
+      (map { $_ => $args{$_} // 0 } @PATTERN_FLAGS),
+      spdx => $spdx,
+      risk => $args{risk} // 5,
       ($args{owner} ? (owner => $args{owner}) : ())
     },
     {id => $id}
   );
 
   $self->sync_pattern_shingles($db, $id, $args{license}, $args{pattern});
+  $tx->commit;
+}
+
+# Bulk-edit the shared name/risk/spdx of every pattern of one license at once, atomically. This is the
+# whole-license counterpart of update(): the pattern text is untouched, so it never changes matcher/bag
+# caches (they key on text -> id) and needs no expire_cache - only the denormalized name copies and the
+# cached reports have to follow, which the shingle resync here and the caller's reindex handle.
+#   %args: license (new name, required), risk (undef leaves each pattern's risk), spdx (canonical string,
+#   '' clears). Empty old names are the keyword-pattern bucket and must never be bulk-edited (guarded in
+#   the controller). Returns {updated => n, license => $new, spdx => $spdx}.
+sub update_license_meta ($self, $old_license, %args) {
+  my $new  = $args{license};
+  my $risk = $args{risk};
+  my $spdx = $args{spdx} // '';
+  my $db   = $self->pg->db;
+
+  my $ids = $db->query('SELECT id FROM license_patterns WHERE license = ?', $old_license)->arrays->flatten->to_array;
+  return {updated => 0} unless @$ids;
+
+  my $renamed   = $new ne $old_license;
+  my $catch_all = license_is_catch_all($new) ? 1 : 0;
+
+  my $tx = $db->begin;
+
+  # full_license_text is unique per license name (partial unique index). A catch-all has no text to
+  # reproduce, and merging into a destination that already carries a full-text pattern would collide, so
+  # in either case the incoming rows give up the claim rather than fight the index.
+  if ($catch_all) {
+    $db->query('UPDATE license_patterns SET full_license_text = false WHERE id = ANY(?)', $ids);
+  }
+  elsif (
+    $renamed
+    && $db->query('SELECT 1 FROM license_patterns WHERE license = ? AND full_license_text AND id <> ALL(?) LIMIT 1',
+      $new, $ids)->rows
+    )
+  {
+    $db->query('UPDATE license_patterns SET full_license_text = false WHERE id = ANY(?)', $ids);
+  }
+
+  $db->query('UPDATE license_patterns SET license = ?, catch_all = ? WHERE id = ANY(?)', $new, $catch_all, $ids);
+  $db->query('UPDATE license_patterns SET risk = ? WHERE id = ANY(?)', $risk, $ids) if defined $risk;
+
+  # spdx and catch_all are per-license properties: normalize them across the whole destination so a merge
+  # cannot leave the pre-existing rows with a different identifier than the ones just moved in.
+  $db->query('UPDATE license_patterns SET spdx = ?, catch_all = ? WHERE license = ?', $spdx, $catch_all, $new);
+
+  # The name is denormalized into pattern_shingles/shingle_license; resync the moved rows so snippet
+  # scoring attributes to the new name (the DELETE+INSERT lets the shingle_license trigger follow).
+  if ($renamed) {
+    for my $row ($db->query('SELECT id, pattern FROM license_patterns WHERE id = ANY(?)', $ids)->hashes->each) {
+      $self->sync_pattern_shingles($db, $row->{id}, $new, $row->{pattern});
+    }
+  }
+
+  $tx->commit;
+
+  return {updated => scalar @$ids, license => $new, spdx => $spdx};
 }
 
 1;

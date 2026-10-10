@@ -56,6 +56,13 @@
                     <a :href="change.editUrl" target="_blank" class="cavil-meta-badge cavil-meta-badge-muted">
                       {{ change.data.edited === true ? 'edited snippet' : 'unedited snippet' }}
                     </a>
+                    <span
+                      v-if="change.data.family"
+                      class="cavil-meta-badge cavil-meta-badge-muted change-family"
+                      title="Proposals about the same legal text share this label"
+                    >
+                      <i class="fa-solid fa-layer-group"></i> {{ change.data.family }}
+                    </span>
                     <span v-if="change.data.ai_assisted" class="cavil-meta-badge cavil-meta-badge-info">
                       <i class="fa-solid fa-robot"></i> AI assisted
                     </span>
@@ -111,7 +118,13 @@
                 </button>
               </div>
             </div>
-            <div v-if="change.lines" class="change-source">
+            <PatternEvidence v-if="change.data.evidence" :data="change.data" />
+            <div v-if="change.data.evidence" class="change-raw-toggle">
+              <a href="#" @click.prevent="change.showRaw = !change.showRaw">
+                {{ change.showRaw ? 'Hide' : 'Show' }} raw pattern
+              </a>
+            </div>
+            <div v-if="change.lines && (!change.data.evidence || change.showRaw)" class="change-source">
               <table :class="getClassForCode(change)">
                 <tbody>
                   <tr v-for="line in change.lines" :key="line.num" :class="getClassForLine(line)">
@@ -147,31 +160,8 @@
                       <label for="risk" class="form-label">Risk</label>
                     </div>
                   </div>
-                  <div class="col-lg-2">
-                    <div class="form-check">
-                      <input v-model="change.data.patent" type="checkbox" class="form-check-input" />
-                      <label class="form-check-label" for="patent">Patent</label>
-                    </div>
-                    <div class="form-check">
-                      <input v-model="change.data.trademark" type="checkbox" class="form-check-input" />
-                      <label class="form-check-label" for="trademark">Trademark</label>
-                    </div>
-                  </div>
-                  <div class="col-lg-2">
-                    <div class="form-check">
-                      <input v-model="change.data.cla" type="checkbox" class="form-check-input" />
-                      <label class="form-check-label" for="cla">CLA</label>
-                    </div>
-                    <div class="form-check">
-                      <input v-model="change.data.eula" type="checkbox" class="form-check-input" />
-                      <label class="form-check-label" for="eula">EULA</label>
-                    </div>
-                  </div>
-                  <div class="col-lg-2">
-                    <div class="form-check">
-                      <input v-model="change.data.export_restricted" type="checkbox" class="form-check-input" />
-                      <label class="form-check-label" for="export_restricted">Export Restricted</label>
-                    </div>
+                  <div class="col-lg-6">
+                    <PatternFlags v-model="change.data" />
                   </div>
                 </div>
               </div>
@@ -206,10 +196,10 @@
                   </div>
                 </div>
               </div>
-              <div v-if="change.data.reason" class="row">
+              <div v-if="change.reason_html" class="row">
                 <div class="col mb-3">
-                  <label class="form-label" for="reason">Reason</label>
-                  <textarea v-model="change.data.reason" class="form-control" disabled="disabled" rows="3"></textarea>
+                  <label class="form-label">Reason</label>
+                  <ProposalReason class="change-reason" :html="change.reason_html" />
                 </div>
               </div>
               <span v-if="hasAdminRole">
@@ -218,7 +208,7 @@
                 <button @click="rejectProposal(change)" class="btn btn-danger btn-sm mb-2">Reject</button>
               </span>
             </div>
-            <div v-if="change.action !== 'create_glob'" class="change-footer">
+            <div v-if="change.action !== 'create_glob' && !change.data.evidence" class="change-footer">
               <div v-if="change.closest !== null">
                 <a :href="change.closest.licenseUrl" target="_blank">
                   <b>{{ change.closest.similarity }}%</b> similarity to
@@ -251,6 +241,9 @@ import BackToTop from './components/BackToTop.vue';
 import CavilNoticePanel from './components/CavilNoticePanel.vue';
 import EmptyState from './components/EmptyState.vue';
 import LegalLoading from './components/LegalLoading.vue';
+import PatternEvidence from './components/PatternEvidence.vue';
+import PatternFlags, {PATTERN_FLAGS} from './components/PatternFlags.vue';
+import ProposalReason from './components/ProposalReason.vue';
 import ToastNotifier from './components/ToastNotifier.vue';
 import {genParamWatchers, getParams} from './helpers/params.js';
 import UserAgent from '@mojojs/user-agent';
@@ -261,7 +254,16 @@ const REFILL_THRESHOLD = 5;
 
 export default {
   name: 'ProposedPatterns',
-  components: {BackToTop, CavilNoticePanel, EmptyState, LegalLoading, ToastNotifier},
+  components: {
+    BackToTop,
+    CavilNoticePanel,
+    EmptyState,
+    LegalLoading,
+    PatternEvidence,
+    PatternFlags,
+    ProposalReason,
+    ToastNotifier
+  },
   data() {
     const params = getParams({createIgnore: true, createPattern: true, createGlob: true, filter: ''});
 
@@ -291,9 +293,7 @@ export default {
       formData.delay = 600;
       let kind = null;
       if (change.action === 'create_pattern') {
-        for (const key of ['patent', 'trademark', 'export_restricted', 'cla', 'eula']) {
-          formData[key] = change.data[key] === true ? '1' : '0';
-        }
+        for (const flag of PATTERN_FLAGS) formData[flag.name] = change.data[flag.name] === true ? '1' : '0';
         formData.checksum = change.token_hexsum;
         kind = 'create-pattern';
       } else if (change.action === 'create_ignore') {
@@ -345,8 +345,8 @@ export default {
         if (change.closest !== null) change.closest.licenseUrl = `/licenses/edit_pattern/${change.closest.id}`;
 
         if (change.action === 'create_pattern') {
-          for (const key of ['edited', 'patent', 'trademark', 'export_restricted', 'cla', 'eula']) {
-            change.data[key] = change.data[key] === '1' ? true : false;
+          for (const key of ['edited', ...PATTERN_FLAGS.map(flag => flag.name)]) {
+            change.data[key] = change.data[key] == 1;
           }
         } else if (change.action === 'create_ignore') {
           change.editUrl = `${change.editUrl}?hash=${change.token_hexsum}&from=${change.data.from}`;
@@ -445,9 +445,19 @@ export default {
 </script>
 
 <style scoped>
+.change-reason {
+  border: 1px solid var(--cavil-border);
+  border-radius: 0.375rem;
+  padding: 0.5rem 0.75rem;
+}
+.change-raw-toggle {
+  border-top: 1px solid var(--cavil-border-faint);
+  font-size: 12px;
+  padding: 4px 10px;
+}
 .change-confirmation {
-  background-color: rgb(246, 248, 250);
-  border: 1px solid rgb(208, 215, 222);
+  background-color: var(--cavil-canvas-subtle);
+  border: 1px solid var(--cavil-border);
   border-radius: 0.25rem;
   font-size: 13px;
   line-height: 20px;
@@ -468,8 +478,8 @@ export default {
 }
 .change-header {
   align-items: center;
-  background-color: rgb(246, 248, 250);
-  border-bottom: 1px solid rgb(208, 215, 222);
+  background-color: var(--cavil-canvas-subtle);
+  border-bottom: 1px solid var(--cavil-border);
   display: flex;
   font-size: 13px;
   gap: 0.75rem;
@@ -498,7 +508,7 @@ export default {
 .change-header a,
 .change-file a,
 .change-footer a {
-  color: #212529;
+  color: var(--cavil-fg-body);
   text-decoration: none;
 }
 .change-header a:hover b,
@@ -507,14 +517,14 @@ export default {
   text-decoration: underline;
 }
 .change-file-container {
-  border: 1px solid rgb(208, 215, 222);
+  border: 1px solid var(--cavil-border);
   border-radius: 6px;
   overflow: hidden;
   padding: 0;
 }
 .change-form {
-  background-color: rgb(246, 248, 250);
-  border-top: 1px solid rgb(208, 215, 222);
+  background-color: var(--cavil-canvas-subtle);
+  border-top: 1px solid var(--cavil-border);
   padding: 10px;
 }
 /* Glob proposals have no source preview, so the header's bottom border and the form's top border
@@ -523,14 +533,14 @@ export default {
   border-top: 0;
 }
 .change-footer {
-  background-color: rgb(246, 248, 250);
-  border-top: 1px solid rgb(208, 215, 222);
+  background-color: var(--cavil-canvas-subtle);
+  border-top: 1px solid var(--cavil-border);
   font-size: 13px;
   line-height: 20px;
   padding: 10px;
 }
 .change-source {
-  background: #fff;
+  background: var(--cavil-canvas);
   overflow: auto;
 }
 .change-source td.linenumber,
@@ -540,13 +550,13 @@ export default {
   margin: 0;
   font-size: 12px;
   line-height: 20px;
-  color: rgba(27, 31, 35, 0.3);
+  color: var(--cavil-linenumber);
   border: 0 !important;
 }
 .change-source td.code {
   padding-left: 0.75rem;
   padding-right: 0.75rem;
-  color: #24292e;
+  color: var(--cavil-fg-code);
   margin-left: 0.5em;
   white-space: -moz-pre-wrap;
   white-space: -o-pre-wrap;
@@ -555,28 +565,34 @@ export default {
   word-break: break-all;
 }
 .change-source td.linenumber {
-  border-right: 1px solid #ddd;
+  border-right: 1px solid var(--cavil-border-faint);
   padding: 0 0.5em;
   margin-right: 0.5em;
   text-align: right;
   width: 1%;
   min-width: 25px;
-  color: rgba(27, 31, 35, 0.3);
+  color: var(--cavil-linenumber);
   user-select: none;
 }
 .change-license-line td {
-  background-color: rgba(31, 136, 61, 0.12);
+  background-color: rgba(var(--cavil-success-emphasis-rgb), 0.12);
 }
 .change-license-line td:first-child {
-  box-shadow: inset 3px 0 0 #1f883d;
+  box-shadow: inset 3px 0 0 var(--cavil-success-emphasis);
 }
 .change-keyword-line td {
-  background-color: rgba(191, 135, 0, 0.14);
+  background-color: rgba(var(--cavil-attention-strong-rgb), 0.14);
 }
 .change-keyword-line td:first-child {
-  box-shadow: inset 3px 0 0 #bf8700;
+  box-shadow: inset 3px 0 0 var(--cavil-attention-strong);
 }
 .change-code-ignore {
-  background: repeating-linear-gradient(-45deg, #ffebe9, #ffebe9 1px, #fff 1px, #fff 5px);
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--cavil-danger-bg),
+    var(--cavil-danger-bg) 1px,
+    var(--cavil-canvas) 1px,
+    var(--cavil-canvas) 5px
+  );
 }
 </style>

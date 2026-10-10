@@ -14,13 +14,29 @@
       <span v-if="total > 0" :class="totalBadgeClass" class="cavil-menu-badge">{{ total }}</span>
     </a>
     <ul class="dropdown-menu dropdown-menu-end cavil-user-dropdown">
-      <template v-if="roles.length > 0">
-        <li><h3 class="dropdown-header">Roles</h3></li>
-        <li>
-          <span class="dropdown-item-text cavil-role-list">{{ rolesSummary }}</span>
-        </li>
-        <li><hr class="dropdown-divider" /></li>
-      </template>
+      <li class="cavil-theme-row">
+        <h3 class="dropdown-header">{{ roles.length > 0 ? 'Roles' : 'Appearance' }}</h3>
+        <button
+          type="button"
+          class="cavil-theme-toggle"
+          :class="{'is-dark': isDark}"
+          role="switch"
+          :aria-checked="isDark ? 'true' : 'false'"
+          aria-label="Dark mode"
+          :title="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
+          @click.stop="toggleTheme"
+        >
+          <i class="fa-regular fa-sun" aria-hidden="true"></i>
+          <i class="fa-regular fa-moon" aria-hidden="true"></i>
+          <span class="cavil-theme-toggle-knob" aria-hidden="true">
+            <i :class="isDark ? 'fa-regular fa-moon' : 'fa-regular fa-sun'"></i>
+          </span>
+        </button>
+      </li>
+      <li v-if="roles.length > 0">
+        <span class="dropdown-item-text cavil-role-list">{{ rolesSummary }}</span>
+      </li>
+      <li><hr class="dropdown-divider" /></li>
       <li><h3 class="dropdown-header">Queues</h3></li>
       <li>
         <a :href="urls.missing" class="dropdown-item">
@@ -38,6 +54,7 @@
       <li><h3 class="dropdown-header">Insights</h3></li>
       <li><a :href="urls.recentPatterns" class="dropdown-item">Pattern Performance</a></li>
       <li><a :href="urls.recentNotes" class="dropdown-item">Recent Notes</a></li>
+      <li><a :href="urls.ephemeral" class="dropdown-item">Ephemeral Reviews</a></li>
       <li><a :href="urls.stats" class="dropdown-item">Statistics</a></li>
       <li><hr class="dropdown-divider" /></li>
       <template v-if="canCurate">
@@ -47,9 +64,13 @@
         <li><a :href="urls.commentTemplates" class="dropdown-item">Comment Templates</a></li>
         <li><hr class="dropdown-divider" /></li>
       </template>
+      <template v-if="canUpload">
+        <li><h3 class="dropdown-header">Uploads</h3></li>
+        <li><a :href="urls.upload" class="dropdown-item">Upload Tarball</a></li>
+        <li><hr class="dropdown-divider" /></li>
+      </template>
       <template v-if="canInfra">
         <li><h3 class="dropdown-header">Administration</h3></li>
-        <li><a :href="urls.upload" class="dropdown-item">Upload Tarball</a></li>
         <li><a :href="urls.minion" class="dropdown-item">Minion Dashboard</a></li>
         <li><hr class="dropdown-divider" /></li>
       </template>
@@ -70,12 +91,14 @@ export default {
     currentUser: {type: String, required: true},
     canCurate: {type: Boolean, default: false},
     canInfra: {type: Boolean, default: false},
+    canUpload: {type: Boolean, default: false},
     initialStats: {type: Object, required: true},
     roles: {type: Array, default: () => []},
     urls: {type: Object, required: true}
   },
   data() {
     return {
+      isDark: document.documentElement.dataset.bsTheme === 'dark',
       refreshDelay: 30000,
       refreshUrl: '/licenses/proposed/stats',
       stats: {...this.initialStats}
@@ -96,6 +119,16 @@ export default {
     }
   },
   methods: {
+    // click.stop keeps Bootstrap's autoClose from shutting the dropdown, so the theme can
+    // be flipped back and forth without reopening the menu each time.
+    toggleTheme() {
+      this.isDark = !this.isDark;
+      const theme = this.isDark ? 'dark' : 'light';
+      document.documentElement.dataset.bsTheme = theme;
+      // Read back by the theme helper on the next render, so the server emits the right
+      // attribute straight away and the page never flashes the other theme.
+      document.cookie = `cavil_theme=${theme}; path=/; max-age=31536000; samesite=lax`;
+    },
     refreshData(data) {
       this.stats = {
         missing: Number(data.missing ?? 0),

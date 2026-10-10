@@ -6,8 +6,10 @@ use Mojo::Base 'Mojolicious::Plugin', -signatures;
 
 use Cavil::Bom::Registry;
 use Cavil::Checkout;
+use Cavil::Declarations qw(is_root_file single_root);
 use Cavil::FileIndexer;
 use Cavil::PatternEngine;
+use Cavil::Util qw(fs_bytes original_filename);
 use Time::HiRes 'time';
 
 sub register ($self, $app, $config) {
@@ -44,7 +46,7 @@ sub _index ($job, $id) {
   # Claiming the package is what protects the build from race conditions, and the claim is the generation:
   # the analyze job at the end of the chain hands it back as it promotes. Losing the race must not lose the
   # rebuild with it. Cavil::Model::Packages::reindex checks before enqueuing, but somebody else can still
-  # claim in between - an spdx report, the analyzed job of the build that just promoted - and this job
+  # claim in between - a document build, the analyzed job of the build that just promoted - and this job
   # writes nothing, so there would be no stranded rows for the cleanup sweep to notice and nothing to say a
   # rebuild was ever due. Record it the same way a request that arrives during a build is recorded, and
   # whoever frees the package up runs it - at the priority this build would have run at, so losing the
@@ -62,15 +64,14 @@ sub _index ($job, $id) {
     # Only our own leftovers, from an earlier attempt of this same job. Other non-zero generations are
     # left alone on purpose: "script/cavil unpack" force-releases the package, so a second build can
     # legitimately be running, and wiping its rows would corrupt it. The cleanup task sweeps those.
-    $db->delete($_, {package => $id, generation => $generation}) for qw(package_components urls emails matched_files);
+    $db->delete($_, {package => $id, generation => $generation})
+      for qw(package_components urls emails copyrights matched_files);
 
     $db->update('bot_packages', {index_stage => 'indexing'}, {id => $id});
     $tx->commit;
 
-    # The SPDX report lives in the checkout directory, where a stale copy left behind for the duration of
-    # the rebuild would be picked up by the next unpack and indexed as if it were a file of the package.
-    # Being briefly unavailable is the lesser problem, so it goes now and is regenerated on demand.
-    $pkgs->remove_spdx_report($id);
+    # Remove stale derived documents before they can be indexed as package content.
+    $pkgs->remove_documents($id);
   }
 
   my $dir      = $pkgs->pkg_checkout_dir($id);
@@ -108,8 +109,8 @@ sub _index_batch ($job, $id, $batch, $generation) {
   my $preptime = time - $start;
 
   my $registry    = Cavil::Bom::Registry->new;
-  my $single_root = _single_unpacked_root($fi->dir);
-  my %meta        = (emails => {}, urls => {}, components => {});
+  my $single_root = single_root($fi->dir->child('.unpacked'));
+  my %meta        = (emails => {}, urls => {}, copyrights => {}, components => {});
 
   # Wrap the whole batch in one transaction: the per-file inserts (matched_files,
   # pattern_matches, file_snippets) plus the URL/email/component upserts below would otherwise
@@ -119,6 +120,10 @@ sub _index_batch ($job, $id, $batch, $generation) {
 
   for my $file (@$batch) {
     my ($path, $mime) = @$file;
+
+    # The batch reached this job as JSON, which hands back characters
+    $path = fs_bytes($path);
+
     $fi->file(\%meta, $path, $mime);
     _detect_components($fi, $registry, \%meta, $path, $single_root);
   }
@@ -146,8 +151,18 @@ sub _index_batch ($job, $id, $batch, $generation) {
     );
   }
 
-  # Vendored subcomponents (identity from the embedded metadata file's content, deduped by purl across
-  # the parallel batches via the upsert)
+  # Batches own disjoint files, so concatenating their file lists can never duplicate an entry. No length
+  # check like the two above need: the harvester caps a notice before it ever gets here.
+  for my $copyright (sort keys %{$meta{copyrights}}) {
+    $db->query(
+      'insert into copyrights (package, copyright, files, generation) values ($1, $2, $3, $4)
+         on conflict (package, md5(copyright), generation)
+         do update set files = copyrights.files || excluded.files', $id, $copyright, $meta{copyrights}{$copyright},
+      $generation
+    );
+  }
+
+  # The upsert deduplicates components discovered by parallel batches.
   for my $purl (sort keys %{$meta{components}}) {
     my $c = $meta{components}{$purl};
     $db->query(
@@ -167,19 +182,7 @@ sub _index_batch ($job, $id, $batch, $generation) {
     sprintf("[$id] Indexed batch of @{[scalar @$batch]} files from $dir (%.02f prep, %.02f total)", $preptime, $total));
 }
 
-# The unpacked tree is a "single wrapper" when it has exactly one top-level directory (a conventional
-# name-version/ source tarball). Multiple top-level directories mean several archives were unpacked side
-# by side (a common OBS shape, since archive_name_as_dir is off and archives land directly under
-# .unpacked), so a manifest one level down is a separate archive, not the primary root.
-sub _single_unpacked_root ($dir) {
-  my $unpacked = $dir->child('.unpacked');
-  return 0 unless -d $unpacked;
-  my $dirs = grep { -d $_ } $unpacked->list({dir => 1})->each;
-  return $dirs == 1 ? 1 : 0;
-}
-
-# Recognise a vendored component from its embedded metadata file (e.g. package.json, Cargo.toml). Identity
-# comes from the file content, so obscured/renamed/deep directory names do not matter.
+# Component identity comes from content, not its path.
 sub _detect_components ($fi, $registry, $meta, $path, $single_root) {
 
   # The scanner re-emits any over-long-lined text file as "<name>.processed.<ext>" and lists only that
@@ -187,27 +190,12 @@ sub _detect_components ($fi, $registry, $meta, $path, $single_root) {
   # composer installed.json) would otherwise be invisible here. Detect on the canonical name and read the
   # original file (kept on disk) - never the processed copy, whose injected line breaks corrupt structured
   # metadata such as JSON.
-  (my $orig = $path) =~ s{\.processed(\.[^./]+)$}{$1};
-  $orig =~ s{\.processed$}{};
+  my $orig = original_filename($path);
 
   return unless $registry->matches($orig);
 
-  # A package manifest (package.json, Cargo.toml, ...) that describes the primary artifact under review
-  # must not be reported as a vendored subcomponent, or the SBOM lists the package as a dependency of
-  # itself. Such a manifest sits at the top of the source tree: at the unpacked root (depth 0), or one
-  # level in when the tree is a single wrapper directory (a conventional name-version/ tarball). But when
-  # several archives are unpacked side by side (multiple top-level directories), a depth-1 manifest is a
-  # *separate* vendored archive (e.g. serde-1.0.197/Cargo.toml) and must be kept. Listing files (Go's
-  # vendor/modules.txt) never describe the primary and are never skipped.
-  #
-  # Depth is measured against the package-root directory the manifest identifies. Python ships its
-  # metadata inside a <name>.egg-info/ or <name>.dist-info/ directory, so the package root is one level
-  # up from the metadata file - otherwise a project's own PKG-INFO/METADATA would sit at depth 2 and
-  # self-list. For every other ecosystem the package root is simply the manifest's own directory.
-  my $root = $orig =~ s{/[^/]*$}{}r;
-  $root =~ s{(?:^|/)[^/]+\.(?:egg-info|dist-info)$}{};
-  my $depth = $root eq '' ? 0 : ($root =~ tr{/}{}) + 1;
-  return if $registry->is_self_manifest($orig) && ($depth == 0 || ($depth == 1 && $single_root));
+  # The package's own manifest is a declaration, listing it here would make the package a dependency of itself
+  return if $registry->is_self_manifest($orig) && is_root_file($orig, $single_root);
 
   my $file = $fi->dir->child('.unpacked', $orig);
   return unless -f $file && -s $file < 4_000_000;

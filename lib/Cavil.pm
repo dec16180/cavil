@@ -20,6 +20,7 @@ use Cavil::Model::Requests;
 use Cavil::Model::Users;
 use Cavil::Model::APIKeys;
 use Cavil::Model::Snippets;
+use Cavil::Notice;
 use Cavil::OBS;
 use Cavil::SPDX;
 use Cavil::Sync;
@@ -29,7 +30,12 @@ use Mojo::File qw(path);
 has classifier => sub { Cavil::Classifier->new };
 has git        => sub { Cavil::Git->new };
 has obs        => sub { Cavil::OBS->new };
-has spdx       => sub ($self) {
+has notice     => sub ($self) {
+  my $notice = Cavil::Notice->new(app => $self);
+  weaken $notice->{app};
+  return $notice;
+};
+has spdx => sub ($self) {
   my $spdx = Cavil::SPDX->new(app => $self);
   weaken $spdx->{app};
   return $spdx;
@@ -40,7 +46,7 @@ has sync => sub ($self) {
   return $sync;
 };
 
-our $VERSION = '1.031';
+our $VERSION = '2.003';
 
 sub startup ($self) {
 
@@ -48,43 +54,28 @@ sub startup ($self) {
   my $config = $self->plugin(Config => {file => $file});
   $self->secrets($config->{secrets});
 
-  # Select the pattern matching engine ("cavil" or "spooky"); loads the alternative engine on demand
-  Cavil::PatternEngine::use_engine($config->{matcher} // 'cavil');
-
   if (my $classifier = $config->{classifier}) {
     $self->classifier->type($classifier->{type})->url($classifier->{url})->token($classifier->{token});
   }
 
   # Avoid huge temp files in "/tmp"
   $ENV{MOJO_TMPDIR} = $config->{tmp_dir} if $config->{tmp_dir};
-  $self->max_request_size(262144000);
+  $self->max_request_size($config->{max_request_size} // 262144000);
 
-  # OBS/git configuration
   if (my $obs = $config->{obs}) { $self->obs->config($obs) }
   if (my $git = $config->{git}) { $self->git->config($git) }
 
   # Short logs for systemd
   $self->log->short(1) if $self->mode eq 'production';
 
-  # Application specific commands
   push @{$self->commands->namespaces}, 'Cavil::Command';
 
-  # Sessions last 14 days
   $self->sessions->default_expiration(1209600)->encrypted(1);
 
   $self->plugin('Cavil::Plugin::Helpers');
 
-  # Webpack
   $self->plugin('Webpack');
 
-  # Job queue (model)
-  #
-  #  Start a background worker (processes 4 jobs parallel by default)
-  #  $ script/cavil minion worker
-  #
-  #  Start a background worker (process one job at a time)
-  #  $ script/cavil minion worker -j 1
-  #
   $self->helper(pg => sub { state $pg = Mojo::Pg->new($config->{pg})->max_connections(1) });
   $self->plugin(Minion => {Pg => $self->pg});
   $self->plugin('Cavil::Task::Classify');
@@ -94,17 +85,15 @@ sub startup ($self) {
   $self->plugin('Cavil::Task::Analyze');
   $self->plugin('Cavil::Task::Cleanup');
   $self->plugin('Cavil::Task::ClosestMatch');
-  $self->plugin('Cavil::Task::SPDX');
+  $self->plugin('Cavil::Task::Documents');
 
   $self->plugin('Cavil::Plugin::Linux');
 
   my $mcp_action = $self->plugin('Cavil::Plugin::MCP');
   $self->types->type(mcp => 'text/plain;charset=utf-8');
 
-  # Compress dynamically generated content
   $self->renderer->compress(1);
 
-  # Model
   if (my $remove_after = $config->{minion_remove_after}) { $self->minion->remove_after($remove_after) }
   if (my $stuck_after  = $config->{minion_stuck_after})  { $self->minion->stuck_after($stuck_after) }
   $self->helper(
@@ -122,11 +111,10 @@ sub startup ($self) {
   $self->helper(
     reports => sub ($c) {
       state $reps = Cavil::Model::Reports->new(
-        acceptable_risk    => $config->{acceptable_risk},
-        checkout_dir       => $config->{checkout_dir},
-        max_expanded_files => $config->{max_expanded_files},
-        snippet_fold       => $config->{snippet_fold},
-        pg                 => $c->pg
+        acceptable_risk => $config->{acceptable_risk},
+        checkout_dir    => $config->{checkout_dir},
+        snippet_fold    => $config->{snippet_fold},
+        pg              => $c->pg
       );
     }
   );
@@ -160,12 +148,10 @@ sub startup ($self) {
 
   $self->helper(notes => sub ($c) { state $nts = Cavil::Model::Notes->new(pg => $c->pg) });
 
-  # Migrations (do not run automatically, use the migrate command)
-  #
+  # Migrations run only through the migrate command.
   my $path = $self->home->child('migrations', 'cavil.sql');
   $self->pg->migrations->name('legalqueue_api')->from_file($path);
 
-  # Authentication
   my $public    = $self->routes;
   my $bot       = $public->under('/')->to('Auth::Token#check');
   my $api_key   = $public->under('/')->to('Auth::APIKey#check');
@@ -179,6 +165,7 @@ sub startup ($self) {
   my $can_propose  = $public->under('/' => {roles => roles_with_capability('propose')})->to('Auth#check');
   my $can_review   = $public->under('/' => {roles => roles_with_capability('review')})->to('Auth#check');
   my $can_classify = $public->under('/' => {roles => roles_with_capability('classify')})->to('Auth#check');
+  my $can_upload   = $public->under('/' => {roles => roles_with_capability('upload_ephemeral')})->to('Auth#check');
 
   if (my $openid = $config->{openid}) {
     $self->plugin(
@@ -199,13 +186,12 @@ sub startup ($self) {
   else { $public->get('/login')->to('Auth::Dummy#login')->name('login') }
   $public->get('/logout')->to('Auth#logout')->name('logout');
 
-  # Minion admin
   $self->plugin('Minion::Admin' => {route => $can_infra->any('/minion')});
 
-  # API for Open Build Service bots
   $bot->get('/package/<id:num>')->to('Queue#package_status');
   $bot->patch('/package/<id:num>')->to('Queue#update_package');
   $bot->post('/packages')->to('Queue#create_package');
+  $bot->post('/packages/upload')->to('Queue#upload_package');
   $bot->post('/packages/import/<id:num>')->to('Queue#import_package');
   $bot->patch('/products/*name')->to('Queue#update_product');
   $bot->delete('/products')->to('Queue#remove_product');
@@ -214,30 +200,35 @@ sub startup ($self) {
   $bot->delete('/requests')->to('Queue#remove_request');
   $bot->get('/package/<id:num>/report' => [format => ['json', 'txt']])->to('Report#report', format => 'json');
 
-  # API for lawyer tools
   $bot->get('/source/<id:num>')->to('Report#source', format => 'json');
 
-  # Public API (legacy)
   $public->get('/api/package/:name' => sub ($c) { $c->redirect_to('package_api') });
   $public->get('/api/1.0/identify/:name/:checksum')->to('API#identify')->name('identify_api');
   $public->get('/api/1.0/package/:name')->to('API#status')->name('package_api');
   $public->get('/api/1.0/source')->to('API#source')->name('source_api');
 
-  # API with key
+  $public->get('/.well-known/oauth-protected-resource/*resource_path' => {resource_path => ''})
+    ->to('OAuth#protected_resource')
+    ->name('oauth_protected_resource');
+  $public->get('/.well-known/oauth-authorization-server')->to('OAuth#metadata');
+  $public->post('/oauth/register')->to('OAuth#register');
+  $public->get('/oauth/authorize')->to('OAuth#authorize')->name('oauth_authorize');
+  $public->post('/oauth/authorize')->to('OAuth#consent')->name('oauth_consent');
+  $public->post('/oauth/token')->to('OAuth#token');
+
   $api_key->any('/mcp' => $mcp_action)->name('mcp');
   $api_key->get('/api/v1/whoami')->to('API#whoami')->name('whoami_api');
   $api_key->get('/api/v1/reports')->to('API#reports');
   $api_key->get('/api/v1/search')->to('API#package_search')->name('search_api');
+  $api_key->post('/api/v1/packages/upload')->to('API#upload')->name('upload_api');
   $api_key->get('/api/v1/report/<id:num>' => [format => ['json', 'txt', 'mcp']])->to('Report#report');
-  $api_key->get('/api/v1/spdx/<id:num>')->to('Report#spdx');
+  $api_key->get('/api/v1/documents/<id:num>/:key')->to('Report#document');
 
-  # API Keys
   $logged_in->get('/api_keys')->to('APIKeys#list')->name('list_api_keys');
   $logged_in->get('/api_keys/meta')->to('APIKeys#list_meta')->name('list_api_keys_meta');
   $logged_in->post('/api_keys')->to('APIKeys#create')->name('create_api_keys');
   $logged_in->delete('/api_keys/:id')->to('APIKeys#remove')->name('remove_api_keys');
 
-  # Review UI
   $public->get('/')->to('Reviewer#list_reviews')->name('dashboard');
   $public->get('/search')->to('Search#search')->name('search');
   $public->get('/package/autocomplete')->to('Search#autocomplete')->name('package_autocomplete');
@@ -245,17 +236,22 @@ sub startup ($self) {
     ->to('Pagination#review_search')
     ->name('pagination_review_search');
   $public->get('/reviews/recent')->to('Reviewer#list_recent')->name('reviews_recent');
+  $logged_in->get('/reviews/ephemeral')->to('Reviewer#list_ephemeral')->name('reviews_ephemeral');
   $logged_in->get('/reviews/file_view/<id:num>/*file' => {file => ''})->to('Reviewer#file_view')->name('file_view');
   $logged_in->get('/reviews/file_view_meta/<id:num>/*file' => {file => ''})
     ->to('Reviewer#file_view_meta')
     ->name('file_view_meta');
+  $logged_in->get('/reviews/file_raw/<id:num>/*file')->to('Reviewer#file_raw')->name('file_raw');
   $logged_in->get('/reviews/details/<id:num>')->to('Reviewer#details')->name('package_details');
   $logged_in->get('/reviews/meta/<id:num>')->to('Reviewer#meta')->name('package_meta');
+  $logged_in->get('/reviews/tags' => [format => ['json']])->to('Reviewer#tags', format => 'json')->name('package_tags');
+  $can_curate->patch('/reviews/tags/<id:num>')->to('Reviewer#set_tags')->name('set_package_tags');
   $logged_in->get('/reviews/report/<id:num>' => [format => ['json', 'txt']])
     ->to('Report#report', format => 'json')
     ->name('report');
   $logged_in->get('/reviews/report_details/<id:num>')->to('Report#details')->name('report_details');
   $logged_in->get('/reviews/report_state/<id:num>')->to('Report#report_state')->name('report_state');
+  $logged_in->get('/reviews/report_artifacts/<id:num>')->to('Report#artifacts')->name('report_artifacts');
   $logged_in->get('/reviews/fetch_source/<id:num>' => [format => ['json']])->to('Report#source', format => 'json');
   $logged_in->get('/reviews/notes/recent'          => [format => ['html', 'json']])
     ->to('Notes#recent', format => 'html')
@@ -272,8 +268,14 @@ sub startup ($self) {
   $can_curate->post('/reviews/reindex/<id:num>')->to('Reviewer#reindex_package')->name('reindex_package');
   $public->get('/pagination/reviews/open')->to('Pagination#open_reviews')->name('pagination_open_reviews');
   $public->get('/pagination/reviews/recent')->to('Pagination#recent_reviews')->name('pagination_recent_reviews');
-  $logged_in->get('/spdx/<id:num>')->to('Report#spdx')->name('spdx_report');
-  $logged_in->post('/spdx/<id:num>')->to('Report#generate_spdx')->name('generate_spdx_report');
+  $logged_in->get('/pagination/reviews/ephemeral')
+    ->to('Pagination#ephemeral_reviews')
+    ->name('pagination_ephemeral_reviews');
+
+  # A package is the default subject. Numeric ids are what leaves room for the same formats on a product or
+  # a codestream later ("/documents/product/<name>/<key>") without moving these
+  $logged_in->get('/documents/<id:num>/:key')->to('Report#document')->name('document');
+  $logged_in->post('/documents/<id:num>')->to('Report#generate_documents')->name('generate_documents');
 
   $public->get('/licenses')->to('License#list')->name('licenses');
   $public->get('/pagination/licenses/known')->to('Pagination#known_licenses')->name('pagination_known_licenses');
@@ -308,6 +310,7 @@ sub startup ($self) {
   # Public because of fine grained access controls (owner of proposal may remove it again)
   $public->post('/licenses/proposed/remove/:checksum')->to('License#remove_proposal')->name('proposed_remove');
 
+  $logged_in->get('/licenses/autocomplete.json')->to('License#autocomplete')->name('license_autocomplete');
   $logged_in->get('/licenses/pattern/<id:num>.json')->to('License#pattern_detail')->name('pattern_detail');
   $can_curate->post('/licenses/pattern/<id:num>.json')->to('License#update_pattern_json')->name('update_pattern_json');
   $logged_in->get('/licenses/pattern/<id:num>/match_count.json')
@@ -321,12 +324,16 @@ sub startup ($self) {
   $can_curate->post('/licenses/update_pattern/<id:num>')->to('License#update_pattern')->name('update_pattern');
   $can_curate->post('/licenses/update_patterns')->to('License#update_patterns')->name('update_patterns');
   $can_curate->delete('/licenses/remove_pattern/<id:num>')->to('License#remove_pattern')->name('remove_pattern');
+
+  # ":id" would read the dot in "Apache-2.0" as a format separator
+  $public->get('/licenses/text_meta')->to('License#text_meta')->name('license_text_meta');
   $public->get('/licenses/*name')->to('License#show')->name('license_show');
 
   $public->get('/products')->to('Product#list')->name('products');
   $public->get('/pagination/products/known')->to('Pagination#known_products')->name('pagination_known_products');
   $public->get('/products/*name')->to('Product#show')->name('product_show');
   $public->get('/pagination/products/*name')->to('Pagination#product_reviews')->name('pagination_product_reviews');
+  $can_curate->put('/products/*name/annotation')->to('Product#set_annotation')->name('product_set_annotation');
 
   $logged_in->get('/snippets')->to('Snippet#list')->name('snippets');
   $logged_in->get('/snippets/meta')->to('Snippet#list_meta')->name('snippets_meta');
@@ -336,14 +343,17 @@ sub startup ($self) {
   $logged_in->get('/snippet/smart_edit/<id:num>')->to('Snippet#smart_edit')->name('snippet_smart_edit');
   $public->post('/snippet/closest')->to('Snippet#closest')->name('snippet_closest');
   $can_propose->get('/snippets/from_file/:file/<start:num>/<end:num>')->to('Snippet#from_file')->name('new_snippet');
+  $can_propose->get('/snippets/from_path/<package:num>/*file')->to('Snippet#from_path')->name('new_snippet_from_path');
+  $can_propose->get('/snippets/match_checksum/<file:num>/<pattern:num>/<line:num>')
+    ->to('Snippet#match_checksum')
+    ->name('snippet_match_checksum');
   $can_propose->post('/snippet/batch_decision')->to('Snippet#batch_decision')->name('snippet_batch_decision');
 
   $logged_in->get('/stats')->to('Stats#index')->name('stats');
   $logged_in->get('/stats/meta')->to('Stats#meta')->name('stats_meta');
 
-  # Upload (experimental)
-  $can_infra->get('/upload')->to('Upload#index')->name('upload');
-  $can_infra->post('/upload')->to('Upload#store')->name('store_upload');
+  $can_upload->get('/upload')->to('Upload#index')->name('upload');
+  $can_upload->post('/upload')->to('Upload#store')->name('store_upload');
 }
 
 1;

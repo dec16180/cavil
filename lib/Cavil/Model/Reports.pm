@@ -4,19 +4,23 @@
 package Cavil::Model::Reports;
 use Mojo::Base -base, -signatures;
 
-use Encode qw(from_to decode);
+use Encode qw(find_encoding from_to);
 use Mojo::File 'path';
-use Mojo::JSON qw(from_json to_json);
+use Mojo::JSON qw(from_json);
 use Cavil::PatternEngine;
 use Cavil::Checkout;
+use Cavil::Declarations;
 use Cavil::Licenses   qw(lic);
-use Cavil::ReportUtil qw(estimated_risk license_compatibility);
-use Cavil::Util       qw(lines_context);
+use Cavil::ReportUtil qw(estimated_risk license_compatibility license_document_candidates unexplained_lines);
+use Cavil::Util       qw(checkout_path line_tag to_json_fast @LICENSE_FLAGS);
 
-has [qw(acceptable_packages acceptable_risk checkout_dir max_expanded_files pg snippet_fold)];
+has [qw(acceptable_packages acceptable_risk checkout_dir pg snippet_fold)];
 
-# we need a HUGE number because Spooky uses unsigned integers
+# we need a HUGE number because the matcher uses unsigned integers
 use constant PATTERN_DELTA => 10000000000;
+
+# Looked up once, a lookup by name per decoded line was most of the source view's time
+my $UTF8 = find_encoding('UTF-8');
 
 sub cached_dig_report {
   my ($self, $id) = @_;
@@ -28,22 +32,74 @@ sub cached_dig_report {
 # value is a reindex building alongside it (only Cavil::Task::Analyze passes one, to build the report it
 # is about to promote)
 sub dig_report {
-  my ($self, $id, $limit_to_file, $generation) = @_;
+  my ($self, $id, $limit_to_file, $generation, $scope) = @_;
   $generation //= 0;
 
   my $db            = $self->pg->db;
-  my $pkg           = $db->select('bot_packages',  '*',            {id       => $id})->hash;
-  my $ignored       = $db->select('ignored_lines', ['id', 'hash'], {packname => $pkg->{name}});
+  my $pkg           = $db->query('SELECT * FROM bot_packages WHERE id = ?',               $id)->hash;
+  my $ignored       = $db->query('SELECT id, hash FROM ignored_lines WHERE packname = ?', $pkg->{name});
   my %ignored_lines = map { $_->{hash} => $_->{id} } $ignored->hashes->each;
 
-  my $report = $self->_dig_report($db, {}, $pkg, \%ignored_lines, $limit_to_file, $generation);
+  my $report = $self->_dig_report($db, {}, $pkg, \%ignored_lines, $limit_to_file, $generation, $scope);
 
-  # OSADL compatibility sub-matrix for the licenses present in this package (verbatim, directional)
   $report->{license_compatibility} = license_compatibility($report);
 
-  # prune match caches
   delete $report->{matches};
+  delete $report->{file_confidence};
   return $report;
+}
+
+# Annotations share the report transaction so derived metadata cannot drift.
+sub annotations ($self, $id) {
+  return undef unless my $hash = $self->pg->db->select('bot_reports', 'annotations', {package => $id})->hash;
+  return undef unless defined $hash->{annotations};
+  return from_json($hash->{annotations});
+}
+
+sub build_annotations ($self, $id, $dig_report) {
+  return {legal_documents => $self->_legal_documents($id, $dig_report)};
+}
+
+# Keep document kind in the row shape so adding detectors needs no schema change.
+sub _legal_documents ($self, $id, $dig_report) {
+  my $found  = license_document_candidates($dig_report);
+  my $result = {documents => [], dropped => $found->{dropped}};
+  my $docs   = $found->{documents};
+  return $result unless @$docs;
+
+  my $db = $self->pg->db;
+  return $result unless my $pkg = $db->select('bot_packages', ['name', 'checkout_dir'], {id => $id})->hash;
+
+  # Every candidate's licensed line spans in one query. The question is whether Cavil recognised the text
+  # at all, so catch_all markers count - excluding them (as the cover guard does, where the question is
+  # whether a license may be asserted) leaves a NOTICE of matched attribution boilerplate reading as
+  # almost entirely unexplained. Keyword patterns stay out: they are trigger words, and a stray
+  # "copyright notice" would mark a line of novel terms as explained. The file ids pin one generation.
+  my %spans;
+  my $matches = $db->query(
+    "SELECT pm.file, pm.sline, pm.eline FROM pattern_matches pm JOIN license_patterns lp ON lp.id = pm.pattern
+      WHERE pm.file = ANY(?) AND pm.ignored = false AND lp.license <> ''", [map { $_->{id} } @$docs]
+  );
+  push @{$spans{$_->[0]}}, [$_->[1], $_->[2]] for $matches->arrays->each;
+
+  # Blankness and line numbering do not require decoding.
+  my $base = checkout_path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir}, '.unpacked');
+  for my $doc (@$docs) {
+    my $file = $base->child($doc->{path});
+    next unless -r $file;
+    my @lines = split /\n/, $file->slurp, -1;
+    my $total = grep {/\S/} @lines;
+    next unless $total;
+    push @{$result->{documents}},
+      {
+      kind        => 'license',
+      path        => $doc->{path},
+      lines       => $total,
+      unexplained => unexplained_lines($spans{$doc->{id}}, \@lines)
+      };
+  }
+
+  return $result;
 }
 
 sub risk_is_acceptable {
@@ -51,6 +107,103 @@ sub risk_is_acceptable {
   return undef unless $shortname =~ /^(.+)-(\d):[^:]+$/;
   return undef if $2 > $self->acceptable_risk;
   return $2;
+}
+
+# Harvested URLs, email addresses and copyright notices, ordered by how often each occurs. Every list is
+# capped and carries its own total, so a truncated one can say how much it is not showing.
+sub artifacts ($self, $id, $limit = 500, $generation = 0) {
+  my $db = $self->pg->db;
+
+  # COUNT(*) OVER () is evaluated before the LIMIT, so the total costs no second query. The tiebreak
+  # collates as bytes, because the database's own collation orders by locale rules and Perl's cmp does not.
+  my $list = sub ($table, $value, $hits) {
+    my $rows = $db->query(
+      "SELECT * FROM (
+         SELECT $value AS value, $hits AS hits, COUNT(*) OVER () AS total
+           FROM $table WHERE package = ? AND generation = ?
+       ) a ORDER BY hits DESC, value COLLATE \"C\" LIMIT ?", $id, $generation, $limit
+    )->hashes;
+    return {
+      total  => $rows->size ? $rows->first->{total} : 0,
+      values => [map { [$_->{value}, $_->{hits}] } $rows->each]
+    };
+  };
+
+  return {
+    emails => $list->('emails', q{CASE WHEN name IS NULL THEN email ELSE name || ' <' || email || '>' END}, 'hits'),
+    urls   => $list->('urls',   'url',                                                                      'hits'),
+
+    # Counted in files rather than occurrences, which is the number that means something to a lawyer
+    copyrights => $list->('copyrights', 'copyright', 'COALESCE(array_length(files, 1), 0)')
+  };
+}
+
+# Every notice of a package with the files it covers. Sorted here rather than stored sorted: parallel
+# index batches merge these rows, so which batch commits first decides the stored order.
+sub copyrights ($self, $id, $generation = 0) {
+  my $rows
+    = $self->pg->db->query(
+    'SELECT copyright, files FROM copyrights WHERE package = ? AND generation = ? ORDER BY copyright COLLATE "C"',
+    $id, $generation)->hashes;
+  return [map { {copyright => $_->{copyright}, files => [sort @{$_->{files}}]} } $rows->each];
+}
+
+# A notice is stored against the original file, a match against the ".processed" copy; joining without
+# undoing that silently drops every wrapped and markup-stripped file
+my $ORIGINAL_NAME = q{regexp_replace(mf.filename, '\.processed(\.[^./]+)?$', '\1')};
+
+# Catch-alls are excluded because a grab-bag marker is not a license declaration, as in Cavil::SPDX
+my $MATCH_LICENSE = q{COALESCE(NULLIF(lp.spdx, ''), lp.license)};
+my $LICENSED_FILE = qq{
+  FROM matched_files mf
+  JOIN pattern_matches   pm ON pm.file = mf.id AND pm.ignored = false
+  JOIN license_patterns  lp ON lp.id = pm.pattern AND lp.catch_all = false
+ WHERE mf.package = ? AND mf.generation = ? AND $MATCH_LICENSE <> ''};
+
+# Includes licenses no copyright notice sits next to, whose terms still have to be reproduced
+sub licenses_present ($self, $id, $generation = 0) {
+  return $self->pg->db->query(qq{SELECT DISTINCT $MATCH_LICENSE COLLATE "C" AS license $LICENSED_FILE ORDER BY license},
+    $id, $generation)->arrays->flatten->to_array;
+}
+
+# Joined in the database and streamed, because a vendored package has millions of (notice, file) pairs
+# that must not reach Perl
+sub each_licensed_copyright ($self, $id, $generation, $cb) {
+  my $sql = qq{
+    SELECT DISTINCT $MATCH_LICENSE COLLATE "C" AS license, c.copyright COLLATE "C" AS copyright
+      FROM copyrights c
+      JOIN matched_files mf ON mf.package = c.package AND mf.generation = c.generation
+                           AND $ORIGINAL_NAME = ANY(c.files)
+      JOIN pattern_matches  pm ON pm.file = mf.id AND pm.ignored = false
+      JOIN license_patterns lp ON lp.id = pm.pattern AND lp.catch_all = false
+     WHERE c.package = ? AND c.generation = ? AND $MATCH_LICENSE <> ''
+     ORDER BY license, copyright};
+  return $self->_each_row($sql, [$id, $generation], $cb);
+}
+
+# A notice Cavil cannot attribute still has to be retained by whoever redistributes the code
+sub each_unlicensed_copyright ($self, $id, $generation, $cb) {
+  my $sql = qq{
+    SELECT c.copyright
+      FROM copyrights c
+     WHERE c.package = ? AND c.generation = ?
+       AND NOT EXISTS (SELECT 1 $LICENSED_FILE AND $ORIGINAL_NAME = ANY(c.files))
+     ORDER BY c.copyright COLLATE "C"};
+  return $self->_each_row($sql, [$id, $generation, $id, $generation], $cb);
+}
+
+# Text behind a license that will resolve to a LicenseRef. The WHERE mirrors the condition Cavil::SPDX
+# mints one under, so the document cannot reference an identifier this cannot explain.
+sub license_evidence ($self, $id, $generation = 0) {
+  return $self->pg->db->query(
+    "SELECT DISTINCT ON (lp.license) lp.license, mf.filename, pm.sline, pm.eline
+       FROM pattern_matches pm
+       JOIN license_patterns lp ON lp.id = pm.pattern
+       JOIN matched_files    mf ON mf.id = pm.file
+      WHERE pm.package = ? AND pm.generation = ? AND pm.ignored = false
+        AND lp.spdx = '' AND lp.license <> '' AND lp.catch_all = false
+      ORDER BY lp.license, (pm.eline - pm.sline) DESC, mf.filename, pm.sline", $id, $generation
+  )->hashes;
 }
 
 sub sanitized_dig_report {
@@ -69,7 +222,6 @@ sub shortname ($self, $chksum) {
     return $lentry->{shortname};
   }
 
-  # try to find a unique name for the checksum
   my $chars = ['a' .. 'z', 'A' .. 'Z', '0' .. '9'];
   for (1 .. 100) {
     my $shortname = join('', map { $chars->[rand @$chars] } 1 .. 6);
@@ -79,9 +231,7 @@ sub shortname ($self, $chksum) {
     )->hash;
     return $inserted->{shortname} if $inserted;
 
-    # The insert was a no-op. The conflict could be on either unique index:
-    # if another writer already assigned a shortname to this checksum, use it;
-    # otherwise our random shortname was taken, so loop and try a new one.
+    # Resolve races on checksum separately from random-name collisions.
     if (my $existing = $db->select('report_checksums', 'shortname', {checksum => $chksum})->hash) {
       return $existing->{shortname};
     }
@@ -89,25 +239,27 @@ sub shortname ($self, $chksum) {
   die "Could not allocate a shortname for checksum $chksum after 100 attempts";
 }
 
-sub source_for {
-  my ($self, $fileid, $start, $end) = @_;
+sub source_for ($self, $fileid, $start, $end, $scope = {}) {
 
   # The file id comes straight from a request, so pin it to the live report: a build running alongside
-  # has its own matched_files rows and must never be rendered
-  my $db   = $self->pg->db;
-  my $file = $db->select('matched_files', '*', {id => $fileid, generation => 0})->hash;
+  # has its own matched_files rows and must never be rendered. No handle is held across dig_report: the pool
+  # caches one connection, so a second one would be a fresh login on every request.
+  my $file = $self->pg->db->query('SELECT * FROM matched_files WHERE id = ? AND generation = 0', $fileid)->hash;
   return undef unless $file;
 
-  my $pkg = $db->select('bot_packages', '*', {id => $file->{package}})->hash;
+  my $pkg = $self->pg->db->query('SELECT * FROM bot_packages WHERE id = ?', $file->{package})->hash;
 
-  my $report = $self->dig_report($file->{package}, $fileid);
+  my $report = $self->dig_report($file->{package}, $fileid, 0, $scope);
   my $lines  = $report->{lines}{$fileid};
 
   # The report lives in the database but its source lines are read from the checkout on every request, and
   # a re-unpack tears that tree down and rebuilds it. Rather than answering with a silently empty file,
   # say the source is temporarily unavailable and let the caller show that instead.
-  my $fn = path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir}, '.unpacked', $file->{filename});
+  my $fn = checkout_path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir}, '.unpacked', $file->{filename});
   return {lines => [], name => $pkg->{name}, filename => $file->{filename}, unavailable => 1} unless -e $fn;
+
+  my $total;
+  ($lines, $total) = _scope_lines($lines, $scope) if defined($scope->{license}) || $scope->{unresolved};
 
   if ($start > 0 && $end > 0) {
     my %pid_info;    # cache
@@ -118,8 +270,7 @@ sub source_for {
       $needed{$nr} = 0;
       $needed{$nr} = $pid->{pid} if $pid->{pid};
 
-      # A folded line carries both a pattern id and a snippet handle: keep it rendering as the folded
-      # pattern (not as an unresolved snippet) and preserve its handle through folded_meta.
+      # Preserve the correction handle without repainting a fold as unresolved.
       if ($pid->{folded}) {
         $folded_meta{$nr} = {snippet => $pid->{snippet}, hash => $pid->{hash}};
       }
@@ -130,7 +281,6 @@ sub source_for {
     my $nr = $start;
     while ($nr <= $end) {
 
-      # snippet 0
       $needed{$nr++} = PATTERN_DELTA;
     }
     for my $c (1 .. 3) {
@@ -138,59 +288,84 @@ sub source_for {
       $needed{$end + $c}   //= 0;
     }
 
-    $lines = $self->_lines($db, \%pid_info, $fn, \%needed, \%folded_meta);
+    $lines = $self->_lines($self->pg->db, \%pid_info, $fn, \%needed, \%folded_meta);
   }
 
-  return {lines => $lines, name => $pkg->{name}, filename => $file->{filename}};
+  return {
+    lines    => $lines,
+    name     => $pkg->{name},
+    filename => $file->{filename},
+    defined $total ? (total => $total) : ()
+  };
 }
 
-sub specfile_report {
-  my ($self, $id) = @_;
+# Keep the first few matches a report row stands for (one license at one risk, or the unresolved snippets), with
+# their context. Every other line keeps its text but loses its match info, so the view only steps between the
+# matches in scope. One license can sit at two risks, which is why the risk is part of the scope.
+sub _scope_lines ($lines, $scope) {
+  my ($license, $risk, $groups) = @{$scope}{qw(license risk groups)};
+  my $in_scope
+    = defined $license
+    ? sub ($info) { defined $info->{pid} && ($info->{name} // '') eq $license && $info->{risk} == $risk }
+    : sub ($info) { $info->{snippet} && !$info->{folded} && $info->{risk} == 9 };
 
-  my $db   = $self->pg->db;
-  my $hash = $db->select('bot_reports', '*', {package => $id})->hash;
-
-  unless ($hash) {
-    return undef unless defined(my $specfile = $self->build_specfile_report($id));
-
-    # Nothing unpacked to read yet, so there is nothing worth caching either
-    return {} unless %$specfile;
-
-    my $report = {package => $id, specfile_report => to_json($specfile)};
-    $hash = $db->insert('bot_reports', $report, {returning => '*'})->hash;
+  my ($total, $prev, %keep) = (0);
+  for my $line (@$lines) {
+    my ($nr, $info) = @$line;
+    next unless $in_scope->($info);
+    my $tag = line_tag($line);
+    $total++ unless $prev && $prev->[0] == $nr - 1 && $prev->[1] == $tag;
+    $prev = [$nr, $tag];
+    next if $total > $groups;
+    $keep{$_} //= 0 for $nr - 3 .. $nr + 3;
+    $keep{$nr} = 1;
   }
 
-  return from_json($hash->{specfile_report});
+  # Same small-gap filling as _lines, so a scoped view does not break up where the full one would not
+  my $last;
+  for my $nr (sort { $a <=> $b } keys %keep) {
+    if ($last && $nr - $last > 1 && $nr - $last < 6) { $keep{$_} //= 0 for $last + 1 .. $nr - 1 }
+    $last = $nr;
+  }
+
+  my @scoped
+    = map { [$_->[0], $keep{$_->[0]} ? $_->[1] : {risk => 0}, $_->[2]] } grep { exists $keep{$_->[0]} } @$lines;
+  return (\@scoped, $total);
 }
 
-# Read the spec file report straight from the checkout, ignoring the cached copy. A rebuild that follows a
+sub declarations ($self, $id) {
+  my $db  = $self->pg->db;
+  my $row = $db->select('bot_reports', 'declarations', {package => $id})->hash;
+  return from_json($row->{declarations}) if $row && defined $row->{declarations};
+
+  return {declarations => [], incomplete_checkout => []} unless my $declarations = $self->build_declarations($id);
+  my $json = to_json_fast($declarations);
+  if ($row) { $db->update('bot_reports', {declarations => $json}, {package => $id}) }
+  else      { $db->insert('bot_reports', {package => $id, declarations => $json}) }
+  return $declarations;
+}
+
+# Read the declarations straight from the checkout, ignoring the cached copy. A rebuild that follows a
 # re-unpack has entirely new sources, so the cache describes the previous ones - Cavil::Task::Analyze takes
-# a fresh report from here and stores it with the promote, not before, so the spec file license and the
-# file report always change over together. Returns undef for a package that is gone and an empty report
-# while the sources are not unpacked.
-sub build_specfile_report ($self, $id) {
+# fresh declarations from here and stores them with the promote, not before, so the declared license and the
+# file report always change over together. Returns undef for a package that is gone or not unpacked.
+sub build_declarations ($self, $id) {
   return undef unless my $pkg = $self->pg->db->select('bot_packages', '*', {id => $id})->hash;
-
-  my $checkout = Cavil::Checkout->new(path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir}));
-  return {} unless $checkout->is_unpacked;
-
-  return $checkout->specfile_report({upload => (($pkg->{external_link} // '') eq 'upload')});
+  my $dir = checkout_path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir});
+  return Cavil::Checkout->new($dir)->is_unpacked ? Cavil::Declarations->new->detect($dir) : undef;
 }
 
 sub summary ($self, $id) {
-  my %summary  = (id => $id);
-  my $specfile = $self->specfile_report($id);
-  $summary{specfile} = lic($specfile->{main}{license})->canonicalize->to_string || 'Unknown';
+  my %summary = (id => $id);
+  $summary{declared}
+    = lic(($self->declarations($id)->{declarations}[0] // {})->{license})->canonicalize->to_string || 'Unknown';
 
-  # Reuse the dig report cached in bot_reports.ldig_report (JSON) when present - analyze stores it right
-  # before this runs, so recomputing the full match walk here is wasted work. Must pass $id and decode
-  # the JSON (see sanitized_dig_report); fall back to a fresh computation when no cache exists yet.
+  # Analyze has already cached this expensive match walk when available.
   my $cached = $self->cached_dig_report($id);
   my $report = $cached ? from_json($cached) : $self->dig_report($id);
 
   my $min_risklevel = 1;
 
-  # it's a bit random but the risk levels are defined a little random too
   $min_risklevel = 2 if $report->{risks}{3};
   $summary{licenses} = {};
   for my $license (sort { $a cmp $b } keys %{$report->{licenses}}) {
@@ -202,13 +377,6 @@ sub summary ($self, $id) {
     $summary{licenses}{$text} = $report->{licenses}{$license}{risk};
   }
 
-  # Walk the full set of winning files (file_snippets_to_show), not the
-  # expansion-truncated subset in $report->{snippets}. max_expanded_files
-  # only caps how many file blocks the renderer shows; the diff/score
-  # must compare every snippet hash, otherwise two content-equivalent
-  # packages can produce different scores just because their first-N
-  # alphabetical files happen to contain different subsets of the global
-  # winning set.
   my $files = {};
   for my $file_id (keys %{$report->{missed_snippets}}) {
     my $filename = $report->{files}{$file_id};
@@ -222,7 +390,7 @@ sub summary ($self, $id) {
 }
 
 sub _check_ignores {
-  my ($self, $report, $file, $ignored_lines, $matches_to_ignore, $snippets_to_remove) = @_;
+  my ($self, $report, $file, $ignored_lines, $matches_to_ignore) = @_;
 
   my $lastline = '';
   my @clines   = @{$report->{lines}{$file}};
@@ -236,9 +404,6 @@ sub _check_ignores {
       push(@marks, $line);
       if ($line->[1]->{snippet}) {
         $hex = $report->{snippets}{$file}{$line->[1]->{snippet}};
-        if (defined $ignored_lines->{$hex}) {
-          $snippets_to_remove->{$line->[1]->{snippet}} = 1;
-        }
         while ($line = shift @clines) {
           $lastline = $line->[2];
           last if $line->[1]{risk} != 9;
@@ -291,80 +456,59 @@ sub _add_to_snippet_hash {
 }
 
 sub _dig_report {
-  my ($self, $db, $pid_info, $pkg, $ignored_lines, $limit_to_file, $generation) = @_;
+  my ($self, $db, $pid_info, $pkg, $ignored_lines, $limit_to_file, $generation, $scope) = @_;
   $generation //= 0;
 
   my $ignored_file_res = Cavil::Util::load_ignored_files($db);
   my $report           = {};
-  my $query            = {package => $pkg->{id}, generation => $generation};
-  if ($limit_to_file) {
-    $query->{id} = $limit_to_file;
-  }
-  my $files = $db->select('matched_files', [qw(id filename)], $query);
+  my @only             = $limit_to_file ? ($limit_to_file) : ();
+
+  my @ignore_globs  = keys %$ignored_file_res;
+  my $matching_glob = sub ($filename) {
+    for my $ifname (@ignore_globs) { return $ifname if $filename =~ $ignored_file_res->{$ifname} }
+    return undef;
+  };
+
+  # Avoid per-row hashes for packages with tens of thousands of files.
   my %globs_matched;
-
-  while (my $file = $files->hash) {
-    my $ignored;
-    for my $ifname (keys %$ignored_file_res) {
-      next unless $file->{filename} =~ $ignored_file_res->{$ifname};
-      $globs_matched{$ifname} = 1;
-      $ignored = 1;
-      last;
-    }
-    $report->{files}{$file->{id}} = $file->{filename} unless $ignored;
+  my $files
+    = $db->query(
+    'SELECT id, filename FROM matched_files WHERE package = ? AND generation = ?' . (@only ? ' AND id = ?' : ''),
+    $pkg->{id}, $generation, @only);
+  for my $file ($files->arrays->each) {
+    my ($id, $filename) = @$file;
+    if (my $glob = $matching_glob->($filename)) { $globs_matched{$glob} = 1 }
+    else                                        { $report->{files}{$id} = $filename }
   }
 
-  # pm.file=mf.id already pins the matches to one generation, so only the files need the predicate
-  my $query_string = 'select distinct filename from
-                      matched_files mf join pattern_matches pm
-                      on pm.file=mf.id where mf.package=? and mf.generation=?
-                      and pm.ignored=true';
-
-  # now check the files that were already ignored during indexing
-  my $filenames;
-  if ($limit_to_file) {
-    $filenames = $db->query("$query_string and mf.id=?", $pkg->{id}, $generation, $limit_to_file);
-  }
-  else {
-    $filenames = $db->query($query_string, $pkg->{id}, $generation);
-  }
+  # The file join already pins matches to its generation.
+  my $filenames = $db->query(
+    'SELECT DISTINCT filename FROM matched_files mf JOIN pattern_matches pm ON pm.file = mf.id
+      WHERE mf.package = ? AND mf.generation = ? AND pm.ignored = true' . (@only ? ' AND mf.id = ?' : ''), $pkg->{id},
+    $generation, @only
+  );
 
   for my $file ($filenames->hashes->each) {
-    for my $ifname (keys %$ignored_file_res) {
-      next unless $file->{filename} =~ $ignored_file_res->{$ifname};
-      $globs_matched{$ifname} = 1;
-      last;
-    }
+    if (my $glob = $matching_glob->($file->{filename})) { $globs_matched{$glob} = 1 }
   }
   $filenames->finish;
 
   $report->{matching_globs} = [keys %globs_matched];
 
-  $query = {package => $pkg->{id}, ignored => 0, generation => $generation};
-  if ($limit_to_file) {
-    $query->{file} = $limit_to_file;
-  }
-  my $matches = $db->select('pattern_matches', [qw(id file pattern sline eline)], $query);
+  my $matches
+    = $db->query(
+    'SELECT id, file, pattern, sline, eline FROM pattern_matches WHERE package = ? AND ignored = false AND generation = ?'
+      . (@only ? ' AND file = ?' : ''),
+    $pkg->{id}, $generation, @only);
 
-  $query = {'file_snippets.package' => $pkg->{id}, 'file_snippets.generation' => $generation};
-  if ($limit_to_file) {
-    $query->{file} = $limit_to_file;
-  }
-  my $snippets = $db->select(
-    ['snippets', ['file_snippets', snippet => 'id']],
-    [
-      'snippets.id', 'snippets.hash', 'snippets.likelyness', 'snippets.like_pattern',
-      'file',        'sline',         'eline',               'classified',
-      'license',     'resolution'
-    ],
-    $query
+  my $snippets = $db->query(
+    'SELECT s.id, s.hash, s.likelyness, s.like_pattern, fs.file, fs.sline, fs.eline, s.classified, s.license,
+       fs.resolution
+     FROM snippets s JOIN file_snippets fs ON fs.snippet = s.id
+     WHERE fs.package = ? AND fs.generation = ?' . (@only ? ' AND fs.file = ?' : ''), $pkg->{id}, $generation, @only
   );
 
-  # Order by content-stable keys (filename, then snippet id, then sline) so
-  # the dedup winner for each snippet is the same across packages with the
-  # same content. sline is package-local because it shifts when surrounding
-  # non-keyword text differs even slightly, so it must not be the primary
-  # key. snippet id is hash-derived and stable.
+  # Stable content keys make deduplication reproducible across packages.
   my @snip_rows = sort {
          ($report->{files}{$a->{file}} // '') cmp ($report->{files}{$b->{file}} // '')
       || $a->{id}                             <=> $b->{id}
@@ -375,20 +519,14 @@ sub _dig_report {
   my %file_snippets_to_fold;
   my %snippets_shown;
 
-  # Partition snippet occurrences by what the report does with them. Dropped occurrences are simply not
-  # collected; this never suppresses real pattern matches - a licensed match inside a dropped or cleared
-  # region still reports its license independently in _register_matches (the premise of overlap-clear).
+  # Snippet resolution never suppresses independent licensed matches.
   for my $snip_row (@snip_rows) {
     my $resolution = $snip_row->{resolution} // '';
 
-    # Files hidden by an ignored-files glob, or snippets the classifier rejects as non-legal text, are
-    # dropped: neither shown to a human nor a license source.
     if (!defined $report->{files}{$snip_row->{file}} || (!$snip_row->{license} && $snip_row->{classified})) {
       next;
     }
 
-    # The stored resolution (computed once by resolve_snippets) decides the outcome per file occurrence:
-    # 'fold' asserts the closest license; 'clear'/'overlap'/'covered' drop the snippet as resolved noise.
     elsif ($resolution eq 'fold') {
       _add_to_snippet_hash(\%file_snippets_to_fold, $snip_row);
     }
@@ -396,7 +534,6 @@ sub _dig_report {
       $report->{cleared}{$snip_row->{file}} = 1;
     }
 
-    # Otherwise it is unresolved backlog: show it once across files (deduplicated by snippet id).
     elsif ($snippets_shown{$snip_row->{id}}) {
       next;
     }
@@ -408,16 +545,10 @@ sub _dig_report {
 
   $report->{missed_snippets} = \%file_snippets_to_show;
 
-  my $expanded_limit = $self->max_expanded_files;
-  my $num_expanded   = 0;
-
   my %matches_to_ignore;
-  my %snippets_to_remove;
 
-  for my $file (sort { $report->{files}{$a} cmp $report->{files}{$b} } keys %file_snippets_to_show) {
-    last if $num_expanded++ > $expanded_limit;
-
-    $report->{expanded}{$file} = 1;
+  # Source lines are only ever rendered for one file at a time
+  for my $file ($limit_to_file ? keys %file_snippets_to_show : ()) {
     for my $snip_row (@{$file_snippets_to_show{$file}}) {
       my ($sline, $eline, $id, $hash, $dummy1, $dummy2) = @$snip_row;
       for (my $i = $sline - 3; $i <= $eline + 3; $i++) {
@@ -433,8 +564,9 @@ sub _dig_report {
     }
   }
 
-  $self->_register_matches($db, $report, $pid_info, $matches, \%matches_to_ignore);
-  $self->_register_folds($db, $report, $pid_info, \%file_snippets_to_fold);
+  my $owns = _owns_lines($scope);
+  $self->_register_matches($db, $report, $pid_info, $matches, \%matches_to_ignore, $limit_to_file, $owns);
+  $self->_register_folds($db, $report, $pid_info, \%file_snippets_to_fold, $limit_to_file, $owns);
 
   $report->{flags} = [keys %{$report->{flags}}] if $report->{flags};
 
@@ -444,12 +576,12 @@ sub _dig_report {
     delete $license->{flaghash};
   }
 
-  for my $file (keys %{$report->{files}}) {
-    next unless $report->{expanded}{$file} || $limit_to_file;
-    my $fn = path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir}, '.unpacked', $report->{files}{$file});
+  for my $file ($limit_to_file ? keys %{$report->{files}} : ()) {
+    my $fn
+      = checkout_path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir}, '.unpacked', $report->{files}{$file});
     $report->{lines}{$file}
       = $self->_lines($db, $pid_info, $fn, $report->{needed_lines}{$file}, $report->{folded_meta}{$file});
-    $self->_check_ignores($report, $file, $ignored_lines, \%matches_to_ignore, \%snippets_to_remove);
+    $self->_check_ignores($report, $file, $ignored_lines, \%matches_to_ignore);
   }
 
   # in case ignored lines found unignored matches (i.e. first load), update them
@@ -459,25 +591,14 @@ sub _dig_report {
   }
 
   if (%matches_to_ignore) {
-    return $self->_dig_report($db, $pid_info, $pkg, $ignored_lines, $limit_to_file, $generation);
+    return $self->_dig_report($db, $pid_info, $pkg, $ignored_lines, $limit_to_file, $generation, $scope);
   }
 
   # we read the lines and that's enough
   delete $report->{needed_lines};
   delete $report->{folded_meta};
 
-  if ($limit_to_file) {
-    return $report;
-  }
-
-  # Scoped to the generation being built, or rendering the live report in the web process would delete
-  # rows out from under a reindex that is running alongside it
-  if (%snippets_to_remove) {
-    for my $id (keys %snippets_to_remove) {
-      $db->delete('file_snippets', {snippet => $id, package => $pkg->{id}, generation => $generation});
-    }
-    return $self->_dig_report($db, $pid_info, $pkg, $ignored_lines, undef, $generation);
-  }
+  return $report if $limit_to_file;
 
   my %missed_files;
 
@@ -498,19 +619,6 @@ sub _dig_report {
     $missed_files{$file} = [$max_risk, $match_of_max, $license_of_max, $spdx_of_max];
   }
   $report->{missed_files} = \%missed_files;
-
-  my $emails = $db->select('emails', '*', {package => $pkg->{id}, generation => $generation});
-  for my $email ($emails->hashes->each) {
-    my $key = $email->{email};
-    if ($email->{name}) {
-      $key = "$email->{name} <$email->{email}>";
-    }
-    $report->{emails}{$key} = $email->{hits};
-  }
-  my $urls = $db->select('urls', '*', {package => $pkg->{id}, generation => $generation});
-  for my $url ($urls->hashes->each) {
-    $report->{urls}{$url->{url}} = $url->{hits};
-  }
 
   my $components = $db->select(
     'package_components', '*',
@@ -564,14 +672,15 @@ sub _lines {
     my ($index, $pid, $line) = @$row;
 
     # Sanitize line - first try UTF-8 strict and then LATIN1
-    eval { $line = decode 'UTF-8', $line, Encode::FB_CROAK; };
+    eval { $line = $UTF8->decode($line, Encode::FB_CROAK | Encode::LEAVE_SRC) };
     if ($@) {
       from_to($line, 'ISO-LATIN-1', 'UTF-8', Encode::FB_DEFAULT);
-      $line = decode 'UTF-8', $line, Encode::FB_DEFAULT;
+      $line = $UTF8->decode($line, Encode::FB_DEFAULT);
     }
     if ($pid >= PATTERN_DELTA) {
       my $sid  = $pid - PATTERN_DELTA;
-      my $info = $snippet_info{$sid} ||= $db->select('snippets', ['hash', 'like_pattern'], {id => $sid})->hash || {};
+      my $info = $snippet_info{$sid}
+        ||= $db->query('SELECT hash, like_pattern FROM snippets WHERE id = ?', $sid)->hash || {};
       my $line_info = {risk => 9, snippet => $sid, name => 'Snippet of missing keywords'};
       $line_info->{hash} = $info->{hash}           if $info->{hash};
       $line_info->{pids} = [$info->{like_pattern}] if $info->{like_pattern};
@@ -593,34 +702,88 @@ sub _lines {
   return \@lines;
 }
 
+# Populate the pattern cache for a batch of pattern ids with one query, so the per-match lookups in
+# _register_matches all hit instead of firing a single-row SELECT each. Only the license identity, risk
+# and flag columns are ever read - never the (large) pattern text: this cache lives on the reports
+# helper, a state singleton, so in a long-running web process it would otherwise accumulate the full
+# pattern text of every pattern any report touches (tens of MB across the corpus, growing with it) for no
+# benefit. Ids already cached are skipped, so a warm cache narrows the batch to just the new ids.
+sub _prime_pattern_cache {
+  my ($self, $db, $pids) = @_;
+
+  my $cache = $self->{license_cache} //= {};
+  my %needed;
+  $needed{$_} = 1 for grep { $_ && !$cache->{"pattern-$_"} } @$pids;
+  return unless %needed;
+
+  my $found = $db->query(
+    'SELECT id, license, spdx, risk, patent, trademark, export_restricted, cla, eula, catch_all
+       FROM license_patterns WHERE id = ANY(?)', [keys %needed]
+  )->hashes;
+  for my $pattern ($found->each) {
+    my $id = delete $pattern->{id};
+    $cache->{"pattern-$id"} = $pattern;
+  }
+}
+
+# Peak memory is one batch rather than the whole result set. The transaction is not optional: a cursor
+# without one is closed before the first FETCH, and DECLARE and FETCH must share a connection.
+use constant CURSOR_BATCH => 1000;
+
+sub _each_row ($self, $sql, $bind, $cb) {
+  state $seq = 0;
+  my $name = 'cavil_rows_' . ++$seq;
+
+  my $db = $self->pg->db;
+  my $tx = $db->begin;
+  $db->query("DECLARE $name NO SCROLL CURSOR FOR $sql", @$bind);
+  while (1) {
+    my $batch = $db->query("FETCH @{[CURSOR_BATCH]} FROM $name")->arrays;
+    last unless $batch->size;
+    $cb->(@$_) for $batch->each;
+  }
+  $db->query("CLOSE $name");
+}
+
 sub _load_pattern_from_cache {
   my ($self, $db, $pid) = @_;
-
-  # Only the license identity, risk and flag columns are ever read from this cache - never the (large)
-  # pattern text. Select just those: this cache lives on the reports helper, a state singleton, so in the
-  # long-running web process it would otherwise accumulate the full pattern text of every pattern any
-  # report touches (tens of MB across the corpus, growing with it) for no benefit.
-  $self->{license_cache}->{"pattern-$pid"}
-    ||= $db->select('license_patterns', [qw(license spdx risk patent trademark export_restricted cla eula)],
-    {id => $pid})->hash;
-  return $self->{license_cache}->{"pattern-$pid"};
+  $self->_prime_pattern_cache($db, [$pid]) unless $self->{license_cache}{"pattern-$pid"};
+  return $self->{license_cache}{"pattern-$pid"};
 }
 
 # Record a license on the report (licenses + risks lists + flags). Shared by the real-match and the
-# folded-snippet registration below so both contribute a license identically.
+# folded-snippet registration below so both contribute a license identically. $source ('match' | 'fold')
+# records how confidently this (file, license) is established - a real pattern match outranks a folded
+# snippet - so proximity can prefer the strongest evidence when it picks a pair's representative files
+# (see file_confidence / _file_license_ids). One hash write per registration (per match/fold, not per line).
 sub _register_license {
-  my ($self, $report, $pid_info, $pattern, $pid, $file) = @_;
+  my ($self, $report, $pid_info, $pattern, $pid, $file, $source) = @_;
 
-  $report->{licenses}{$pattern->{license}}
-    ||= {name => $pattern->{license}, spdx => $pattern->{spdx}, risk => $pattern->{risk}};
-  $report->{licenses}{$pattern->{license}}{flaghash}{$_} ||= $pattern->{$_}
-    for qw(patent trademark export_restricted cla eula);
+  $report->{licenses}{$pattern->{license}} ||= {
+    name      => $pattern->{license},
+    spdx      => $pattern->{spdx},
+    risk      => $pattern->{risk},
+    catch_all => $pattern->{catch_all}
+  };
+  $report->{licenses}{$pattern->{license}}{flaghash}{$_} ||= $pattern->{$_} for @LICENSE_FLAGS;
 
   my $rl = $report->{risks}{$pattern->{risk}};
   push(@{$rl->{$pattern->{license}}{$pid}}, $file);
   $report->{risks}{$pattern->{risk}} = $rl;
 
+  my $rank = ($source // 'match') eq 'fold' ? 2 : 3;
+  my $seen = $report->{file_confidence}{$file}{$pattern->{license}};
+  $report->{file_confidence}{$file}{$pattern->{license}} = $rank if !defined $seen || $rank > $seen;
+
   $pid_info->{$pid} = {risk => $pattern->{risk}, name => $pattern->{license}, pid => $pid};
+}
+
+# A line holds one pattern (equal risk, last one wins), so a license can lose every line it matched to others.
+# A scoped view would then come up empty, so there its license registers last and takes its lines regardless.
+sub _owns_lines ($scope) {
+  return sub ($pattern) {0}
+    unless defined(my $license = $scope->{license});
+  return sub ($pattern) { $pattern->{license} eq $license && $pattern->{risk} == $scope->{risk} };
 }
 
 # Register every real (non-ignored) license pattern match into the report: add its license and
@@ -628,9 +791,18 @@ sub _register_license {
 # fully inside an ignored/cleared snippet region are skipped, and matches in glob-hidden files are
 # queued for ignoring.
 sub _register_matches {
-  my ($self, $db, $report, $pid_info, $matches, $matches_to_ignore) = @_;
+  my ($self, $db, $report, $pid_info, $matches, $matches_to_ignore, $with_lines, $owns) = @_;
 
-  for my $match ($matches->hashes->each) {
+  # Prime the pattern cache in one shot. Every match references a pattern, and the per-match
+  # _load_pattern_from_cache below would otherwise fire one single-row SELECT per cache miss - hundreds
+  # of round-trips on a large package, and the dominant cost of report generation. Bulk-load the distinct
+  # ids that are not cached yet with a single ANY() query instead.
+  my $rows = $matches->hashes->to_array;
+  $self->_prime_pattern_cache($db, [map { $_->{pattern} } @$rows]);
+  my %owned = map { $_ => $owns->($self->_load_pattern_from_cache($db, $_)) } map { $_->{pattern} } @$rows;
+  @$rows = sort { $owned{$a->{pattern}} <=> $owned{$b->{pattern}} } @$rows;
+
+  for my $match (@$rows) {
     my $pid = $match->{pattern};
 
     if (!defined $report->{files}{$match->{file}}) {
@@ -648,23 +820,31 @@ sub _register_matches {
     my $pattern = $self->_load_pattern_from_cache($db, $pid);
     next if $pattern->{license} eq '';
 
-    $self->_register_license($report, $pid_info, $pattern, $pid, $match->{file});
-    my $risk = $pattern->{risk};
+    my ($file, $mid, $sline, $eline) = @{$match}{qw(file id sline eline)};
+    $self->_register_license($report, $pid_info, $pattern, $pid, $file, 'match');
+    next unless $with_lines;
+    my ($risk, $owned) = ($pattern->{risk}, $owned{$pid});
 
-    for (my $i = $match->{sline} - 3; $i <= $match->{eline} + 3; $i++) {
+    # Hoist the two per-file line maps: the loop runs once per line of every match (its ±3 context lines
+    # included), so re-descending these two-level hashes each iteration is the hot path on a big package.
+    my $needed  = $report->{needed_lines}{$file} //= {};
+    my $matched = $report->{matches}{$file}      //= {};
+
+    for (my $i = $sline - 3; $i <= $eline + 3; $i++) {
       next if $i < 1;
-      if ($i >= $match->{sline} && $i <= $match->{eline}) {
-        my $opid = $report->{needed_lines}{$match->{file}}{$i} // 0;
-        next if $opid > PATTERN_DELTA;
+      if ($i >= $sline && $i <= $eline) {
+        my $opid = $needed->{$i} // 0;
+        next if !$owned && $opid > PATTERN_DELTA;
 
-        # set the risk of the line, but make sure we do not lower the risk
-        next if $risk < $self->_info_for_pattern($db, $pid_info, $opid)->{risk};
-        $report->{needed_lines}{$match->{file}}{$i} = $pid;
-        $report->{matches}{$match->{file}}{$i}      = $match->{id};
+        # Set the line's pattern, but never lower an already-higher risk. An unmarked line (opid 0) has
+        # risk 0 and can never out-rank this match, so skip the lookup for it.
+        next if !$owned && $opid && $risk < $self->_info_for_pattern($db, $pid_info, $opid)->{risk};
+        $needed->{$i}  = $pid;
+        $matched->{$i} = $mid;
       }
       else {
         # we want context but not highlight the context
-        $report->{needed_lines}{$match->{file}}{$i} ||= 0;
+        $needed->{$i} //= 0;
       }
     }
   }
@@ -676,7 +856,7 @@ sub _register_matches {
 # only holds one integer per line, so the originating snippet id/hash (the handle reviewers need to
 # correct a wrong fold) is carried in a parallel folded_meta map.
 sub _register_folds {
-  my ($self, $db, $report, $pid_info, $file_snippets_to_fold) = @_;
+  my ($self, $db, $report, $pid_info, $file_snippets_to_fold, $with_lines, $owns) = @_;
 
   for my $file (keys %$file_snippets_to_fold) {
     for my $snip_row (@{$file_snippets_to_fold->{$file}}) {
@@ -684,14 +864,11 @@ sub _register_folds {
       next unless $pid;
       my $pattern = $self->_load_pattern_from_cache($db, $pid);
       next if $pattern->{license} eq '';
+      my $owned = $owns->($pattern);
 
-      $self->_register_license($report, $pid_info, $pattern, $pid, $file);
+      $self->_register_license($report, $pid_info, $pattern, $pid, $file, 'fold');
       $report->{folded}{$file} = 1;
-
-      # Do not auto-expand a file just because it folded: only files with unresolved matches are
-      # expanded inline (the show loop above). A fully-folded file is still listed under its inferred
-      # license and rendered on demand - opened from the report file link or in the file browser (both
-      # go through the limit_to_file path, which builds its lines and the fold highlighting below).
+      next unless $with_lines;
 
       for (my $i = $sline - 3; $i <= $eline + 3; $i++) {
         next if $i < 1;
@@ -701,7 +878,7 @@ sub _register_folds {
           # (1..PATTERN_DELTA) or an unresolved-snippet marker (> PATTERN_DELTA) already on the line is
           # authoritative, so a fold never repaints a line a curated match already explains.
           my $opid = $report->{needed_lines}{$file}{$i} // 0;
-          next if $opid;
+          next if $opid && !$owned;
           $report->{needed_lines}{$file}{$i} = $pid;
           $report->{folded_meta}{$file}{$i}  = {snippet => $sid, hash => $hash};
         }
@@ -721,13 +898,10 @@ sub _sanitize_report {
 
   # Files
   my $files    = $report->{files};
-  my $expanded = $report->{expanded};
-  my $lines    = $report->{lines};
   my $snippets = $report->{missed_snippets};
 
   my @missed;
   for my $file (keys %$snippets) {
-    $expanded->{$file} = 1;
     my ($max_risk, $match, $license, $spdx) = @{$report->{missed_files}{$file}};
     $license = 'Keyword' unless $license;
     push(
@@ -746,15 +920,7 @@ sub _sanitize_report {
   delete $report->{missed_snippets};
   $report->{missed_files} = [sort { $b->{max_risk} cmp $a->{max_risk} || $a->{name} cmp $b->{name} } @missed];
 
-  $report->{files} = [];
-  for my $file (sort { $files->{$a} cmp $files->{$b} } keys %$files) {
-    my $path = $files->{$file};
-    push @{$report->{files}}, my $current = {id => $file, path => $path, expand => $expanded->{$file}};
-
-    if ($lines->{$file}) {
-      $current->{lines} = lines_context($lines->{$file});
-    }
-  }
+  $report->{files} = [map { {id => $_, path => $files->{$_}} } sort { $files->{$a} cmp $files->{$b} } keys %$files];
 
   # Risks
   my $chart = $report->{chart} = {};
@@ -769,7 +935,8 @@ sub _sanitize_report {
       my $current = $current->{$lic} = {};
       my $license = $licenses->{$lic};
       my $name    = $current->{name} = $license->{name};
-      $current->{spdx} = $license->{spdx};
+      $current->{spdx}      = $license->{spdx};
+      $current->{catch_all} = $license->{catch_all} ? 1 : 0;
 
       my $matches = $risk->{$lic};
       my %files   = map { $_ => 1 } map {@$_} values %$matches;
@@ -784,11 +951,6 @@ sub _sanitize_report {
     }
   }
 
-  # Emails and URLs
-  my $emails = $report->{emails};
-  $report->{emails} = [map { [$_, $emails->{$_}] } sort { $emails->{$b} <=> $emails->{$a} || $a cmp $b } keys %$emails];
-  my $urls = $report->{urls};
-  $report->{urls} = [map { [$_, $urls->{$_}] } sort { $urls->{$b} <=> $urls->{$a} || $a cmp $b } keys %$urls];
 }
 
 1;

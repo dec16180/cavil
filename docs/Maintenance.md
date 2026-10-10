@@ -27,7 +27,7 @@ Not all failures will be as self explanatory as HTTP timeouts and might require 
 
 If you have configured an `exclude_file` in `cavil.conf`, it lets you keep whole files out of unpacking and indexing.
 Its most important job is defensive: neutralizing hostile or pathological inputs that would otherwise break the
-unpacker — zip bombs, archives that make `tar` loop forever, files with names that make unpacking fail, and
+unpacker - zip bombs, archives that make `tar` loop forever, files with names that make unpacking fail, and
 deliberately deep or malicious directory structures. It is also handy for cutting pure noise, such as generated code or
 large vendored blobs that only clutter reports. When you find an input that hangs or fails the unpacker (often surfaced
 as a stuck or failed Minion job), adding it here is usually the fix, so expect this list to grow over time.
@@ -68,14 +68,17 @@ register a schedule once with `script/cavil minion schedule`, and your Minion wo
 own (as long as at least one worker is running).
 
 ```sh
-    # Reindex everything every Saturday at 20:00
-    script/cavil minion schedule -e weekly_reindexing -c '0 20 * * 6' -t reindex_all
+    # Reindex everything every Friday at 20:00
+    script/cavil minion schedule -e weekly_reindexing -c '0 20 * * 5' -t reindex_all
 
     # Clean up obsolete reports every day at 01:00
     script/cavil minion schedule -e daily_cleanup -c '0 1 * * *' -t obsolete
 
     # Collect builds that died halfway, every hour
     script/cavil minion schedule -e hourly_sweep -c '25 * * * *' -t sweep_builds
+
+    # Purge expired ephemeral one-off reviews, every hour
+    script/cavil minion schedule -e hourly_ephemeral_cleanup -c '15 * * * *' -t cleanup_ephemeral
 ```
 
 The `-e` value is just a name for the schedule (used to update, pause, or remove it later), `-c` is a standard cron

@@ -7,17 +7,27 @@ Package: <%== $summary->{package_name} %>
 Id: <%== $summary->{id} %>
 State: <%== $summary->{state} %>
 External-Link: <%== $summary->{external_link} %>
+% if (my $data = $summary->{external_link_data}) { if (my $target = $data->{target}) {
+Target: <%== $target %>
+% } }
+% if (my @tags = @{$summary->{tags} // []}) {
+Tags: <%== join(', ', @tags) %>
+% }
+% if (my @requests = @{$summary->{requests_data}}) {
+Requests:
+% for my $request (@requests) {
+- <%== $request->{text} %><%== $request->{target} ? " (Target: $request->{target})" : '' %>
+% }
+% }
 % if (my $version = $summary->{package_version}) {
 Version: <%== $version %>
 % }
-% if (my $declared = $summary->{package_license}{name}) {
-Declared-License: <%== $declared %><%== $summary->{package_license}{spdx} ? '' : ' (not a valid SPDX expression)' %>
+% my $primary = $summary->{declarations}[0] // {};
+% if (defined(my $declared = $primary->{license})) {
+Declared-License: <%== $declared %> (from <%== $primary->{file} %>)<%== $primary->{spdx} ? '' : ' (not a valid SPDX expression)' %>
 % }
 % if (my $sum = $summary->{package_summary}) {
 Summary: <%== $sum %>
-% }
-% if (my $group = $summary->{package_group}) {
-Group: <%== $group %>
 % }
 % if (my $url = $summary->{package_url}) {
 URL: <%== $url %>
@@ -49,40 +59,83 @@ Created: <%== Mojo::Date->new($summary->{created})->to_datetime %>
 
 
 % }
-% if (@{$summary->{errors}}) {
-## Package File Warnings for Packagers
+% if (@{$summary->{declarations}}) {
+## Package Declarations
 
-%   for my $error (@{$summary->{errors}}) {
-* <%== $error %>
+%   for my $d (@{$summary->{declarations}}) {
+%     my $name = join '@', grep { length($_ // '') } $d->{name}, $d->{version};
+* `<%== $d->{file} %>` (<%== $d->{format} %>)<%== length $name ? ": $name" : '' %><%== defined $d->{license} ? ", $d->{license}" : ', no license declared' %>
 %   }
 
 
 
 % }
-% if (@{$summary->{warnings}}) {
-## Package File Warnings for Reviewers
+% if (@{$summary->{incomplete_checkout}}) {
+## Checkout May Be Incomplete
 
-%   for my $warning (@{$summary->{warnings}}) {
-* <%== $warning %>
+%   for my $service (@{$summary->{incomplete_checkout}}) {
+* Remote service in _service file: <%== $service->{name} %> (mode: <%== $service->{mode} %>)
 %   }
 
 
 
 % }
 ## Licenses
-% use Cavil::ReportUtil qw(hard_incompatibilities);
-% my $hard = hard_incompatibilities($report->{license_compatibility} // {});
-% if (@$hard) {
+% use Cavil::ReportUtil qw(ranked_incompatibilities incompatibility_location);
+% my $ranked = ranked_incompatibilities($report->{license_compatibility} // {});
+% if (@$ranked) {
+%   my $VENDORED_LIMIT = 10;
+%   my (@investigate, @vendored, $peripheral, $weak, $distant);
+%   for my $r (@$ranked) {
+%     my $loc = incompatibility_location($r);
+%     if ($r->{confidence} >= 2 && $r->{tier} < 2 && $loc) {
+%       my $tags = ($r->{mutual} ? 'mutual' : 'one-way') . ($r->{confidence} == 2 ? ', folded' : '');
+%       push @{$r->{tier} ? \@vendored : \@investigate}, "* $r->{a} + $r->{b} [$tags] - $loc";
+%     }
+%     elsif ($r->{tier} == 2)               { $peripheral++ }
+%     elsif ($r->{confidence} == 1 && $loc) { $weak++ }
+%     else                                  { $distant++ }
+%   }
+%   my $dropped = @vendored - $VENDORED_LIMIT;
+%   splice @vendored, $VENDORED_LIMIT if $dropped > 0;
 
 ### Incompatible Licenses
 
-%   for my $pair (@$hard) {
-* <%== $pair->[0] %> and <%== $pair->[1] %>
-%   }
+OSADL flags these pairs as incompatible when combined into one work. Proximity locates the code but is not
+proof - confirm with cavil_get_file.
 
-OSADL flags these pairs as incompatible in both directions. That only matters if the code is really
-combined into one work; vendored or merely aggregated components usually are not. The web report has
-the full directional matrix and OSADL's explanations.
+%   if (@investigate) {
+Worth investigating (co-located in shipped code):
+%     for my $line (@investigate) {
+<%== $line %>
+%     }
+%   }
+%   else {
+None co-located in shipped code (aggregation only).
+%   }
+%   if (@vendored) {
+
+Vendored dependencies (spot check these - vendored code linked into the build is still a combined work):
+%     for my $line (@vendored) {
+<%== $line %>
+%     }
+%     if ($dropped > 0) {
+* and <%= $dropped %> more vendored pairs, not listed (full matrix in the web report)
+%     }
+%   }
+%   if ($peripheral || $weak || $distant) {
+
+Lower priority (full matrix in the web report):
+%     if ($peripheral) {
+* <%= $peripheral %> in tests/docs/examples (ignorable even inside a vendored tree)
+%     }
+%     if ($weak) {
+* <%= $weak %> via an unresolved-snippet guess
+%     }
+%     if ($distant) {
+* <%= $distant %> only at the package root (aggregation)
+%     }
+%   }
 
 % }
 % if (@{$report->{missed_files}}) {
@@ -145,30 +198,48 @@ No files matched known license patterns or keywords.
 For the full list and per-snippet detail (verbatim text, overlaps, keywords, covered-by): cavil_search_snippets(package_id=<%= $summary->{id} %>).
 
 % }
-% my @emails = @{$report->{emails} // []};
+% my $emails = $artifacts->{emails} // {total => 0, values => []};
+% my @emails = @{$emails->{values}}[0 .. ($email_limit <= @{$emails->{values}} ? $email_limit - 1 : $#{$emails->{values}})];
 % if ($email_limit && @emails) {
 
 ## Email Addresses
 
-Ordered by occurrences<%= @emails > $email_limit ? ", top $email_limit of " . scalar(@emails) : '' %>.
+Ordered by occurrences<%= $emails->{total} > @emails ? ", top " . scalar(@emails) . " of $emails->{total}" : '' %>.
 
-%   for my $email (@emails[0 .. ($email_limit < @emails ? $email_limit - 1 : $#emails)]) {
+%   for my $email (@emails) {
 * `<%== $email->[0] %>`: <%== $email->[1] %>
 %   }
 % }
 
-% my @urls = @{$report->{urls} // []};
+% my $urls = $artifacts->{urls} // {total => 0, values => []};
+% my @urls = @{$urls->{values}}[0 .. ($url_limit <= @{$urls->{values}} ? $url_limit - 1 : $#{$urls->{values}})];
 % if ($url_limit && @urls) {
 
 ## URLs
 
-Ordered by occurrences<%= @urls > $url_limit ? ", top $url_limit of " . scalar(@urls) : '' %>.
+Ordered by occurrences<%= $urls->{total} > @urls ? ", top " . scalar(@urls) . " of $urls->{total}" : '' %>.
 
-%   for my $url (@urls[0 .. ($url_limit < @urls ? $url_limit - 1 : $#urls)]) {
+%   for my $url (@urls) {
 * `<%== $url->[0] %>`: <%== $url->[1] %>
 %   }
 % }
 
+% my $legal_documents = $summary->{legal_documents};
+% if ($legal_documents && @{$legal_documents->{documents}}) {
+
+## Legal Documents
+
+The files that state this package's terms, with the lines of each no known license pattern matched. Read
+those lines: the auto-resolved snippet counts can hide them.
+
+%   for my $document (@{$legal_documents->{documents}}) {
+%     my $unexplained = $document->{unexplained};
+* `<%== $document->{path} %>`: <%= $document->{lines} %> line<%= $document->{lines} == 1 ? '' : 's' %><%== $unexplained ? ", $unexplained unknown" : '' %>
+%   }
+%   if (my $dropped = $legal_documents->{dropped}) {
+* ... <%= $dropped %> more not listed
+%   }
+% }
 % if (@{$report->{components} // []}) {
 
 ## Vendored Components

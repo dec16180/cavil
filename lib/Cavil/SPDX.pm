@@ -7,12 +7,13 @@ use Mojo::Base -base, -signatures;
 use Cavil::Checkout;
 use Cavil::Licenses qw(lic scancode_suggestion);
 use Cavil::PostProcess;
-use Cavil::Util qw(slurp_and_decode);
+use Cavil::Util qw(fs_bytes read_lines @LICENSE_FLAGS);
 use Digest::SHA;
 use IO::Compress::Gzip qw($GzipError);
 use Mojo::File         qw(path);
 use Mojo::JSON         qw(encode_json);
 use Mojo::Date;
+use Mojo::URL;
 use Mojo::Util qw(decode scope_guard);
 
 # BSI TR-03183-2 requires SPDX 3.0.1 (or higher) in JSON format (see section 4)
@@ -20,8 +21,32 @@ use constant SPEC_VERSION => '3.0.1';
 use constant CONTEXT      => 'https://spdx.org/rdf/3.0.1/spdx-context.jsonld';
 use constant HASH_ALGO    => 'sha512';
 
-# Legal flags Cavil curates per license pattern, surfaced as additive SPDX annotations
-my @FLAGS = qw(trademark patent export_restricted cla eula);
+# SPDX 3.0.1 individuals for "the author asserts nothing here". The CISA minimum elements want unavailable
+# data stated rather than left out, so a recipient can tell "we do not know" from "we did not look". The
+# agent one has to be spelled as a full IRI: the short "NoAssertionElement" token is only accepted where the
+# schema lists it literally, and the agent range used for a component producer does not.
+use constant NO_ASSERTION_AGENT   => 'https://spdx.org/rdf/3.0.1/terms/Core/NoAssertionElement';
+use constant NO_ASSERTION_LICENSE => 'expandedlicensing_NoAssertionLicense';
+
+# "There is nothing here", as opposed to "we did not check". Used to state that a package genuinely ships no
+# vendored subcomponents, which is what carries the completeness of the dependency list for such a package.
+use constant NONE_ELEMENT => 'https://spdx.org/rdf/3.0.1/terms/Core/NoneElement';
+
+# Stated once on the SBOM rather than repeated on every element it applies to. The elements this covers
+# (version, hash) are plain strings and objects in SPDX 3.0.1 with no "unknown" form to put in them, and
+# CISA treats identifying unknowns as a practice rather than a data field, so one statement is the right
+# shape - a per-component note would repeat itself thousands of times in a heavily vendored package.
+use constant UNKNOWNS_STATEMENT => join(' ',
+  'Unknown information is stated rather than omitted.',
+  'A component with no identifiable producer carries a NoAssertion producer, and a component whose license',
+  'could not be determined carries a NoAssertion license.',
+  'This is a source SBOM: the cryptographic hashes cover the delivered source archives, while vendored',
+  'subcomponents have no archive of their own to hash and so carry none.',
+  'A vendored subcomponent whose own metadata states no version is listed without one.',
+  'Nothing is withheld from this document.');
+
+# A pattern can cover a whole license body, so one match must not be able to flood the document
+use constant MAX_LICENSE_TEXT => 20_000;
 
 # Filename extensions of deployable source archives; their hash is the "deployable component" hash
 # BSI requires, and hashing just these is far cheaper than re-reading the whole unpacked tree
@@ -36,15 +61,15 @@ has 'app';
 sub generate_to_file ($self, $id, $file) {
   path($file)->remove if -e $file;
 
-  my $app             = $self->app;
-  my $log             = $app->log;
-  my $config          = $app->config->{spdx} || {};
-  my $namespace       = $config->{namespace} || 'http://legaldb.suse.de/spdx/';
-  my $dir             = $app->packages->pkg_checkout_dir($id);
-  my $checkout        = Cavil::Checkout->new($dir);
-  my $reports         = $app->reports;
-  my $specfile_report = $reports->specfile_report($id);
-  my $db              = $app->pg->db;
+  my $app          = $self->app;
+  my $log          = $app->log;
+  my $config       = $app->config->{spdx} || {};
+  my $namespace    = $config->{namespace} || 'http://legaldb.suse.de/spdx/';
+  my $dir          = $app->packages->pkg_checkout_dir($id);
+  my $checkout     = Cavil::Checkout->new($dir);
+  my $reports      = $app->reports;
+  my $declarations = $reports->declarations($id);
+  my $db           = $app->pg->db;
 
   my $pkg
     = $db->query('SELECT *, EXTRACT(EPOCH FROM created)::bigint AS created_epoch FROM bot_packages WHERE id = ?', $id)
@@ -68,12 +93,14 @@ sub generate_to_file ($self, $id, $file) {
   $handle->print('{"@context":"' . CONTEXT . '","@graph":[');
   my $graph = _Graph->new(handle => $handle, first => 1);
 
-  # Enumerate the unpacked files (for the file components, copyright/license scanning and subcomponent
-  # grouping). Individual files are not hashed - only the delivered archive is (see below).
-  my (%info, %paths, %original_files);
+  # Hash only delivered archives; hashing every unpacked file is prohibitively expensive.
+  my (%info, %original_files);
   for my $unpacked (@{$checkout->unpacked_files}) {
     my ($ufile, $mime) = @$unpacked;
-    $ufile = decode('UTF-8', $ufile) // $ufile;
+
+    # Undecoded on purpose. This name has to open a file and match the rows the indexer wrote under it,
+    # and both want the bytes the filesystem uses; it is decoded where the report states it, further down.
+    # Decoding here instead dropped every file with a non-ASCII name out of the document entirely.
 
     # The indexer pre-processes certain files so they can be scanned; report the original file name
     my $scan_path = $dir->child('.unpacked', $ufile)->to_string;
@@ -82,10 +109,7 @@ sub generate_to_file ($self, $id, $file) {
       $original_files{$ufile} = $original if -e $dir->child('.unpacked', $original);
     }
 
-    if (-e $scan_path) {
-      $paths{$ufile} = $scan_path;
-      $info{$ufile}  = {mime => $mime};
-    }
+    if (-e $scan_path) { $info{$ufile} = {mime => $mime} }
     else {
       $log->error("Non-existing path in SPDX report $id: $scan_path");
     }
@@ -104,8 +128,12 @@ sub generate_to_file ($self, $id, $file) {
     }
   );
 
-  my $creator       = $config->{creator} || {};
-  my $creator_name  = $creator->{name}   || 'Cavil';
+  my $creator = $config->{creator} || {};
+
+  # The entity that operates Cavil, which is not Cavil itself - the tool is a separate field further down.
+  # An instance that has not been told who runs it is identified by the host it publishes its SBOMs under,
+  # which at least names a real party, rather than by the name of the software that wrote the file.
+  my $creator_name  = $creator->{name} || Mojo::URL->new($namespace)->host || $namespace;
   my $creator_email = $creator->{email};
   my $creator_url   = $creator->{url} || $namespace;
   my $creator_org
@@ -116,22 +144,104 @@ sub generate_to_file ($self, $id, $file) {
     : {type => 'ExternalIdentifier', externalIdentifierType => 'urlScheme', identifier => $creator_url}
     ];
   $graph->add($creator_org);
-  $graph->add({type => 'Tool', spdxId => $iri->('tool-cavil'), creationInfo => $creation, name => 'Cavil'});
+
+  # The name of the tool and its version are two separate data fields, and SPDX 3.0.1 gives a Tool no version
+  # property of its own, so the version travels as a package URL alongside the plain name
+  $graph->add(
+    {
+      type               => 'Tool',
+      spdxId             => $iri->('tool-cavil'),
+      creationInfo       => $creation,
+      name               => 'Cavil',
+      externalIdentifier => [
+        {
+          type                   => 'ExternalIdentifier',
+          externalIdentifierType => 'packageUrl',
+          identifier             => 'pkg:generic/cavil@' . Cavil->VERSION
+        }
+      ]
+    }
+  );
+
+  # Inverted because notices are stored against the files they cover, and SPDX attributes them the
+  # other way round
+  my (@copyrights, %copyrights_by_file);
+  for my $row (@{$reports->copyrights($id)}) {
+    push @copyrights,                          $row->{copyright};
+    push @{$copyrights_by_file{fs_bytes($_)}}, $row->{copyright} for @{$row->{files}};
+  }
+
+  my %evidence;
+  $evidence{$_->{license}} = $_ for $reports->license_evidence($id)->each;
 
   # Shared helpers for licenses and relationships
   my (%license_pool, %license_meta, $license_num, $rel_num, $snippet_num, $annotation_num);
+  my (%ref_source, %declared_text, %custom_pool, $custom_num);
+  my $postprocess = Cavil::PostProcess->new;
+
+  # SPDX requires one of these for every "LicenseRef-" an expression uses, or the identifier resolves
+  # to nothing for a reader
+  my $custom_license = sub ($ref) {
+    return $custom_pool{$ref} if exists $custom_pool{$ref};
+    $custom_pool{$ref} = undef;
+
+    my $name = $ref_source{$ref};
+    my ($text, $where, $origin);
+
+    # Same order the NOTICE resolves in, so the two documents cannot disagree about a license
+    if (defined $name && defined($text = $app->patterns->full_license_texts([$name])->{$name})) {
+      $origin = 'Full license text curated in Cavil.';
+    }
+    elsif (defined $name && $evidence{$name} && (($text, $where) = $checkout->evidence_text($evidence{$name}))) {
+      $origin = "Text as found at ./$where.";
+    }
+
+    # A vendored component's manifest string is itself the reference
+    elsif (defined($text = $declared_text{$ref})) {
+      $origin = 'License as declared by the component metadata.';
+    }
+    return undef unless defined $text && length $text;
+
+    my $truncated = length($text) > MAX_LICENSE_TEXT;
+    $text = substr $text, 0, MAX_LICENSE_TEXT if $truncated;
+
+    my $cid  = $iri->('customlicense-' . ++$custom_num);
+    my $node = {
+      type                        => 'expandedlicensing_CustomLicense',
+      spdxId                      => $cid,
+      creationInfo                => $creation,
+      simplelicensing_licenseText => $text
+    };
+    $node->{name} = $name if defined $name && length $name;
+
+    # A declaration is evidence for the identifier, not terms to reproduce, so it says where it was read
+    my @comment = ($origin);
+    push @comment, 'Truncated.' if $truncated;
+    $node->{comment} = join ' ', @comment;
+
+    $graph->add($node);
+    return $custom_pool{$ref} = $cid;
+  };
+
   my $license_ref = sub ($expr) {
     return $license_pool{$expr} if $license_pool{$expr};
     my $lid = $iri->('license-' . ++$license_num);
     $license_pool{$expr} = $lid;
-    $graph->add(
-      {
-        type                              => 'simplelicensing_LicenseExpression',
-        spdxId                            => $lid,
-        creationInfo                      => $creation,
-        simplelicensing_licenseExpression => $expr
-      }
-    );
+    my $node = {
+      type                              => 'simplelicensing_LicenseExpression',
+      spdxId                            => $lid,
+      creationInfo                      => $creation,
+      simplelicensing_licenseExpression => $expr
+    };
+
+    my @entries;
+    for my $ref ($expr =~ /(LicenseRef-[A-Za-z0-9.-]+)/g) {
+      next unless my $uri = $custom_license->($ref);
+      push @entries, {type => 'DictionaryEntry', key => $ref, value => $uri};
+    }
+    $node->{simplelicensing_customIdToUri} = \@entries if @entries;
+
+    $graph->add($node);
     return $lid;
   };
   my $relationship = sub ($from, $type, $to, $completeness = undef) {
@@ -164,43 +274,67 @@ sub generate_to_file ($self, $id, $file) {
       spdxId             => $iri->('document'),
       creationInfo       => $creation,
       name               => $pkg->{name},
-      profileConformance => ['core', 'software', 'simpleLicensing'],
+      profileConformance => ['core', 'software', 'simpleLicensing', 'expandedLicensing'],
       dataLicense        => $license_ref->('CC0-1.0'),
       rootElement        => [$base]
     }
   );
+
+  # The SBOM URI is derived from the package id and so is the same for every rebuild of this package. The
+  # iteration number is what distinguishes one rebuild from the next; the major version is 1 because this
+  # document follows the published minimum elements.
+  my $sbom_version = $app->packages->next_sbom_version($id);
   $graph->add(
     {
-      type              => 'software_Sbom',
-      spdxId            => $base,
-      creationInfo      => $creation,
-      rootElement       => [$iri->('package')],
-      software_sbomType => ['source']
+      type               => 'software_Sbom',
+      spdxId             => $base,
+      creationInfo       => $creation,
+      rootElement        => [$iri->('package')],
+      software_sbomType  => ['source'],
+      comment            => UNKNOWNS_STATEMENT,
+      externalIdentifier => [
+        {
+          type                   => 'ExternalIdentifier',
+          externalIdentifierType => 'other',
+          identifier             => "1.$sbom_version",
+          comment                => 'SBOM version'
+        }
+      ]
     }
   );
 
   # BSI section 6.1: refer to licenses by SPDX identifier, else ScanCode ("LicenseRef-scancode-*"),
   # else a "LicenseRef-<inventorising-entity>-*" identifier. License text is never a substitute.
   my $ref_entity      = $config->{license_ref_namespace} || 'cavil';
-  my $resolve_license = sub ($spdx, $name) {
+  my $resolve_license = sub ($spdx, $name, $catch_all = 0) {
+
+    # A catch-all is the curator saying "license-shaped text we decline to identify" - "Any Permissive",
+    # "GPL-Unspecified", "SUSE-NotALicense". Minting a LicenseRef for one asserts a license that does not
+    # exist, so it resolves to nothing and the file simply carries no concluded license.
+    return undef if $catch_all;
+
     return $spdx if defined $spdx && length $spdx;
     if (defined $name && length $name) {
-      if (my $scancode = scancode_suggestion($name)) { return $scancode }
+      if (my $scancode = scancode_suggestion($name)) {
+        $ref_source{$scancode} //= $name;
+        return $scancode;
+      }
       my $ref = "LicenseRef-$ref_entity-$name";
       $ref =~ s/[^A-Za-z0-9.]+/-/g;
       $ref =~ s/-+$//;
+      $ref_source{$ref} //= $name;
       return $ref;
     }
     return undef;
   };
 
-  # Resolve a declared license *expression* (specfile or component metadata): a valid SPDX expression is
-  # used as-is, otherwise the section 6.1 ScanCode/LicenseRef fallback applies
   my $resolve_expr = sub ($string) {
     return undef unless defined $string && length $string;
     my $license = lic($string);
     return "$license" if !$license->error && length "$license";
-    return $resolve_license->(undef, $string);
+    return undef unless my $ref = $resolve_license->(undef, $string);
+    $declared_text{$ref} //= $string;
+    return $ref;
   };
 
   # Component origin (supplier) from the Open Build Service coordinates
@@ -243,12 +377,11 @@ sub generate_to_file ($self, $id, $file) {
   }
 
   # Primary component (the package itself)
-  my $main    = $specfile_report->{main} || {};
+  my $main    = $declarations->{declarations}[0] // {};
   my $version = $main->{version};
   $version = "$version" if defined $version;
 
-  # The creator-assigned version, used for the package URL (a timestamp fallback is not a meaningful purl
-  # version, so the purl is emitted only when a real version exists)
+  # A timestamp fallback is not a meaningful purl version.
   my $purl_version = (defined $version && length $version) ? $version : undef;
 
   # BSI TR-03183-2 section 5.2.2 requires a component version; when the creator assigns none, the mandated
@@ -264,9 +397,13 @@ sub generate_to_file ($self, $id, $file) {
     software_primaryPurpose    => 'source',
     software_additionalPurpose => ['archive']
   };
-  $package->{software_packageVersion} = $version       if defined $version && length $version;
-  $package->{software_homePage}       = $main->{url}   if $main->{url};
-  $package->{originatedBy}            = $originated_by if $originated_by;
+  $package->{software_packageVersion} = $version     if defined $version && length $version;
+  $package->{software_homePage}       = $main->{url} if $main->{url};
+
+  $package->{originatedBy} = $originated_by // [NO_ASSERTION_AGENT];
+
+  # Copyright is a component attribute for CISA's Framing baseline, not only a per-file one
+  $package->{software_copyrightText} = join "\n", @copyrights if @copyrights;
 
   # Content checksum of the delivered artifact(s), so the primary component carries a verifiable digest
   $package->{verifiedUsing} = [map { $_->{hash} } @archives] if @archives;
@@ -275,15 +412,12 @@ sub generate_to_file ($self, $id, $file) {
     $package->{software_downloadLocation}
       = "$src->{api_url}/source/$src->{project}/$src->{package}" . ($src->{srcmd5} ? "?rev=$src->{srcmd5}" : '');
   }
-  if (defined $purl_version) {
-    $package->{externalIdentifier} = [
-      {
-        type                   => 'ExternalIdentifier',
-        externalIdentifierType => 'packageUrl',
-        identifier             => "pkg:generic/$pkg->{name}\@$purl_version"
-      }
-    ];
-  }
+
+  # Timestamp fallbacks use a versionless, still-resolvable purl.
+  my $purl = "pkg:generic/$pkg->{name}";
+  $purl .= "\@$purl_version" if defined $purl_version;
+  $package->{externalIdentifier}
+    = [{type => 'ExternalIdentifier', externalIdentifierType => 'packageUrl', identifier => $purl}];
 
   # BSI TR-03183-2 section 5.2.4 "Source code URI": the *utilised* (distribution) source, version-pinned -
   # for a distribution the source we actually built from, not upstream (section 8.1.8: a maintainer who
@@ -304,6 +438,10 @@ sub generate_to_file ($self, $id, $file) {
 
   $graph->add($package);
 
+  # rootElement above is what SPDX 3.0 says to use, but consumers carried over from 2.x look for a
+  # "describes" relationship instead and otherwise report the document as having no primary component
+  $relationship->($base, 'describes', [$pkgid]);
+
   # Distribution (concluded) and original (declared) licenses of the primary component
   my $declared = lic($main->{license} // '');
   if (!$declared->error && length "$declared") {
@@ -317,8 +455,11 @@ sub generate_to_file ($self, $id, $file) {
               bool_or(export_restricted) AS export_restricted, bool_or(cla) AS cla, bool_or(eula) AS eula
        FROM license_patterns WHERE spdx = ? OR license = ?', "$declared", "$declared"
     )->hash;
-    $note_license->($lid, $meta->{risk}, [grep { $meta->{$_} } @FLAGS]) if $meta;
+    $note_license->($lid, $meta->{risk}, [grep { $meta->{$_} } @LICENSE_FLAGS]) if $meta;
   }
+
+  # Distinguish "nothing found" from an omitted license field.
+  else { $relationship->($pkgid, 'hasConcludedLicense', [NO_ASSERTION_LICENSE]) }
 
   # The delivered source archive(s) as deployable component file elements, reusing the digests computed
   # above (see the @archives comment for why only these files are hashed)
@@ -351,22 +492,22 @@ sub generate_to_file ($self, $id, $file) {
   for my $matched (
     $db->query('SELECT id, filename FROM matched_files WHERE package = ? AND generation = 0', $id)->hashes->each)
   {
-    $matched_files->{$matched->{filename}} = $matched->{id};
+    $matched_files->{fs_bytes($matched->{filename})} = $matched->{id};
   }
 
   # Emit the file components in chunks: license findings for a whole chunk are fetched in two batched
   # queries (see _license_rows_by_file) instead of two per file, while the graph is still streamed one
   # element at a time and only one chunk of rows is held in memory
   my $file_num;
-  my $postprocess = Cavil::PostProcess->new;
-  my @ordered     = sort keys %info;
+  my @ordered = sort keys %info;
   while (my @chunk = splice @ordered, 0, 1000) {
     my @file_ids = grep {defined} map { $matched_files->{$_} } @chunk;
     my ($snippets_by_file, $matches_by_file) = _license_rows_by_file($db, \@file_ids);
 
     for my $ufile (@chunk) {
       $file_num++;
-      my $real_name = $original_files{$ufile} // $ufile;
+      my $real_name = $original_files{$ufile}     // $ufile;
+      my $reported  = decode('UTF-8', $real_name) // $real_name;
       my $fid       = $iri->("file-$file_num");
 
       my $mfid = $matched_files->{$ufile};
@@ -374,7 +515,8 @@ sub generate_to_file ($self, $id, $file) {
         = $mfid
         ? _file_licenses($snippets_by_file->{$mfid} // [], $matches_by_file->{$mfid} // [], $resolve_license)
         : [];
-      my $copyright = _copyrights($paths{$ufile});
+
+      my $copyright = $copyrights_by_file{$real_name} // [];
 
       # Findings are line numbers in the ".processed" copy the indexer scanned, but the file is
       # reported under its original name, and post-processing shifts lines around (long lines are
@@ -391,7 +533,7 @@ sub generate_to_file ($self, $id, $file) {
         type                    => 'software_File',
         spdxId                  => $fid,
         creationInfo            => $creation,
-        name                    => "./$real_name",
+        name                    => "./$reported",
         software_primaryPurpose => _file_purpose($info{$ufile}{mime})
       };
       $node->{software_copyrightText} = join "\n", @$copyright if @$copyright;
@@ -428,7 +570,7 @@ sub generate_to_file ($self, $id, $file) {
 
             # A human-readable location name (file plus line range), so the snippet is a self-describing
             # element rather than an anonymous evidence node
-            name                     => "./$real_name#L$sline-L$eline",
+            name                     => "./$reported#L$sline-L$eline",
             software_snippetFromFile => $fid,
             software_lineRange       =>
               {type => 'PositiveIntegerRange', beginIntegerRange => $sline, endIntegerRange => $eline}
@@ -441,9 +583,9 @@ sub generate_to_file ($self, $id, $file) {
 
   # Vendored subcomponents detected during indexing (name/version/license/purl from their embedded
   # metadata), related to the primary component as dependencies
-  for my $c ($db->query('SELECT * FROM package_components WHERE package = ? AND generation = 0 ORDER BY purl', $id)
-    ->hashes->each)
-  {
+  my $components
+    = $db->query('SELECT * FROM package_components WHERE package = ? AND generation = 0 ORDER BY purl', $id)->hashes;
+  for my $c ($components->each) {
     my $cid  = $iri->("component-$c->{id}");
     my $node = {
       type               => 'software_Package',
@@ -454,6 +596,11 @@ sub generate_to_file ($self, $id, $file) {
         [{type => 'ExternalIdentifier', externalIdentifierType => 'packageUrl', identifier => $c->{purl}}]
     };
     $node->{software_packageVersion} = $c->{version} if defined $c->{version} && length $c->{version};
+
+    # Vendored code carries no reliable statement of who published it - the embedded metadata names the
+    # component, not its producer. That is said out loud, so a reader can tell an unknown producer from a
+    # producer nobody bothered to record.
+    $node->{originatedBy} = [NO_ASSERTION_AGENT];
     $graph->add($node);
 
     # Distribution licence (BSI required, hasConcludedLicense) and original licence (additional,
@@ -463,8 +610,16 @@ sub generate_to_file ($self, $id, $file) {
       $relationship->($cid, 'hasConcludedLicense', [$lid], 'complete');
       $relationship->($cid, 'hasDeclaredLicense',  [$lid], 'complete');
     }
+
+    # Neither the component's own metadata nor the file scan produced anything usable
+    else { $relationship->($cid, 'hasConcludedLicense', [NO_ASSERTION_LICENSE]) }
     $relationship->($pkgid, 'dependsOn', [$cid], $c->{complete} ? 'complete' : 'incomplete');
   }
+
+  # A package that ships no vendored code would otherwise say nothing at all about its dependencies, which
+  # reads the same as never having looked. Both BSI and CISA want the completeness of the dependency list
+  # spelled out, so an empty list is stated as an empty list.
+  $relationship->($pkgid, 'dependsOn', [NONE_ELEMENT], 'complete') unless $components->size;
 
   # Cavil's curated legal risk and flags per license, as additive annotations (removable without
   # affecting BSI conformance)
@@ -518,7 +673,7 @@ sub _file_licenses ($snippet_rows, $match_rows, $resolve_license) {
     }
     _matched_lines(\%matched_lines, $match->{sline}, $match->{eline}, 1);
 
-    next unless my $license = $resolve_license->($match->{spdx}, $match->{license});
+    next unless my $license = $resolve_license->($match->{spdx}, $match->{license}, $match->{catch_all});
     push @findings,
       {
       license => $license,
@@ -531,7 +686,7 @@ sub _file_licenses ($snippet_rows, $match_rows, $resolve_license) {
 
   # Folded snippets contribute their inferred license, just like a real match would
   for my $snippet (@folded) {
-    next unless my $license = $resolve_license->($snippet->{pspdx}, $snippet->{plicense});
+    next unless my $license = $resolve_license->($snippet->{pspdx}, $snippet->{plicense}, $snippet->{pcatch_all});
     push @findings,
       {
       license => $license,
@@ -554,7 +709,7 @@ sub _license_rows_by_file ($db, $file_ids) {
 
   my $snippet_sql = qq{
     SELECT f.file, f.sline, f.eline, f.resolution, s.license, s.like_pattern, s.likelyness,
-           p.spdx AS pspdx, p.license AS plicense, p.risk AS prisk,
+           p.spdx AS pspdx, p.license AS plicense, p.risk AS prisk, p.catch_all AS pcatch_all,
            p.trademark AS ptrademark, p.patent AS ppatent, p.export_restricted AS pexport_restricted,
            p.cla AS pcla, p.eula AS peula
     FROM file_snippets f LEFT JOIN snippets s ON f.snippet = s.id LEFT JOIN license_patterns p ON s.like_pattern = p.id
@@ -563,7 +718,7 @@ sub _license_rows_by_file ($db, $file_ids) {
   push @{$snippets{$_->{file}}}, $_ for $db->query($snippet_sql, $file_ids)->hashes->each;
 
   my $match_sql = qq{
-    SELECT m.*, p.spdx, p.license, p.risk, p.trademark, p.patent, p.export_restricted, p.cla, p.eula
+    SELECT m.*, p.spdx, p.license, p.risk, p.catch_all, p.trademark, p.patent, p.export_restricted, p.cla, p.eula
     FROM pattern_matches m LEFT JOIN license_patterns p ON m.pattern = p.id
     WHERE m.file = ANY(?) AND ignored = false ORDER BY p.license, p.id DESC
   };
@@ -574,44 +729,11 @@ sub _license_rows_by_file ($db, $file_ids) {
 
 # Extract the set flags from a match/snippet row (the fold path uses "p"-prefixed column aliases)
 sub _flags ($row, $prefix) {
-  return [grep { $row->{"$prefix$_"} } @FLAGS];
+  return [grep { $row->{"$prefix$_"} } @LICENSE_FLAGS];
 }
 
-# Extract distinct copyright statements from a file. Scans the file header (bounded by slurp_and_decode
-# to ~30kB) rather than only license-match regions, so copyright notices in files without a license
-# match are still found; copyright notices virtually always live near the top of a file.
-sub _copyrights ($path) {
-  return [] unless defined $path && -f $path;
-  my $text = slurp_and_decode($path) // return [];
-
-  # Fast path: the overwhelming majority of files contain no copyright notice at all, so skip the
-  # line-by-line work entirely unless there is something to find
-  return [] unless $text =~ /copyright|\x{00a9}/i;
-
-  # Pull out only the lines that mention copyright in a single regex pass, rather than splitting the file
-  # into lines and testing each one - on large trees the per-line test dominates report generation
-  my (%seen, @copyrights);
-  while ($text =~ /^([^\n]*(?:copyright|\x{00a9})[^\n]*)$/mgi) {
-    my $line = $1;
-
-    # Skip minified/one-line blobs that merely happen to mention "copyright" somewhere
-    next if length $line > 300;
-
-    # Strip comment/markup leaders and collapse whitespace
-    $line =~ s/^[\s*#;>|!\/-]+//;
-    $line =~ s/\s+/ /g;
-    $line =~ s/^\s+|\s+$//g;
-
-    # Require a year or a copyright symbol to keep out unrelated prose and license-template placeholders
-    next unless length $line && $line =~ /\d{4}|\x{00a9}/i;
-    next if $seen{$line}++;
-    push @copyrights, $line;
-    last if @copyrights >= 100;
-  }
-
-  return \@copyrights;
-}
-
+# Line numbers are positions in the ".processed" copy that was scanned, so they translate back like
+# snippet ranges do; one that will not translate yields nothing rather than the wrong lines.
 # Map a MIME type to an SPDX SoftwarePurpose, approximating the BSI executable/archive/structured
 # properties as closely as the available metadata allows.
 sub _file_purpose ($mime) {
@@ -634,12 +756,12 @@ sub _matched_lines ($matched_lines, $start, $end, $value) {
 package _Graph;
 use Mojo::Base -base, -signatures;
 
-use Mojo::JSON qw(encode_json);
+use Cavil::Util qw(encode_json_fast);
 
 # Stream elements into the "@graph" array one at a time to keep memory bounded for large packages. Each
 # element is written in a single print (comma prepended) to halve the writes into the gzip layer.
 sub add ($self, $node) {
-  my $json = encode_json($node);
+  my $json = encode_json_fast($node);
   $self->{handle}->print($self->{first} ? $json : ",$json");
   $self->{first} = 0;
 }

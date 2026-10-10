@@ -8,18 +8,15 @@ use Cavil::Util qw(PRIORITY_SWEEP PRIORITY_UPKEEP);
 use Mojo::File  qw(path);
 
 sub register ($self, $app, $config) {
-  $app->minion->add_task(obsolete      => \&_obsolete);
-  $app->minion->add_task(cleanup       => \&_cleanup);
-  $app->minion->add_task(cleanup_batch => \&_cleanup_batch);
-  $app->minion->add_task(sweep_builds  => \&_sweep);
+  $app->minion->add_task(obsolete          => \&_obsolete);
+  $app->minion->add_task(cleanup           => \&_cleanup);
+  $app->minion->add_task(cleanup_batch     => \&_cleanup_batch);
+  $app->minion->add_task(cleanup_ephemeral => \&_cleanup_ephemeral);
+  $app->minion->add_task(purge_batch       => \&_purge_batch);
+  $app->minion->add_task(sweep_builds      => \&_sweep);
 }
 
-# The build sweep on its own, for scheduling more often than the rest of the cleanup. Reclaiming disk can
-# wait for the nightly run, but a claim left behind by a job that died or was deleted cannot: it stops the
-# package being reindexed (reindex() sees an owner and only records the request, and the owner that would
-# have acted on it is gone), and once a request is recorded the report page goes read-only. Nothing here
-# needs to be serialized against another run of itself - discard_builds only acts while the package is
-# still owned by exactly who the caller saw owning it, so two sweeps cannot take the same package.
+# Sweep stale claims more often than disk cleanup; compare-and-swap makes runs independent.
 sub _sweep ($job) { _sweep_builds($job->app) }
 
 sub _cleanup ($job) {
@@ -29,6 +26,7 @@ sub _cleanup ($job) {
   _sweep_builds($app);
 
   $pkgs->obsolete_duplicate_new;
+
   my $ids     = $pkgs->need_cleanup;
   my $buckets = Cavil::Util::buckets($ids, $app->config->{cleanup_bucket_average});
 
@@ -39,6 +37,24 @@ sub _cleanup ($job) {
 sub _cleanup_batch ($job, @ids) {
   my $pkgs = $job->app->packages;
   for my $id (@ids) { $pkgs->cleanup($id, $job->id) }
+}
+
+# Ephemeral one-off reviews are fully purged on a much shorter TTL than the normal obsolete cleanup, run on
+# its own schedule so a burst of them never delays the nightly sweep.
+sub _cleanup_ephemeral ($job) {
+  my $app  = $job->app;
+  my $pkgs = $app->packages;
+
+  my $ids     = $pkgs->need_ephemeral_cleanup($app->config->{hours_to_keep_ephemeral_packages} // 24);
+  my $buckets = Cavil::Util::buckets($ids, $app->config->{cleanup_bucket_average});
+
+  my $minion = $app->minion;
+  $minion->enqueue('purge_batch', $_, {parents => [$job->id], priority => PRIORITY_SWEEP}) for @$buckets;
+}
+
+sub _purge_batch ($job, @ids) {
+  my $pkgs = $job->app->packages;
+  for my $id (@ids) { $pkgs->purge($id, $job->id) }
 }
 
 # Recover from reindexes that died halfway: a worker that was killed, a job that failed and was removed
@@ -63,17 +79,13 @@ sub _sweep_builds ($app) {
     next unless defined(my $deleted = $pkgs->discard_builds($id, $owner));
     $log->info("[$id] Discarded $deleted rows from an abandoned reindex") if $deleted;
 
-    # The reindex the abandoned build was meant to deliver still has to happen, and so does any request
-    # that came in while it was running. reindex() enqueues one job for both, at the priority of the
-    # request when there was one - the priority the dead build itself ran at is gone with it, so a
-    # replacement that nobody explicitly asked for is upkeep.
+    # Preserve an explicit request's priority when replacing abandoned work.
     my $requested = $pkgs->reindex_request($id);
     next unless $deleted || defined $requested;
     my $priority = $requested // PRIORITY_UPKEEP;
     $pkgs->clear_reindex_request($id);
 
-    # A package that has no report yet is not a reindex candidate at all (reindex only takes indexed
-    # packages), so an import whose very first build died is indexed from scratch instead
+    # First imports resume at indexing because they have no report to reindex.
     my $requeued;
     if    ($pkgs->is_indexed($id)) { $requeued = ($pkgs->reindex($id, $priority) // '') eq 'now' }
     elsif (!$pkgs->is_obsolete($id) && $pkgs->is_unpacked($id)) { $requeued = $pkgs->index($id, $priority) }

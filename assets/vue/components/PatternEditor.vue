@@ -11,8 +11,9 @@
         <span v-else-if="matchCount.matches === 0">This pattern has no matches.</span>
         <span v-else>
           This pattern has <b>{{ matchCount.matches }}</b> {{ matchCount.matches === 1 ? 'match' : 'matches' }} in
-          <b>{{ matchCount.packages }}</b>
-          <a :href="`/search?pattern=${pattern.id}`">{{ matchCount.packages === 1 ? 'package' : 'packages' }}</a
+          <b>{{ matchCount.packages }}</b
+          >{{ ' '
+          }}<a :href="`/search?pattern=${pattern.id}`">{{ matchCount.packages === 1 ? 'package' : 'packages' }}</a
           >.
         </span>
       </div>
@@ -56,7 +57,33 @@
           <form :action="formAction" method="POST" @submit="onSubmit">
             <div class="col mb-3">
               <label class="form-label" for="license">License</label>
-              <input v-model="form.license" type="text" name="license" id="license" class="form-control" />
+              <div class="pattern-editor-autocomplete-anchor">
+                <input
+                  v-model="form.license"
+                  @input="autocomplete"
+                  @focus="licenseFocused = true"
+                  @blur="licenseFocused = false"
+                  ref="license"
+                  type="text"
+                  name="license"
+                  id="license"
+                  class="form-control"
+                  autocomplete="off"
+                />
+                <div v-show="licenseFocused && results.length > 0" class="autocomplete-container">
+                  <div class="autocomplete">
+                    <div
+                      v-for="(result, i) in results"
+                      :key="i"
+                      @mousedown.prevent="fillLicense(result)"
+                      class="autocomplete-item"
+                    >
+                      {{ result }}
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="form-text">Auto-completed license names will also predict the risk value.</div>
             </div>
             <div v-if="!isNew && showSpdx" class="col mb-3">
               <label class="form-label" for="spdx">SPDX</label>
@@ -78,59 +105,8 @@
                     <label for="risk" class="form-label">Risk</label>
                   </div>
                 </div>
-                <div class="col-lg-2">
-                  <div class="form-check">
-                    <input
-                      v-model="form.patent"
-                      type="checkbox"
-                      class="form-check-input"
-                      id="patent"
-                      name="patent"
-                      value="1"
-                    />
-                    <label class="form-check-label" for="patent">Patent</label>
-                  </div>
-                  <div class="form-check">
-                    <input
-                      v-model="form.trademark"
-                      type="checkbox"
-                      class="form-check-input"
-                      id="trademark"
-                      name="trademark"
-                      value="1"
-                    />
-                    <label class="form-check-label" for="trademark">Trademark</label>
-                  </div>
-                </div>
-                <div class="col-lg-2">
-                  <div class="form-check">
-                    <input v-model="form.cla" type="checkbox" class="form-check-input" id="cla" name="cla" value="1" />
-                    <label class="form-check-label" for="cla">CLA</label>
-                  </div>
-                  <div class="form-check">
-                    <input
-                      v-model="form.eula"
-                      type="checkbox"
-                      class="form-check-input"
-                      id="eula"
-                      name="eula"
-                      value="1"
-                    />
-                    <label class="form-check-label" for="eula">EULA</label>
-                  </div>
-                </div>
-                <div class="col-lg-2">
-                  <div class="form-check">
-                    <input
-                      v-model="form.export_restricted"
-                      type="checkbox"
-                      class="form-check-input"
-                      id="export_restricted"
-                      name="export_restricted"
-                      value="1"
-                    />
-                    <label class="form-check-label" for="export_restricted">Export Restricted</label>
-                  </div>
+                <div class="col-lg-6 pattern-editor-flags">
+                  <PatternFlags v-model="form" />
                 </div>
               </div>
             </div>
@@ -177,11 +153,13 @@
 import ClosestPattern from './ClosestPattern.vue';
 import LegalLoading from './LegalLoading.vue';
 import PatternCodeMirror from './PatternCodeMirror.vue';
+import PatternFlags, {LICENSE_FLAGS, PATTERN_FLAGS} from './PatternFlags.vue';
+import {rankLicenses} from '../helpers/licenseAutocomplete.js';
 import UserAgent from '@mojojs/user-agent';
 
 export default {
   name: 'PatternEditor',
-  components: {ClosestPattern, LegalLoading, PatternCodeMirror},
+  components: {ClosestPattern, LegalLoading, PatternCodeMirror, PatternFlags},
   props: {
     pattern: {type: Object, required: true},
     inline: {type: Boolean, default: false},
@@ -198,6 +176,10 @@ export default {
       matchCountError: null,
       saving: false,
       error: null,
+      licenses: {},
+      suggestions: [],
+      results: [],
+      licenseFocused: false,
       ua: new UserAgent({baseURL: window.location.href})
     };
   },
@@ -211,19 +193,43 @@ export default {
   },
   mounted() {
     if (!this.isNew && this.showMatchCount) this.loadMatchCount();
+    this.loadLicenses();
   },
   methods: {
+    async loadLicenses() {
+      try {
+        const res = await this.ua.get('/licenses/autocomplete.json');
+        if (!res.isSuccess) return;
+        this.licenses = await res.json();
+        this.suggestions = Object.keys(this.licenses);
+        this.results = this.suggestions;
+      } catch (_error) {
+        // Autocomplete is a convenience; a failed fetch just leaves the field as a plain text input
+      }
+    },
+    autocomplete() {
+      this.results = rankLicenses(this.suggestions, this.form.license);
+    },
+    fillLicense(result) {
+      if (this.$refs.license) this.$refs.license.blur();
+      this.form.license = result;
+      const options = this.licenses[result];
+      if (options !== undefined) {
+        this.form.risk = String(options.risk);
+
+        // Only the license's own properties; full_license_text is about this pattern's text
+        for (const flag of LICENSE_FLAGS) this.form[flag.name] = !!options[flag.name];
+      }
+      this.results = this.suggestions;
+      this.licenseFocused = false;
+    },
     formFromPattern(pattern) {
       return {
         license: pattern.license ?? '',
         pattern: pattern.pattern ?? '',
         risk: String(pattern.risk ?? 0),
-        patent: !!pattern.patent,
-        trademark: !!pattern.trademark,
-        export_restricted: !!pattern.export_restricted,
-        cla: !!pattern.cla,
-        eula: !!pattern.eula,
-        packname: pattern.packname ?? ''
+        packname: pattern.packname ?? '',
+        ...Object.fromEntries(PATTERN_FLAGS.map(flag => [flag.name, !!pattern[flag.name]]))
       };
     },
     formPayload() {
@@ -233,11 +239,7 @@ export default {
         risk: this.form.risk,
         packname: this.form.packname
       };
-      if (this.form.patent) form.patent = '1';
-      if (this.form.trademark) form.trademark = '1';
-      if (this.form.export_restricted) form.export_restricted = '1';
-      if (this.form.cla) form.cla = '1';
-      if (this.form.eula) form.eula = '1';
+      for (const flag of PATTERN_FLAGS) if (this.form[flag.name]) form[flag.name] = '1';
       return form;
     },
     async loadMatchCount() {
@@ -299,6 +301,8 @@ export default {
       this.closest = null;
       this.matchCount = null;
       this.matchCountError = null;
+      this.results = this.suggestions;
+      this.licenseFocused = false;
       if (!this.isNew && this.showMatchCount) this.loadMatchCount();
     }
   }
@@ -313,7 +317,7 @@ export default {
   display: none;
 }
 .pattern-editor-tabs {
-  border-bottom: 1px solid #d0d7de;
+  border-bottom: 1px solid var(--cavil-border);
   display: flex;
   gap: 4px;
   margin-bottom: 16px;
@@ -324,7 +328,7 @@ export default {
   border: 1px solid transparent;
   border-bottom: 0;
   border-radius: 6px 6px 0 0;
-  color: #57606a;
+  color: var(--cavil-fg-muted);
   cursor: pointer;
   display: inline-flex;
   font-size: 13px;
@@ -338,31 +342,31 @@ export default {
     color 0.15s;
 }
 .pattern-editor-tab:hover:not(:disabled):not(.active) {
-  background: #f3f5f7;
-  color: #1f2328;
+  background: var(--cavil-canvas-tint);
+  color: var(--cavil-fg);
 }
 .pattern-editor-tab.active {
-  background: #ffffff;
-  border-color: #d0d7de;
-  color: #1f2328;
+  background: var(--cavil-canvas);
+  border-color: var(--cavil-border);
+  color: var(--cavil-fg);
   font-weight: 600;
 }
 .pattern-editor-tab:disabled {
-  color: #8c959f;
+  color: var(--cavil-fg-disabled);
   cursor: not-allowed;
 }
 .pattern-editor-tab-badge {
-  background: #ddf4ff;
+  background: var(--cavil-accent-bg);
   border-radius: 10px;
-  color: #0969da;
+  color: var(--cavil-accent);
   font-size: 11px;
   font-weight: 600;
   margin-left: 2px;
   padding: 1px 7px;
 }
 .pattern-editor-tab:disabled .pattern-editor-tab-badge {
-  background: #eaeef2;
-  color: #8c959f;
+  background: var(--cavil-neutral-bg);
+  color: var(--cavil-fg-disabled);
 }
 .pattern-editor-tab-pane {
   display: none;
@@ -379,6 +383,36 @@ export default {
   margin-left: 0.25rem;
 }
 .pattern-editor-inline {
-  background: #ffffff;
+  background: var(--cavil-canvas);
+}
+.pattern-editor-autocomplete-anchor {
+  position: relative;
+}
+.autocomplete-container {
+  background: var(--cavil-canvas);
+  border: 1px solid var(--cavil-border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(var(--cavil-neutral-rgb), 0.2);
+  cursor: pointer;
+  left: 0;
+  margin: 4px 0 0;
+  padding: 4px 0;
+  position: absolute;
+  right: 0;
+  z-index: 1000;
+}
+.autocomplete {
+  max-height: 220px;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.autocomplete-item {
+  color: var(--cavil-fg);
+  font-size: 14px;
+  padding: 6px 14px;
+}
+.autocomplete-item:hover {
+  background-color: var(--cavil-canvas-subtle);
+  color: var(--cavil-fg);
 }
 </style>

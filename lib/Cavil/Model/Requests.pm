@@ -1,27 +1,29 @@
-# Copyright (C) 2018 SUSE Linux GmbH
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Model::Requests;
 use Mojo::Base -base, -signatures;
 
 has 'pg';
 
-sub add ($self, $link, $pkg) {
+sub add ($self, $link, $pkg, $target = undef) {
   my $db = $self->pg->db;
-  $db->query('INSERT INTO bot_requests (external_link, package) VALUES (?, ?) ON CONFLICT DO NOTHING', $link, $pkg);
-  return $db->query('SELECT id FROM bot_requests WHERE external_link = ? AND package = ?', $link, $pkg)->hash->{id};
+  my $added
+    = $db->query('INSERT INTO bot_requests (external_link, package, target) VALUES (?, ?, ?) ON CONFLICT DO NOTHING',
+    $link, $pkg, $target)->rows;
+
+  # After the insert, so a concurrent removal of another request can never retire a package this one needs
+  $db->query('UPDATE bot_packages SET obsolete = false WHERE id = ?', $pkg);
+  return $added;
+}
+
+sub unresolved_targets ($self, $package) {
+  return $self->pg->db->query('SELECT id, external_link FROM bot_requests WHERE package = ? AND target IS NULL',
+    $package)->hashes->to_array;
+}
+
+sub set_target ($self, $id, $target) {
+  $self->pg->db->query('UPDATE bot_requests SET target = ? WHERE id = ?', $target, $id);
 }
 
 sub all ($self) {

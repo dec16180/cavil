@@ -1,17 +1,5 @@
-# Copyright (C) 2018 SUSE Linux GmbH
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Model::Products;
 use Mojo::Base -base, -signatures;
@@ -21,6 +9,8 @@ use Cavil::Util qw(paginate);
 has 'pg';
 
 sub all ($self) { $self->pg->db->select('bot_products')->hashes->to_array }
+
+sub find ($self, $name) { $self->pg->db->select('bot_products', '*', {name => $name})->hash }
 
 sub find_or_create ($self, $name) {
   my $db = $self->pg->db;
@@ -36,33 +26,89 @@ sub for_package ($self, $id) {
     'name', {'bot_package_products.package' => $id})->arrays->flatten->to_array;
 }
 
+# Curated names let callers collapse multiple codestreams into one product.
+sub for_package_products ($self, $id) {
+  return $self->pg->db->query(
+    'SELECT p.name, p.product FROM bot_package_products pp JOIN bot_products p ON (p.id = pp.product)
+     WHERE pp.package = ? ORDER BY p.name', $id
+  )->hashes->to_array;
+}
+
+# The codestream names that roll up to a curated product, so the aggregate group page can offer a curator a
+# way back down to each individual codestream (where its annotation can be changed or cleared)
+sub codestreams_for_product ($self, $product) {
+  return $self->pg->db->select('bot_products', 'name', {product => $product}, {order_by => 'name'})
+    ->arrays->flatten->to_array;
+}
+
+# Name-based creation works before sync and keeps later membership updates independent.
+sub set_annotation ($self, $name, $product) {
+  my $db  = $self->pg->db;
+  my $obj = $self->find_or_create($name);
+  $product = undef if defined $product && $product eq '';
+  $db->update('bot_products', {product => $product}, {id => $obj->{id}});
+  return $product;
+}
+
 sub paginate_known_products ($self, $options) {
   my $db = $self->pg->db;
 
   my $search = '';
   if (length($options->{search}) > 0) {
     my $quoted = $db->dbh->quote("\%$options->{search}\%");
-    $search = "WHERE name ILIKE $quoted";
+    $search = "WHERE name ILIKE $quoted OR product ILIKE $quoted";
   }
 
-  my $results = $db->query(
-    qq{
-      SELECT id, name, EXTRACT(EPOCH FROM updated) as updated_epoch, COUNT(*) OVER() AS total
-      FROM bot_products
-      $search
-      ORDER BY updated DESC, id DESC
-      LIMIT ? OFFSET ?
-    }, $options->{limit}, $options->{offset}
-  )->hashes->to_array;
+  # Default view collapses codestreams by their curated product name (falling back to the raw codestream
+  # name when unannotated), so one deliverable spread across many codestreams becomes a single row. The
+  # flat view ("All codestreams") instead lists every codestream on its own, with its annotation exposed,
+  # so a curator can audit the product mapping across the whole fleet at a glance
+  my $grouped = ($options->{grouped} // 'true') eq 'true';
 
+  my $results;
+  if ($grouped) {
+    $results = $db->query(
+      qq{
+        SELECT COALESCE(product, name) AS name, COUNT(*) AS streams,
+          EXTRACT(EPOCH FROM MAX(updated)) AS updated_epoch, COUNT(*) OVER() AS total
+        FROM bot_products
+        $search
+        GROUP BY COALESCE(product, name)
+        ORDER BY MAX(updated) DESC, name DESC
+        LIMIT ? OFFSET ?
+      }, $options->{limit}, $options->{offset}
+    )->hashes->to_array;
+  }
+  else {
+    $results = $db->query(
+      qq{
+        SELECT name, product AS annotation, 1 AS streams,
+          EXTRACT(EPOCH FROM updated) AS updated_epoch, COUNT(*) OVER() AS total
+        FROM bot_products
+        $search
+        ORDER BY updated DESC, name DESC
+        LIMIT ? OFFSET ?
+      }, $options->{limit}, $options->{offset}
+    )->hashes->to_array;
+  }
+
+  # Package counts for a row: a group sums across every codestream that rolls up to it, a flat codestream
+  # counts only its own membership
   for my $result (@$results) {
+    my $where = $grouped ? 'COALESCE(bot_products.product, bot_products.name) = ?' : 'bot_products.name = ?';
+
+    # COUNT(DISTINCT id): a package shared by several codestreams of one product must count once, not once
+    # per codestream, or grouped products with overlapping codestreams inflate their review totals
     my $packages = $db->query(
-      q{
-      SELECT COUNT(*) FILTER (WHERE state = 'new') AS new_packages,
-        COUNT(*) FILTER (WHERE state = 'unacceptable') AS unacceptable_packages,
-        COUNT(*) FILTER (WHERE state = 'acceptable' OR state = 'acceptable_by_lawyer') AS reviewed_packages
-      FROM bot_package_products JOIN bot_packages ON (bot_packages.id = bot_package_products.package)
-      WHERE bot_package_products.product = ?}, $result->{id}
+      qq{
+      SELECT COUNT(DISTINCT bot_packages.id) FILTER (WHERE state = 'new') AS new_packages,
+        COUNT(DISTINCT bot_packages.id) FILTER (WHERE state = 'unacceptable') AS unacceptable_packages,
+        COUNT(DISTINCT bot_packages.id) FILTER (WHERE state = 'acceptable' OR state = 'acceptable_by_lawyer')
+          AS reviewed_packages
+      FROM bot_package_products
+        JOIN bot_packages ON (bot_packages.id = bot_package_products.package)
+        JOIN bot_products ON (bot_products.id = bot_package_products.product)
+      WHERE $where}, $result->{name}
     )->hash;
     $result->{reviewed_packages}     = $packages->{reviewed_packages};
     $result->{new_packages}          = $packages->{new_packages};

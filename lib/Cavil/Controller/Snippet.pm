@@ -7,7 +7,7 @@ use Mojo::Base 'Mojolicious::Controller', -signatures;
 use Mojo::File        qw(path);
 use Mojo::JSON        qw(true false);
 use Cavil::ReportUtil qw(smart_edit_snippet spdx_edit_snippet);
-use Cavil::Util       qw(pattern_checksum pattern_contains_redundant_skip pattern_matches);
+use Cavil::Util       qw(pattern_checksum pattern_contains_redundant_skip pattern_matches @PATTERN_FLAGS);
 use Cavil::Util       qw(PRIORITY_UPKEEP PRIORITY_WAITING);
 
 my $CHECKSUM_RE = qr/^(?:[a-f0-9]{32}|manual[\w:-]+)$/i;
@@ -43,7 +43,6 @@ sub closest ($self) {
   my $exclude  = $v->param('exclude');
   my $patterns = $self->patterns;
 
-  # Ask for 2 matches when excluding, in case the best match is the excluded pattern itself
   my $matches = $patterns->closest_matches($text, defined $exclude ? 2 : 1);
   my $match   = $matches->[0];
   $match = $matches->[1] if defined $exclude && $match && $match->{pattern} == $exclude;
@@ -74,8 +73,8 @@ my %BATCH_KINDS = map { $_ => 1 } qw(
 
 my %ADMIN_ONLY_KINDS = map { $_ => 1 } qw(create-pattern create-ignore create-glob mark-non-license);
 
-# Glob proposals are file-path based, not snippet based, so they carry no snippet id.
-my %SNIPPETLESS_KINDS = map { $_ => 1 } qw(propose-glob create-glob);
+# create-ignore keys on a content hash, not a snippet occurrence, so it needs no snippet id
+my %SNIPPETLESS_KINDS = map { $_ => 1 } qw(propose-glob create-glob create-ignore);
 
 # Apply a list of snippet decisions as a single batch.
 #
@@ -172,7 +171,31 @@ sub from_file ($self) {
   my $snippets = $self->snippets;
   return $self->reply->not_found unless defined(my $snippet = $snippets->from_file($file_id, $first_line, $last_line));
 
-  my $hash = $v->param('hash') // '';
+  return $self->_snippet_created($v, $snippet);
+}
+
+# A file with no matches has no id to address it by, so its ranges are named by path instead
+sub from_path ($self) {
+  my $v = $self->validation;
+  $v->optional('hash')->like($CHECKSUM_RE);
+  $v->optional('from');
+  $v->required('start')->num(1);
+  $v->required('end')->num(1);
+  return $self->reply->json_validation_error if $v->has_error || $v->param('start') > $v->param('end');
+
+  my $snippet = $self->snippets->from_file_path($self->stash('package'), $self->stash('file'), $v->param('start'),
+    $v->param('end'));
+  return $self->reply->not_found unless defined $snippet;
+
+  return $self->_snippet_created($v, $snippet);
+}
+
+sub _snippet_created ($self, $v, $snippet) {
+
+  # Selections made in a report have no hash yet - the snippet is being created here. Return the
+  # freshly stored checksum so the editor has the context (hash + from) that gates the ignore,
+  # missing-license and no-legal-text actions; without it those only reappeared after a reload.
+  my $hash = $v->param('hash') || $self->snippets->find($snippet)->{hash};
   my $from = $v->param('from') // '';
   $self->respond_to(
     json => sub { $self->render(json => {snippet => $snippet, hash => $hash, from => $from}) },
@@ -180,6 +203,16 @@ sub from_file ($self) {
       $self->redirect_to($self->url_for('edit_snippet', id => $snippet)->query(hash => $hash, from => $from));
     }
   );
+}
+
+# Ignoring a licensed match needs the checksum of its stored range, not a snippet occurrence. Resolving it
+# by (file, pattern, covered line) guarantees the hash matches what the indexer recomputes, and creating no
+# snippet avoids leaving a file_snippets row that would make the match look unresolved until the next
+# reindex.
+sub match_checksum ($self) {
+  my $hash = $self->snippets->checksum_for_match($self->stash('file'), $self->stash('pattern'), $self->stash('line'));
+  return $self->reply->not_found unless defined $hash;
+  $self->render(json => {hash => $hash});
 }
 
 sub list ($self) {
@@ -196,7 +229,7 @@ sub list_meta ($self) {
   $v->optional('timeframe')->in('any', 'year', 'month', 'week', 'day', 'hour');
   $v->optional('before')->num;
   $v->optional('offset')->num;
-  $v->optional('resolution')->in('any', 'unresolved', 'fold', 'clear', 'overlap', 'covered');
+  $v->optional('resolution')->in('any', 'unresolved', 'reported', 'fold', 'clear', 'overlap', 'covered');
   $v->optional('order')->in('occurrences', 'packages', 'risk', 'recent');
   $v->optional('search');    # free text, used only as a bound parameter; empty means "no search"
   return $self->reply->json_validation_error if $v->has_error;
@@ -237,8 +270,15 @@ sub list_meta ($self) {
 }
 
 sub meta ($self) {
-  my $id       = $self->param('id');
-  my $snippet  = $self->snippets->with_context($id);
+  my $v = $self->validation;
+  $v->optional('file')->num;
+
+  my $id = $self->param('id');
+
+  # Scope to the occurrence the reviewer is actually on: snippets are content-hash deduped, so one
+  # snippet id can have hundreds of occurrences across packages (a widely vendored license file).
+  # Content-deduplicated snippets need file context to match the review being edited.
+  my $snippet  = $self->snippets->with_context($id, $v->param('file'));
   my $patterns = $self->patterns;
   my $licenses = $patterns->autocomplete;
   my $pattern  = $patterns->closest_pattern($snippet->{text}) // {};
@@ -246,7 +286,9 @@ sub meta ($self) {
 }
 
 sub smart_edit ($self) {
-  my $snippet = $self->snippets->with_context($self->param('id')) or return $self->reply->not_found;
+  my $v = $self->validation;
+  $v->optional('file')->num;
+  my $snippet = $self->snippets->with_context($self->param('id'), $v->param('file')) or return $self->reply->not_found;
   my $mode    = $self->param('mode') // 'smart';
   my $result  = $mode eq 'spdx' ? spdx_edit_snippet($snippet) : smart_edit_snippet($snippet);
   $self->render(
@@ -347,20 +389,21 @@ sub _apply_action ($self, $a, $packages_to_reindex) {
   if ($kind eq 'create-pattern') {
     my $contributor_id = $form->{contributor} ? $users->id_for_login($form->{contributor}) : undef;
     my $pattern        = $patterns->create(
-      license           => $form->{license},
-      pattern           => $form->{pattern},
-      risk              => $form->{risk},
-      patent            => $form->{patent},
-      trademark         => $form->{trademark},
-      export_restricted => $form->{export_restricted},
-      cla               => $form->{cla},
-      eula              => $form->{eula},
-      owner             => $owner_id,
-      contributor       => $contributor_id
+      license => $form->{license},
+      pattern => $form->{pattern},
+      risk    => $form->{risk},
+      (map { $_ => $form->{$_} } @PATTERN_FLAGS),
+      owner       => $owner_id,
+      contributor => $contributor_id
     );
+    return {kind => $kind, error => $pattern->{error}}                            if $pattern->{error};
     return {kind => $kind, error => 'Conflicting license pattern already exists'} if $pattern->{conflict};
 
     if (my $checksum = $form->{checksum}) { $patterns->remove_proposal($checksum) }
+
+    # Creating a pattern answers the snippet's missing-license report, so clear it too. This also covers
+    # approving a new_license proposal, whose checksum above only removed the proposal row, not the report.
+    $patterns->retire_missing_license($id);
     my $pkgs = $snippets->packages_for_snippet($id);
     $packages_to_reindex->{$_} = 1 for @$pkgs;
     return {kind => 'pattern', id => $pattern->{id}, packages => $pkgs};
@@ -368,9 +411,13 @@ sub _apply_action ($self, $a, $packages_to_reindex) {
 
   if ($kind eq 'create-ignore') {
     my $contributor_id = $form->{contributor} ? $users->id_for_login($form->{contributor}) : undef;
-    $packages->ignore_line(
+    my $ids            = $packages->ignore_line(
       {package => $form->{from}, hash => $form->{hash}, owner => $owner_id, contributor => $contributor_id});
     $patterns->remove_proposal($form->{hash});
+
+    # Reindex every package sharing the name through the batch's deferred loop, so it runs once and at the
+    # priority the reviewer's report deserves (see batch_decision) instead of jumping the queue here.
+    $packages_to_reindex->{$_} = 1 for @$ids;
     return {kind => 'ignore'};
   }
 
@@ -394,12 +441,7 @@ sub _apply_action ($self, $a, $packages_to_reindex) {
       license              => $form->{license},
       risk                 => $form->{risk},
       package              => $form->{package},
-      patent               => $form->{patent},
-      trademark            => $form->{trademark},
-      export_restricted    => $form->{export_restricted},
-      cla                  => $form->{cla},
-      eula                 => $form->{eula},
-      owner                => $owner_id
+      (map { $_ => $form->{$_} } @PATTERN_FLAGS), owner => $owner_id
     );
     return {
       kind   => $kind,
@@ -407,8 +449,9 @@ sub _apply_action ($self, $a, $packages_to_reindex) {
       error  => 'This license and risk combination is not allowed, only use pre-existing licenses'
       }
       if $result->{license_conflict};
-    return {kind => $kind, error => 'Conflicting license pattern already exists'} if $result->{conflict};
-    return {kind => $kind, error => 'Conflicting license pattern proposal already exists'}
+    return {kind => $kind, status => 400, error => $result->{error}} if $result->{error};
+    return {kind => $kind, error  => 'Conflicting license pattern already exists'} if $result->{conflict};
+    return {kind => $kind, error  => 'Conflicting license pattern proposal already exists'}
       if $result->{proposal_conflict};
     return {kind => 'proposal'};
   }

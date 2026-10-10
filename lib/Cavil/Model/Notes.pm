@@ -6,32 +6,36 @@ use Mojo::Base -base, -signatures;
 use Cavil::Util qw(paginate);
 use Exporter 'import';
 
-our @EXPORT_OK = qw(NOTE_BODY_MAX_LENGTH);
+our @EXPORT_OK = qw(NOTE_BODY_MAX_LENGTH REVIEW_TAG relevance_predicate);
 use constant NOTE_BODY_MAX_LENGTH => 65535;
+
+# Convention, not schema: the tag cavil-review-note writes, its idempotency guard checks, and the
+# review listings key their "the agent has been here" icon on.
+use constant REVIEW_TAG => 'review';
 
 has 'pg';
 
-# Notes are shared across all bot_packages rows that share a name. The
-# originating package id (`package`) is kept as a "permalink" target so the UI
-# can show "originally added on review #N" — but it can become NULL if that
-# package row is later removed, and the note still belongs to the package
-# name.
-#
-# A pinned note is a reviewer's assertion that it matters for every future
-# review of the package name, so it deliberately escapes both mechanisms that
-# would otherwise bury it: it is exempt from the relevance filter, and the web
-# list pulls it out of the keyset scroll entirely (see pinned_for_package).
+# Notes belong to a package name; the nullable package id is only a permalink.
+# Pinned notes apply to every review and stay outside keyset pagination.
 
-sub add ($self, $package_id, $package_name, $author_id, $body, $lawyer_only, $ai_assisted = 0, $tags = undef) {
+# "Applies to the review being looked at": a limitation, pinned, written on it, or written on another review with
+# an identical license report. Shared with Cavil::Model::Packages so a listing filter and the icon
+# beside it can never disagree. Callers supply the joins: note c, the review it was written on np.
+sub relevance_predicate ($outer) {
+  return "(c.pinned OR c.limitation OR c.package = $outer.id OR np.checksum = $outer.checksum)";
+}
+
+sub add ($self, $package_id, $name, $author_id, $body, $lawyer_only, $ai_assisted = 0, $tags = undef, $limitation = 0) {
   my $row = $self->pg->db->insert(
     'package_notes',
     {
       package      => $package_id,
-      package_name => $package_name,
+      package_name => $name,
       author       => $author_id,
       ai_assisted  => $ai_assisted ? 1 : 0,
       body         => $body,
       lawyer_only  => $lawyer_only ? 1 : 0,
+      limitation   => $limitation  ? 1 : 0,
       tags         => $tags // []
     },
     {returning => 'id'}
@@ -44,6 +48,13 @@ sub find ($self, $id) {
   return $rows->[0];
 }
 
+# While a package name has limitations, every new version needs a human review
+sub limitations ($self, $package_name) {
+  return $self->pg->db->query(
+    'SELECT id, body, package FROM package_notes WHERE package_name = ? AND limitation ORDER BY id DESC',
+    $package_name)->hashes->to_array;
+}
+
 sub list ($self, $package_name, %opts) {
   my $limit = $opts{limit} // 20;
   $limit = 1   if $limit < 1;
@@ -54,27 +65,20 @@ sub list ($self, $package_name, %opts) {
 
   push @sql, 'AND c.lawyer_only = false' unless $opts{include_lawyer_only};
 
-  # The web list hoists pinned notes into their own block above the scroll, so
-  # they must not also appear in the paginated stream. Consumers that render a
-  # single flat list (like the plain text report) leave this off.
-  push @sql, 'AND c.pinned = false' if $opts{exclude_pinned};
+  push @sql, 'AND c.pinned = false AND c.limitation = false' if $opts{exclude_pinned};
 
   if (defined $opts{before_id}) {
     push @sql,  'AND c.id < ?';
     push @args, $opts{before_id};
   }
 
-  # "Only relevant notes" = pinned OR native to this review OR from a review
-  # with an identical license report (same bot_packages.checksum). Degrades to
-  # native-only when the current package has no report checksum yet.
-  if ($opts{relevant_only}) {
+  if    ($opts{relevant_only}) { _relevant_only(\@sql, \@args, \%opts) }
+  elsif ($opts{history_only}) {
+    push @sql,  'AND c.pinned = false AND c.limitation = false AND c.package IS DISTINCT FROM ?';
+    push @args, $opts{package_id};
     if (defined $opts{checksum}) {
-      push @sql, 'AND (c.pinned = true OR c.package = ? OR p.checksum = ?)';
-      push @args, $opts{package_id}, $opts{checksum};
-    }
-    else {
-      push @sql,  'AND (c.pinned = true OR c.package = ?)';
-      push @args, $opts{package_id};
+      push @sql,  'AND p.checksum IS DISTINCT FROM ?';
+      push @args, $opts{checksum};
     }
   }
 
@@ -85,16 +89,12 @@ sub list ($self, $package_name, %opts) {
   return {notes => $rows, has_more => $has_more};
 }
 
-# All pinned notes for a package name, newest first. Kept out of the keyset
-# pagination in list() on purpose: sorting pinned notes to the front would put
-# rows with ids above the `before_id` cursor into later pages, which either
-# duplicates or drops them depending on where the scroll is. A separate query
-# is correct at any scroll position, and the pin limit keeps it small.
+# A separate query prevents pinned rows from crossing keyset cursors.
 sub pinned_for_package ($self, $package_name, %opts) {
-  my @sql  = ('AND c.package_name = ?', 'AND c.pinned = true');
+  my @sql  = ('AND c.package_name = ?', 'AND (c.pinned OR c.limitation)');
   my @args = ($package_name);
   push @sql, 'AND c.lawyer_only = false' unless $opts{include_lawyer_only};
-  return $self->_query(join(' ', @sql), \@args, 'ORDER BY c.id DESC');
+  return $self->_query(join(' ', @sql), \@args, 'ORDER BY c.limitation DESC, c.id DESC');
 }
 
 sub recent ($self, %opts) {
@@ -110,6 +110,7 @@ sub recent ($self, %opts) {
     push @sql,  'AND c.id < ?';
     push @args, $opts{before_id};
   }
+  push @sql, 'AND c.limitation' if $opts{limitation};
   if (defined $opts{tags} && @{$opts{tags}}) {
     push @sql,  'AND c.tags @> ?::text[]';
     push @args, $opts{tags};
@@ -122,8 +123,6 @@ sub recent ($self, %opts) {
   return {notes => $rows, has_more => $has_more};
 }
 
-# Distinct tags across all notes with usage counts, most-used first. Powers the
-# autocomplete suggestions in the note tag editor and the recent-notes filter.
 sub all_tags ($self, %opts) {
   my $where = $opts{include_lawyer_only} ? '' : 'WHERE lawyer_only = false';
   return $self->pg->db->query(
@@ -149,22 +148,14 @@ sub paginate_for_package ($self, $package_name, %opts) {
     push @sql,  'AND c.tags @> ?::text[]';
     push @args, $opts{tags};
   }
-  if ($opts{relevant_only}) {
-    if (defined $opts{checksum}) {
-      push @sql, 'AND (c.pinned = true OR c.package = ? OR p.checksum = ?)';
-      push @args, $opts{package_id}, $opts{checksum};
-    }
-    else {
-      push @sql,  'AND (c.pinned = true OR c.package = ?)';
-      push @args, $opts{package_id};
-    }
-  }
+  _relevant_only(\@sql, \@args, \%opts) if $opts{relevant_only};
 
   # Offset pagination, so unlike list() this one can just sort pinned notes to
   # the front without breaking a cursor.
   my $sql = qq{
-    SELECT c.id, c.body, c.lawyer_only, c.ai_assisted, c.pinned, c.tags, c.package AS package_id, c.package_name,
-           c.author AS author_id, u.login AS author_login, u.roles AS author_roles,
+    SELECT c.id, c.body, c.lawyer_only, c.ai_assisted, c.pinned, c.limitation, c.tags,
+           c.package AS package_id, c.package_name, c.author AS author_id,
+           u.login AS author_login, u.roles AS author_roles,
            EXTRACT(EPOCH FROM c.created) AS created_epoch,
            EXTRACT(EPOCH FROM c.edited)  AS edited_epoch,
            p.state AS package_state, p.obsolete AS package_obsolete,
@@ -174,7 +165,7 @@ sub paginate_for_package ($self, $package_name, %opts) {
       JOIN bot_users u ON c.author = u.id
       LEFT JOIN bot_packages p ON c.package = p.id
      WHERE 1 = 1 } . join(' ', @sql) . qq{
-     ORDER BY c.pinned DESC, c.id DESC
+     ORDER BY c.limitation DESC, c.pinned DESC, c.id DESC
      LIMIT ? OFFSET ?
   };
 
@@ -191,24 +182,37 @@ sub counts ($self, $package_name) {
   )->hash;
 }
 
-# Count of visible notes "relevant" to the given review (pinned, native, or
-# identical license report), so the UI can gate the "Only relevant notes"
-# toggle and show "N of M". Mirrors the relevant_only predicate in list().
 sub relevant_count ($self, $package_name, $package_id, $checksum, %opts) {
-  my @sql  = ('c.package_name = ?');
-  my @args = ($package_name);
-  push @sql, 'c.lawyer_only = false' unless $opts{include_lawyer_only};
-  if (defined $checksum) {
-    push @sql, '(c.pinned = true OR c.package = ? OR p.checksum = ?)';
-    push @args, $package_id, $checksum;
+  my $row      = {id => $package_id, name => $package_name, checksum => $checksum};
+  my $relevant = $self->relevant_notes([$row], %opts)->{$package_id};
+  return $relevant ? $relevant->{count} : 0;
+}
+
+# One query for a whole page of reviews, so a listing can show a note icon without a query per row.
+# Returns {package id => {count, review, ai}}, reviews without a relevant note absent entirely.
+sub relevant_notes ($self, $rows, %opts) {
+  return {} unless @$rows;
+
+  my $lawyer = $opts{include_lawyer_only} ? '' : 'AND c.lawyer_only = false';
+  my $sql    = 'SELECT r.id, COUNT(*)::int AS count, bool_or(c.tags @> ?::text[]) AS review,
+                       bool_or(c.tags @> ?::text[] AND c.ai_assisted) AS ai, bool_or(c.limitation) AS limitation
+                  FROM unnest(?::bigint[], ?::text[], ?::text[]) AS r(id, name, checksum)
+                  JOIN package_notes c ON c.package_name = r.name
+                  LEFT JOIN bot_packages np ON c.package = np.id
+                 WHERE ' . relevance_predicate('r') . " $lawyer GROUP BY r.id";
+
+  my $results = $self->pg->db->query(
+    $sql, [REVIEW_TAG], [REVIEW_TAG],
+    [map { $_->{id} } @$rows],
+    [map { $_->{name} } @$rows],
+    [map { $_->{checksum} } @$rows]
+  )->hashes;
+
+  my %relevant;
+  for my $row ($results->each) {
+    $relevant{$row->{id}} = {count => $row->{count}, map { $_ => $row->{$_} ? 1 : 0 } qw(review ai limitation)};
   }
-  else {
-    push @sql,  '(c.pinned = true OR c.package = ?)';
-    push @args, $package_id;
-  }
-  my $sql = 'SELECT COUNT(*)::int AS relevant FROM package_notes c
-              LEFT JOIN bot_packages p ON c.package = p.id WHERE ' . join(' AND ', @sql);
-  return $self->pg->db->query($sql, @args)->hash->{relevant};
+  return \%relevant;
 }
 
 # Newest note id that carries $tag AND is relevant to the given review (native or
@@ -257,9 +261,7 @@ sub edit ($self, $id, $body, $tags = undef) {
   return $self->find($id);
 }
 
-# Pinning is curation of an existing note, not a change to what it says, so it
-# deliberately leaves `edited` alone - a pin must not make the note read as
-# "edited 2 minutes ago" to the next reviewer.
+# Pinning is curation, not an edit; preserve the content timestamp.
 sub set_pinned ($self, $id, $pinned) {
   my $rows
     = $self->pg->db->query('UPDATE package_notes SET pinned = ? WHERE id = ? RETURNING id', $pinned ? 1 : 0, $id)->rows;
@@ -272,10 +274,17 @@ sub pinned_count ($self, $package_name) {
     $package_name)->hash->{pinned};
 }
 
+sub _relevant_only ($sql, $args, $opts) {
+  push @$sql,
+    'AND (c.pinned OR c.limitation OR c.package = ?' . (defined $opts->{checksum} ? ' OR p.checksum = ?)' : ')');
+  push @$args, $opts->{package_id}, defined $opts->{checksum} ? $opts->{checksum} : ();
+}
+
 sub _query ($self, $extra_sql, $extra_args, $tail_sql = '', $tail_args = []) {
   my $sql = qq{
-    SELECT c.id, c.body, c.lawyer_only, c.ai_assisted, c.pinned, c.tags, c.package AS package_id, c.package_name,
-           c.author AS author_id, u.login AS author_login, u.roles AS author_roles,
+    SELECT c.id, c.body, c.lawyer_only, c.ai_assisted, c.pinned, c.limitation, c.tags,
+           c.package AS package_id, c.package_name, c.author AS author_id,
+           u.login AS author_login, u.roles AS author_roles,
            EXTRACT(EPOCH FROM c.created) AS created_epoch,
            EXTRACT(EPOCH FROM c.edited)  AS edited_epoch,
            p.state AS package_state, p.obsolete AS package_obsolete,

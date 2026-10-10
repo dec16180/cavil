@@ -16,6 +16,7 @@ sub run ($self, @args) {
   getopt \@args,
     'backfill-catch-all'     => \my $backfill_catch_all,
     'backfill-shingles'      => \my $backfill_shingles,
+    'backfill-spdx-ids'      => \my $backfill_spdx_ids,
     'check-catch-all'        => \my $check_catch_all,
     'check-risks'            => \my $check_risks,
     'check-spdx'             => \my $check_spdx,
@@ -32,53 +33,39 @@ sub run ($self, @args) {
     'remove-unused-ignore'   => \my $remove_unused_ignore,
     'remove-used=i'          => \my $remove_used;
 
-  # Show pattern match
   return $self->_match($match, $preview) if $match;
 
-  # Remove unused license pattern
   return $self->_remove_unused($remove_unused)               if $remove_unused;
   return $self->_remove_unused_extras($remove_unused_extras) if $remove_unused_extras;
 
-  # Remove license pattern currently in use
   return $self->_remove_used($remove_used) if $remove_used;
 
-  # Remove unused ignore patterns
   return $self->_check_ignore(1) if $remove_unused_ignore;
 
-  # Fix risk assessment for license
   return $self->_fix_risk($license, $fix_risk) if defined $fix_risk;
 
-  # Check license names for valid SPDX expressions
   return $self->_inherit_spdx if $inherit_spdx;
 
-  # (Re)seed the per-license catch_all flag from the license naming rule
   return $self->_backfill_catch_all if $backfill_catch_all;
 
-  # (Re)populate the pattern_shingles table from all patterns (one-time migration / after a format change)
   return $self->_backfill_shingles if $backfill_shingles;
 
-  # Check for licenses whose patterns disagree on the catch_all flag
+  return $self->_backfill_spdx_ids if $backfill_spdx_ids;
+
   return $self->_check_catch_all if $check_catch_all;
 
-  # Check for licenses with multiple risk assessments
   return $self->_check_risks if $check_risks;
 
-  # Check for licenses patterns with inconsistent SPDX expressions
   return $self->_check_spdx if $check_spdx;
 
-  # Check for unused patterns
   return $self->_check_use(1, $license, $preview) if $check_unused;
 
-  # Check for unused ignore patterns
   return $self->_check_ignore(0) if $check_unused_ignore;
 
-  # Check for used patterns
   return $self->_check_use(0, $license, $preview) if $check_used;
 
-  # License stats
   return $self->_license_stats($license) if $license;
 
-  # Stats
   return $self->_stats;
 }
 
@@ -142,6 +129,12 @@ sub _backfill_shingles ($self) {
   $patterns->backfill_pattern_shingles;
   my $rows = $self->app->pg->db->query('SELECT COUNT(*) AS c FROM pattern_shingles')->hash->{c};
   say "Done: $rows shingle rows.";
+}
+
+sub _backfill_spdx_ids ($self) {
+  my $created = $self->app->patterns->backfill_spdx_identifiers;
+  say "$_->{license} -> $_->{pattern}" for @$created;
+  say scalar(@$created) . ' SPDX identifier patterns created';
 }
 
 sub _check_catch_all ($self) {
@@ -239,6 +232,9 @@ sub _inherit_spdx ($self) {
 
   for my $license ($db->query('SELECT DISTINCT(license) AS name FROM license_patterns')->hashes->each) {
     next unless my $name = $license->{name};
+
+    # A "LicenseRef-*" name parses as valid SPDX, but it is only a local reference (the SBOM derives its own)
+    if ($name =~ /LicenseRef-/i) { say "$name: skipped, LicenseRef is not an SPDX identifier"; next }
     my $lic = lic($name);
     next if $lic->error;
     my $rows = $db->query('UPDATE license_patterns SET spdx = ? WHERE license = ?', $lic->to_string, $name)->rows;
@@ -425,6 +421,9 @@ Cavil::Command::patterns - Cavil command to manage license patterns
     # adds them; routine pattern edits then maintain them incrementally)
     script/cavil patterns --backfill-shingles
 
+    # Create the "SPDX-License-Identifier: <expr>" pattern for every SPDX license missing it
+    script/cavil patterns --backfill-spdx-ids
+
   Options:
         --match <id>                    Show all known information for a
                                         pattern match
@@ -435,6 +434,12 @@ Cavil::Command::patterns - Cavil command to manage license patterns
                                         migration, or after a shingle-format
                                         change); routine edits maintain it
                                         incrementally
+        --backfill-spdx-ids             Create the "SPDX-License-Identifier:
+                                        <expr>" pattern for every license with
+                                        an SPDX expression that is still missing
+                                        it, taking the identifier from the
+                                        license's spdx field and inheriting all
+                                        other properties from its patterns
         --check-catch-all               Check for licenses whose patterns
                                         disagree on the catch_all flag
         --check-risks                   Check for licenses with multiple

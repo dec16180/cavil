@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -21,7 +9,8 @@ use lib "$FindBin::Bin/lib";
 use Test::More;
 use Test::Mojo;
 use Cavil::Test;
-use Mojo::File qw(path tempdir);
+use Cavil::Util qw(incoming_priority PRIORITY_INCOMING PRIORITY_UPKEEP);
+use Mojo::File  qw(path tempdir);
 
 plan skip_all => 'set TEST_ONLINE to enable this test' unless $ENV{TEST_ONLINE};
 
@@ -90,6 +79,11 @@ subtest 'Upload' => sub {
 
   my $pkg = $t->app->packages->find(3);
   is $pkg->{priority}, 6, 'priority taken from the form';
+
+  # An uploaded archive is an arriving package, and the priority on the form moves it around inside the
+  # incoming band the same way the one a Bot API request carries does
+  my $unpack = $t->app->minion->jobs({tasks => ['unpack'], states => ['inactive']})->next;
+  is $unpack->{priority}, incoming_priority(6), 'queued in the incoming band, one step up for the form priority';
 
   # The checkout directory must be the real content hash of the archive (not the md5 of an
   # empty stream), otherwise different archives uploaded under the same name would collide
@@ -194,6 +188,91 @@ subtest 'Non-JSON upload redirects to the dashboard' => sub {
   $t->get_ok('/')->status_is(200)->content_like(qr/perl-Mojo-Redirect has been uploaded/);
   ok $t->app->packages->find_by_name_and_md5('perl-Mojo-Redirect', 'c1ffb4256878c64eb0e40c48f36d24d2'),
     'package created via the redirect path';
+};
+
+subtest 'Ephemeral upload is flagged and runs a band below normal incoming' => sub {
+  my $tmp = tempdir;
+  my $src = $tmp->child('eph')->make_path;
+  $src->child('file.txt')->spew("ephemeral content\n");
+  my $archive = $tmp->child('eph.tar.gz');
+  is system('tar', '-czf', $archive->to_string, '-C', $src->to_string, '.'), 0, 'ephemeral archive created';
+
+  $t->post_ok(
+    '/upload',
+    {Accept => 'application/json'},
+    form => {name => 'eph-web', priority => '6', ephemeral => 1, tarball => {file => $archive->to_string}}
+  )->status_is(200);
+  my $id = $t->tx->res->json->{id};
+
+  ok $t->app->packages->find($id)->{ephemeral}, 'package is flagged ephemeral';
+
+  my $unpack = $t->app->minion->jobs({tasks => ['unpack'], notes => ["pkg_$id"]})->next;
+  is $unpack->{priority}, incoming_priority(6) - (PRIORITY_INCOMING - PRIORITY_UPKEEP),
+    'queued a whole band below normal incoming';
+
+  # The report metadata hints that the review is ephemeral and when it will be deleted
+  $t->app->minion->perform_jobs;
+  $t->get_ok("/reviews/meta/$id")->status_is(200);
+  ok $t->tx->res->json('/ephemeral'), 'metadata marks the report ephemeral';
+  my $meta = $t->tx->res->json;
+  is $meta->{ephemeral_delete}, $meta->{created} + 24 * 3600, 'deletion time is created plus the configured window';
+};
+
+subtest 'Ephemeral reviews are listed together in every state' => sub {
+  my $tmp = tempdir;
+  my $src = $tmp->child('eph2')->make_path;
+  $src->child('file.txt')->spew("second ephemeral content\n");
+  my $archive = $tmp->child('eph2.tar.gz');
+  is system('tar', '-czf', $archive->to_string, '-C', $src->to_string, '.'), 0, 'second ephemeral archive created';
+
+  $t->post_ok(
+    '/upload',
+    {Accept => 'application/json'},
+    form => {name => 'eph-accepted', priority => '5', ephemeral => 1, tarball => {file => $archive->to_string}}
+  )->status_is(200);
+  my $id2 = $t->tx->res->json->{id};
+  $t->app->minion->perform_jobs;
+
+  # Force two different states so the listing is proven not to filter by state
+  my $id1 = $t->app->pg->db->select('bot_packages', 'id', {name => 'eph-web'})->hash->{id};
+  $t->app->packages->update({id => $id1, state => 'new'});
+  $t->app->packages->update({id => $id2, state => 'acceptable'});
+
+  $t->get_ok('/pagination/reviews/ephemeral')->status_is(200);
+  my $page  = $t->tx->res->json;
+  my %by_id = map { $_->{id} => $_ } @{$page->{page}};
+  ok $by_id{$id1},        'new-state ephemeral review is listed';
+  ok $by_id{$id2},        'acceptable-state ephemeral review is listed';
+  ok !$by_id{3},          'a normal (non-ephemeral) package is not listed';
+  ok $by_id{$id1}{login}, 'uploader login is present';
+  is $by_id{$id1}{ephemeral_delete}, $by_id{$id1}{created_epoch} + 24 * 3600, 'row carries the scheduled deletion time';
+};
+
+subtest 'Uploader role can only make ephemeral uploads' => sub {
+  $t->app->pg->db->update('bot_users', {roles => ['uploader']}, {login => 'tester'});
+  $t->get_ok('/upload')->status_is(200)->content_like(qr/setupArchiveUpload\('[^']+', true\)/);
+
+  my $tmp = tempdir;
+  my $src = $tmp->child('up')->make_path;
+  $src->child('file.txt')->spew("uploader content\n");
+  my $archive = $tmp->child('up.tar.gz');
+  is system('tar', '-czf', $archive->to_string, '-C', $src->to_string, '.'), 0, 'uploader archive created';
+
+  # No ephemeral flag at all, the server forces it
+  $t->post_ok(
+    '/upload',
+    {Accept => 'application/json'},
+    form => {name => 'up-web', priority => '6', tarball => {file => $archive->to_string}}
+  )->status_is(200);
+  my $id = $t->tx->res->json->{id};
+  ok $t->app->packages->find($id)->{ephemeral}, 'package is forced ephemeral';
+  $t->app->minion->perform_jobs;
+
+  $t->get_ok('/pagination/reviews/open?priority=1&limit=100')->status_is(200);
+  ok !(grep { $_->{id} == $id } @{$t->tx->res->json->{page}}), 'not in the open review backlog';
+  $t->get_ok('/pagination/reviews/ephemeral')->status_is(200);
+  ok((grep { $_->{id} == $id } @{$t->tx->res->json->{page}}), 'listed with the ephemeral reviews');
+  $t->get_ok("/reviews/details/$id")->status_is(200);
 };
 
 done_testing();

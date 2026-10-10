@@ -4,12 +4,67 @@
 package Cavil::Model::Packages;
 use Mojo::Base -base, -signatures;
 
-use Cavil::Util qw(paginate PRIORITY_INCOMING PRIORITY_SWEEP PRIORITY_UPKEEP PRIORITY_WAITING);
-use Mojo::File  qw(path);
-use Mojo::Util  qw(dumper scope_guard);
-use Text::Glob  qw(glob_to_regex);
+use Cavil::Model::Notes qw(relevance_predicate);
+use Cavil::Util         qw(checkout_path incoming_priority md5_file paginate parse_list_filter),
+  qw(PRIORITY_INCOMING PRIORITY_SWEEP PRIORITY_UPKEEP), qw(PRIORITY_WAITING @LICENSE_FLAGS);
+use Mojo::File qw(path);
+use Mojo::Util qw(dumper scope_guard);
+use Text::Glob qw(glob_to_regex);
 
 has [qw(checkout_dir classifier log minion pg)];
+
+# Adding a derived format is an entry here plus its generator; the job, the polled state, the routes and
+# the report UI all read this list. "gzip" is per entry because a format can be an archive served as it
+# lies. The ".report." prefix is not cosmetic: Cavil::Checkout keeps files carrying it out of the unpacked
+# tree and out of the indexer, so a format named anything else gets indexed as package content.
+use constant DOCUMENTS => [
+  {key => 'spdx',   file => '.report.spdx.json.gz',  name => 'spdx.json',  type => 'application/json', gzip => 1},
+  {key => 'notice', file => '.report.notice.txt.gz', name => 'NOTICE.txt', type => 'text/plain',       gzip => 1}
+];
+
+sub document ($self, $key) {
+  my ($doc) = grep { $_->{key} eq $key } @{DOCUMENTS()};
+  return $doc;
+}
+
+sub document_path ($self, $id, $key) {
+  return undef unless my $doc = $self->document($key);
+  return $self->pkg_checkout_dir($id)->child($doc->{file});
+}
+
+# The size a download produces, not the size on disk: a gzipped document is served compressed, and gzip
+# records the decompressed size in its last four bytes, so this costs a seek rather than a decompression.
+sub _size ($doc, $path) {
+  return undef unless my $compressed = -s $path;
+  return $compressed unless $doc->{gzip};
+
+  # ISIZE is the uncompressed size modulo 2^32, so it is only the answer while the report cannot have been
+  # bigger than that. JSON gzips by roughly ten to one, leaving this bound with room to spare; above it we
+  # would rather say nothing than name a size that has silently wrapped
+  return undef if $compressed > 256 * 1024 * 1024;
+
+  open my $fh, '<:raw', $path or return undef;
+  seek $fh, -4, 2 or return undef;
+  read($fh, my $isize, 4) == 4 or return undef;
+  return unpack 'V', $isize;
+}
+
+sub has_document ($self, $id, $key) { return -f $self->document_path($id, $key) }
+
+# undef unless every registered document is there: they are built in one pass, so a partial set means the
+# job is still running or died
+sub ready_documents ($self, $id) {
+  my $dir = $self->pkg_checkout_dir($id);
+
+  my @documents;
+  for my $doc (@{DOCUMENTS()}) {
+    my $path = $dir->child($doc->{file});
+    return undef unless -f $path;
+    push @documents, {key => $doc->{key}, name => "$id.$doc->{name}", size => _size($doc, $path)};
+  }
+
+  return \@documents;
+}
 
 sub add ($self, %args) {
 
@@ -31,9 +86,53 @@ sub add ($self, %args) {
     requesting_user => $args{requesting_user},
     priority        => $args{priority},
     state           => 'new',
-    embargoed       => $args{embargoed} ? 1 : 0
+    embargoed       => $args{embargoed} ? 1 : 0,
+    ephemeral       => $args{ephemeral} ? 1 : 0
   };
   return $db->insert('bot_packages', $pkg, {returning => 'id'})->hash->{id};
+}
+
+# Store and verify the archive before creating its row to prevent incomplete sources.
+sub store_upload ($self, $upload, $opts) {
+  my $file = $upload->asset->to_file;
+
+  my $sum = md5_file($file->path);
+  die {checksum_mismatch => 1} if defined $opts->{checksum} && lc($opts->{checksum}) ne $sum;
+
+  # Identical uploads make client retries idempotent.
+  my $name = $opts->{name};
+  if (my $existing = $self->find_by_name_and_md5($name, $sum)) { return ($self->find($existing->{id}), 1) }
+
+  my $dir = checkout_path($self->checkout_dir, $name, $sum);
+  eval { $dir->make_path; $file->move_to($dir->child(path($upload->filename)->basename)) };
+  if ($@) {
+    $dir->remove_tree;
+    die $@;
+  }
+
+  my $id = $self->add(
+    name            => $name,
+    checkout_dir    => $sum,
+    api_url         => '',
+    requesting_user => $opts->{requesting_user},
+    project         => '',
+    priority        => $opts->{priority},
+    package         => $name,
+    srcmd5          => $sum,
+    ephemeral       => $opts->{ephemeral}
+  );
+  my $obj = $self->find($id);
+  $obj->{external_link} = $opts->{external_link};
+  $self->update($obj);
+  $self->imported($id);
+
+  # Ephemeral one-off uploads run a whole band below normal incoming, so even a burst of them yields to
+  # real reviews.
+  my $priority = incoming_priority($opts->{priority});
+  $priority -= PRIORITY_INCOMING - PRIORITY_UPKEEP if $opts->{ephemeral};
+  $self->unpack($id, $priority);
+
+  return ($obj, 0);
 }
 
 sub actions ($self, $link, $id) {
@@ -53,10 +152,11 @@ sub actions ($self, $link, $id) {
 sub all ($self) { $self->pg->db->select('bot_packages')->hashes }
 
 # A plain re-analyze (no generation) touches no files and rewrites nothing but the report row, so the
-# default priority is above every band in Cavil::Util: it is a few seconds of work standing between a
-# reviewer and a corrected report, and making it wait for the queue would cost far more than it saves.
-# The analyze that ends a build passes its own priority instead and stays in the build's band.
-sub analyze ($self, $id, $priority = 9, $parents = [], $generation = 0) {
+# default priority is above every band in Cavil::Util, clear of even the highest a build can climb to: it
+# is a few seconds of work standing between a reviewer and a corrected report, and making it wait for the
+# queue would cost far more than it saves. The analyze that ends a build passes its own priority instead
+# and stays in the build's band.
+sub analyze ($self, $id, $priority = 100, $parents = [], $generation = 0) {
 
   # Without a generation this is a plain re-analyze of the live report, which deduplicates like any other
   # per-package job
@@ -75,14 +175,14 @@ sub analyze ($self, $id, $priority = 9, $parents = [], $generation = 0) {
   );
 }
 
-# One owner at a time. Every job that rewrites a package's checkout or its report claims the package row
-# before it starts and hands it back when it is done, so an unpack cannot pull the sources out from under
-# an indexing run and two rebuilds cannot fight over one report. The owner is the id of the Minion job
-# holding it, which buys three things a lock did not: there is no expiry to outlive a slow build (a
-# reindex of a large package can run for hours), the build hands the package back in the very transaction
-# that promotes its report, and a claim stranded by a worker that died is recovered the way admins already
-# recover everything else - retrying the failed job in the Minion admin UI re-claims the package, because
-# the claim it finds is its own.
+# A changed limitation only reaches the versions waiting for review through their next auto review
+sub analyze_waiting ($self, $name) {
+  $self->_enqueue('analyzed', $_->{id})
+    for $self->pg->db->query("SELECT id FROM bot_packages WHERE name = ? AND state = 'new' AND NOT obsolete", $name)
+    ->hashes->each;
+}
+
+# A Minion job id provides exclusive ownership without expiring during long builds.
 sub claim ($self, $id, $job_id) {
   return !!$self->pg->db->query(
     'UPDATE bot_packages SET processing_job = ?
@@ -90,49 +190,35 @@ sub claim ($self, $id, $job_id) {
   )->rows;
 }
 
-# Claim the package for as long as the caller's scope lives, for jobs that do all their work themselves. A
-# report build spans four jobs and so claims and releases by hand instead.
+# Multi-job report builds manage their longer-lived claim explicitly.
 sub claim_guard ($self, $id, $job_id) {
   return undef unless $self->claim($id, $job_id);
   return scope_guard sub { $self->release($id, $job_id) };
 }
 
-# Hand the package back, but only while we are still the owner: a job whose claim was taken over by the
-# cleanup sweep must not clear the claim of whoever has it now on its way out.
+# A superseded job must not release its successor's claim.
 sub release ($self, $id, $job_id) {
   $self->pg->db->query('UPDATE bot_packages SET processing_job = NULL WHERE id = ? AND processing_job = ?',
     $id, $job_id);
 }
 
-# Hand the package back at the end of a chain of jobs, and start the rebuild it owes. Reindexes requested
-# while the package was busy are only written down (see request_reindex), so somebody has to act on them
-# once it is free, and that is whoever lets go of it last - otherwise the request sits there until the
-# nightly sweep, with the report page read-only the whole time. Only the successful path calls this; a job
-# that dies just releases, and its retry hands back instead. The order is not delicate: an index job that
-# is already queued for the package is deduplicated away, and a request arriving right after this ran
-# finds the package free and enqueues its own build.
+# The final owner services rebuild requests recorded while the package was busy.
 sub hand_back ($self, $id, $job_id) {
   $self->release($id, $job_id);
 
-  # The rebuild runs at the priority whoever asked for it would have got, so a reviewer who clicked
-  # Reindex while the package was busy is still ahead of the weekly sweep afterwards
+  # Preserve the requester's priority across the wait.
   return unless defined(my $priority = $self->reindex_request($id));
 
-  # Only clear the request once the build that answers it exists. A package that has become ineligible in
-  # the meantime (obsoleted, never indexed) keeps it, and the sweep clears it along with the package.
+  # Clear only after enqueue succeeds, so requests cannot be lost.
   return unless ($self->reindex($id, $priority) // '') eq 'now';
   $self->log->info("[$id] Reindex was requested while the package was busy, queueing it now");
   $self->clear_reindex_request($id);
 }
 
-# Enqueue the classify job when this package has snippets awaiting the classifier, coalesced to a single
-# pending run. The job is guarded and drains every package's snippets in one pass, so one queued run is
-# enough however many packages were analyzed. Packages whose snippets are all classified (the reindex
-# case) enqueue nothing, and so does an instance with no classifier configured to consume the snippets.
+# One classifier run drains pending snippets across packages, so coalesce queued work.
 sub classify ($self, $id) {
   return unless $self->classifier->url;
 
-  # Generation 0 only: this runs after the promote, so the build's rows are the live ones by now
   my $db = $self->pg->db;
   return unless $db->query(
     'SELECT 1 FROM file_snippets fs JOIN snippets s ON s.id = fs.snippet
@@ -141,7 +227,7 @@ sub classify ($self, $id) {
 
   my $minion = $self->minion;
   return if $minion->jobs({tasks => ['classify'], states => ['inactive']})->total;
-  $minion->enqueue(classify => [] => {priority => 5});
+  $minion->enqueue(classify => [] => {priority => PRIORITY_INCOMING});
 }
 
 sub cleanup ($self, $id, $job_id) {
@@ -156,7 +242,7 @@ sub cleanup ($self, $id, $job_id) {
   my $pkg = $db->select('bot_packages', ['name', 'checkout_dir', 'obsolete'], {id => $id})->hash;
   return if !$pkg || !$pkg->{obsolete};
 
-  my $dir = path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir});
+  my $dir = checkout_path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir});
   if (-d $dir) {
     $log->info("[$id] Removing checkout $pkg->{name}/$pkg->{checkout_dir}");
     $dir->remove_tree;
@@ -166,28 +252,62 @@ sub cleanup ($self, $id, $job_id) {
   {
     my $tx = $db->begin;
     $db->query('UPDATE bot_packages SET cleaned = NOW() WHERE id = ?', $id);
-
-    # No generation predicate on purpose: the package is obsolete and going away, so everything it owns
-    # goes, including the rows of a reindex that was still building when it was superseded
-    $db->query('delete from bot_reports where package = ?',        $id);
-    $db->query('delete from emails where package = ?',             $id);
-    $db->query('delete from urls where package = ?',               $id);
-    $db->query('delete from package_components where package = ?', $id);
-    $db->query('delete from pattern_matches where package = ?',    $id);
-    $db->query('delete from matched_files where package = ?',      $id);
+    _delete_package_rows($db, $id);
     $tx->commit;
   }
 }
 
-sub pkg_checkout_dir ($self, $id) {
-  my $pkg = $self->find($id);
-  return path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir});
+# The package-owned rows both teardown paths remove. No generation predicate on purpose: the package is
+# going away, so everything it owns goes, including the rows of a reindex that was still building when it
+# was superseded. matched_files cascades to pattern_matches and file_snippets.
+sub _delete_package_rows ($db, $id) {
+  $db->query('delete from bot_reports where package = ?',        $id);
+  $db->query('delete from emails where package = ?',             $id);
+  $db->query('delete from urls where package = ?',               $id);
+  $db->query('delete from copyrights where package = ?',         $id);
+  $db->query('delete from package_components where package = ?', $id);
+  $db->query('delete from pattern_matches where package = ?',    $id);
+  $db->query('delete from matched_files where package = ?',      $id);
 }
 
-# Does the glob match at least one of the package's matched (reported) files? A glob only reduces
-# noise if it covers files that actually appear in the report, and matched_files is a small,
-# bounded set - so this check stays cheap even for packages with millions of files on disk, and
-# it uses the same filename basis that dig_report applies globs against.
+# Full teardown for an ephemeral one-off review: everything cleanup() removes, plus the bot_packages row
+# itself and its private bot_sources row, so it leaves as little trace as possible. The shared content-hash
+# dictionaries (snippets, report_checksums) are deliberately left alone: snippets keeps its cross-package
+# learning with the origin back-reference nulled (ON DELETE SET NULL), and report_checksums has no
+# per-package key. Deletes run parents-last because these FKs are NOT NULL without ON DELETE CASCADE.
+sub purge ($self, $id, $job_id) {
+  my $db  = $self->pg->db;
+  my $log = $self->log;
+
+  return unless my $guard = $self->claim_guard($id, $job_id);
+
+  my $pkg = $db->select('bot_packages', ['name', 'checkout_dir', 'source', 'ephemeral'], {id => $id})->hash;
+  return if !$pkg || !$pkg->{ephemeral};
+
+  my $dir = checkout_path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir});
+  if (-d $dir) {
+    $log->info("[$id] Purging ephemeral checkout $pkg->{name}/$pkg->{checkout_dir}");
+    $dir->remove_tree;
+  }
+
+  my $tx = $db->begin;
+  _delete_package_rows($db, $id);
+  $db->query('delete from bot_requests where package = ?',         $id);
+  $db->query('delete from bot_package_products where package = ?', $id);
+  $db->query('delete from bot_packages where id = ?',              $id);
+  $db->query('delete from bot_sources where id = ?',               $pkg->{source});
+  $tx->commit;
+}
+
+# The name comes back from the database as characters, and joining a character string to a file name
+# holding raw bytes upgrades the bytes into codepoints, so the path stops naming the file on disk. Every
+# path under a checkout is built from this one, so the flag is dropped here rather than at each join.
+sub pkg_checkout_dir ($self, $id) {
+  my $pkg = $self->find($id);
+  return checkout_path($self->checkout_dir, $pkg->{name}, $pkg->{checkout_dir});
+}
+
+# Check the bounded report set rather than packages that may contain millions of files.
 sub glob_matches_report_files ($self, $id, $glob) {
   local $Text::Glob::strict_wildcard_slash = 0;
   my $regex = glob_to_regex($glob);
@@ -228,21 +348,20 @@ sub find_by_name_and_md5 ($self, $pkg, $md5) {
 
 sub flags ($self, $id, $generation = 0) {
 
-  # Only include flags that have a field in the bot_packages table
-  my @flags = qw(patent trademark export_restricted cla eula);
-  my $flags = {map { $_ => 0 } @flags};
+  # Only the license-level flags, which are the ones with a field in the bot_packages table
+  my $flags   = {map { $_ => 0 } @LICENSE_FLAGS};
+  my $columns = join ', ',   @LICENSE_FLAGS;
+  my $any     = join ' OR ', map {"lp.$_ = true"} @LICENSE_FLAGS;
 
   my $results = $self->pg->db->query(
     qq{
-      SELECT patent, trademark, export_restricted, cla, eula
+      SELECT $columns
       FROM pattern_matches pm JOIN license_patterns lp ON pm.pattern = lp.id
-      WHERE pm.package = ? AND pm.generation = ? AND pm.ignored = false
-        AND (lp.patent = true OR lp.trademark = true OR lp.export_restricted = true
-             OR lp.cla = true OR lp.eula = true)
+      WHERE pm.package = ? AND pm.generation = ? AND pm.ignored = false AND ($any)
     }, $id, $generation
   )->hashes->to_array;
   for my $result (@$results) {
-    for my $flag (@flags) {
+    for my $flag (@LICENSE_FLAGS) {
       $flags->{$flag} = 1 if $result->{$flag};
     }
   }
@@ -250,34 +369,26 @@ sub flags ($self, $id, $generation = 0) {
   return $flags;
 }
 
-# Nothing to do when the report is already on disk, and nothing to do when one is already on its way. The
-# queue itself is the record of the latter, the same way it is for every other job here: a job that fails,
-# is removed or never gets dequeued takes its own claim to the work with it. A Minion lock used to stand in
-# for that, and it outlived the job it belonged to - a build whose "analyzed" job failed left the lock
-# behind for its full two days, and for those two days the package could not be given a report at all,
-# because every attempt quietly refused to enqueue one and /spdx/<id> just kept saying "not ready".
-#
-# By default somebody is sitting in front of the download waiting for it, so it goes in at the top of the
-# ladder in Cavil::Util. The build that ends in one passes its own priority and stays in its band.
-sub generate_spdx_report ($self, $id, $options = {}) {
-  return if $self->has_spdx_report($id);
+# The queue is the deduplication record and cannot outlive the job as a lock can. Somebody is always
+# waiting for the download, so the job goes in at waiting priority.
+sub generate_documents ($self, $id) {
+  return if $self->ready_documents($id);
 
   my $minion = $self->minion;
-  return if $minion->jobs({tasks => ['spdx_report'], states => ['inactive', 'active'], notes => ["pkg_$id"]})->total;
-  $minion->enqueue('spdx_report' => [$id] => {priority => PRIORITY_WAITING, notes => {"pkg_$id" => 1}, %$options});
+  return if $minion->jobs({tasks => ['documents'], states => ['inactive', 'active'], notes => ["pkg_$id"]})->total;
+  $minion->enqueue('documents' => [$id] => {priority => PRIORITY_WAITING, notes => {"pkg_$id" => 1}});
 }
 
 sub has_file_stats ($self, $id) {
   return defined($self->pg->db->select('bot_packages', 'unpacked_files', {id => $id})->hash->{unpacked_files});
 }
 
+# Ephemeral one-off reviews are excluded from every sibling lookup below: they must not anchor or veto a
+# normal package's auto-review, and since they are fully purged their deletion must not change any decision.
 sub has_manual_review ($self, $name) {
-  return !!$self->pg->db->query('SELECT COUNT(*) FROM bot_packages WHERE name = ? AND reviewing_user IS NOT NULL',
-    $name)->array->[0];
-}
-
-sub has_spdx_report ($self, $id) {
-  return -f $self->spdx_report_path($id);
+  return !!$self->pg->db->query(
+    'SELECT COUNT(*) FROM bot_packages WHERE name = ? AND reviewing_user IS NOT NULL AND ephemeral = FALSE', $name)
+    ->array->[0];
 }
 
 sub history ($self, $name, $checksum, $id) {
@@ -285,46 +396,22 @@ sub history ($self, $name, $checksum, $id) {
     "select p.id, external_link, result, state, login,
        extract(epoch from created) as created_epoch, obsolete
      from bot_packages p left join bot_users u on p.reviewing_user = u.id
-     where name = ? and checksum = ? and p.id != ? and state != 'new'
+     where name = ? and checksum = ? and p.id != ? and state != 'new' and ephemeral = false
      order by p.id desc", $name, $checksum, $id
   )->hashes->to_array;
 }
 
 sub ignore_line ($self, $options) {
-  my $db       = $self->pg->db;
-  my $inserted = $db->query(
-    'insert into ignored_lines (hash, packname, owner, contributor) values (?, ?, ?, ?)
-     on conflict do nothing returning id', $options->{hash}, $options->{package}, $options->{owner},
-    $options->{contributor}
-  )->hash;
-  my $ignore_id
-    = $inserted
-    ? $inserted->{id}
-    : $db->select('ignored_lines', 'id', {hash => $options->{hash}, packname => $options->{package}})->hash->{id};
-
-  # A new ignored_lines row does not change file contents or pattern definitions, so a full reindex is
-  # unnecessary. No generation predicate: pm.file = fs.file pins both sides to the same generation anyway,
-  # and a reindex building right now should carry the ignore into the report it is about to promote.
+  my $db = $self->pg->db;
   $db->query(
-    'update pattern_matches pm
-       set ignored = true, ignored_line = ?
-       from file_snippets fs, snippets s, bot_packages bp
-       where pm.file = fs.file
-         and pm.package = fs.package
-         and fs.snippet = s.id
-         and pm.package = bp.id
-         and s.hash = ?
-         and bp.name = ?
-         and bp.obsolete = false
-         and bp.indexed is not null
-         and pm.sline <= fs.eline
-         and pm.eline >= fs.sline
-         and pm.ignored = false', $ignore_id, $options->{hash}, $options->{package}
-  );
+    'insert into ignored_lines (hash, packname, owner, contributor) values (?, ?, ?, ?) on conflict do nothing',
+    $options->{hash}, $options->{package}, $options->{owner}, $options->{contributor});
 
-  my $ids = $db->select('bot_packages', 'id', {name => $options->{package}, obsolete => 0, indexed => {'!=' => undef}})
+  # Suppression is applied at index time (see Cavil::FileIndexer), so every package sharing this name must
+  # be reindexed. The ids are returned rather than reindexed here so a batch of decisions reindexes each
+  # package once, at the priority the reviewer's own report deserves (Cavil::Controller::Snippet).
+  return $db->select('bot_packages', 'id', {name => $options->{package}, obsolete => 0, indexed => {'!=' => undef}})
     ->arrays->flatten->to_array;
-  $self->analyze($_) for @$ids;
 }
 
 sub remove_ignored_line ($self, $id, $user) {
@@ -366,28 +453,69 @@ sub is_indexed  ($self, @args) { $self->_check_field('indexed',  @args) }
 sub is_obsolete ($self, @args) { $self->_check_field('obsolete', @args) }
 sub is_unpacked ($self, @args) { $self->_check_field('unpacked', @args) }
 
+# Iteration number for the next SBOM of this package. The SBOM URI is derived from the package id and so
+# stays the same every time the report is rebuilt - a reindex, a reclassified snippet or an edited pattern
+# all change what the report says without changing what it is called. The counter is what lets a recipient
+# tell two iterations apart. It counts generations rather than content changes, so a rebuild that happens
+# to produce an identical report still advances it; comparing two reports to avoid that is not worth it.
+sub next_sbom_version ($self, $id) {
+  return $self->pg->db->query(
+    'UPDATE bot_packages SET sbom_version = sbom_version + 1 WHERE id = ? RETURNING sbom_version', $id)
+    ->hash->{sbom_version};
+}
+
 sub old_reviews ($self, $pkg) {
   return $self->pg->db->select(
     'bot_packages',
     'id,checksum',
     {
-      name     => $pkg->{name},
-      state    => [qw(acceptable acceptable_by_lawyer)],
-      id       => {'!=' => $pkg->{id}},
-      obsolete => 0,
-      indexed  => {'!=' => undef}
+      name      => $pkg->{name},
+      state     => [qw(acceptable acceptable_by_lawyer)],
+      id        => {'!=' => $pkg->{id}},
+      obsolete  => 0,
+      ephemeral => 0,
+      indexed   => {'!=' => undef}
     },
     {-desc => 'id'}
   )->hashes->to_array;
 }
 
+# Reviews a note applies to, or that none applies to, optionally narrowed to one tag (how the agent
+# asks for what it has not annotated yet). Empty unless asked for, so a listing that does not filter
+# on notes keeps the plan it has today.
+#
+# Resolve the annotated ids first and match on those; correlating the relevance predicate with each
+# candidate row instead costs 300ms on the production docket, because the planner then re-evaluates
+# it once per (review, note) pair. IN is safe, the subquery yields a primary key.
+sub _annotated_filter ($db, $options) {
+  return '' if ($options->{notes} // 'any') eq 'any';
+
+  my $not    = $options->{notes} eq 'without'  ? 'NOT'                                  : '';
+  my $tag    = $options->{notes_tag}           ? $db->dbh->quote($options->{notes_tag}) : '';
+  my $lawyer = $options->{include_lawyer_only} ? ''                                     : 'AND c.lawyer_only = false';
+
+  return "AND id $not IN (SELECT p.id FROM bot_packages p
+                            JOIN package_notes c ON c.package_name = p.name
+                            LEFT JOIN bot_packages np ON c.package = np.id
+                           WHERE "
+    . relevance_predicate('p') . " $lawyer" . ($tag ? " AND c.tags @> ARRAY[$tag]::text[]" : '') . ')';
+}
+
 sub paginate_open_reviews ($self, $options) {
   my $db = $self->pg->db;
 
+  my ($quals, $text) = parse_list_filter($options->{search}, ['tag']);
+
   my $search = '';
-  if (length($options->{search}) > 0) {
-    my $quoted = $db->dbh->quote("\%$options->{search}\%");
+  if (length($text) > 0) {
+    my $quoted = $db->dbh->quote("\%$text\%");
     $search = "AND (checksum ILIKE $quoted OR external_link ILIKE $quoted OR name ILIKE $quoted)";
+  }
+
+  my $tag = '';
+  if (defined(my $v = $quals->{tag})) {
+    my $quoted = $db->dbh->quote($v);
+    $tag = "AND EXISTS (SELECT 1 FROM unnest(tags) t WHERE t ILIKE $quoted)";
   }
 
   my $priority = '';
@@ -406,13 +534,15 @@ sub paginate_open_reviews ($self, $options) {
     $embargoed = 'AND embargoed = false';
   }
 
+  my $notes = _annotated_filter($db, $options);
+
   my $results = $db->query(
     qq{
       SELECT id, name, EXTRACT(EPOCH FROM created) as created_epoch, EXTRACT(EPOCH FROM imported) as imported_epoch,
         EXTRACT(EPOCH FROM unpacked) as unpacked_epoch, EXTRACT(EPOCH FROM indexed) as indexed_epoch, external_link,
-        priority, state, checksum, unresolved_matches, COUNT(*) OVER() AS total
+        priority, state, checksum, unresolved_matches, tags, COUNT(*) OVER() AS total
       FROM bot_packages
-      WHERE state = 'new' AND obsolete = FALSE $priority $search $progress $embargoed
+      WHERE state = 'new' AND obsolete = FALSE AND ephemeral = FALSE $priority $search $tag $progress $embargoed $notes
       ORDER BY priority DESC, external_link, unresolved_matches, name
       LIMIT ? OFFSET ?
     }, $options->{limit}, $options->{offset}
@@ -424,7 +554,12 @@ sub paginate_open_reviews ($self, $options) {
 sub paginate_product_reviews ($self, $name, $options) {
   my $db = $self->pg->db;
 
-  return paginate([], $options) unless my $product = $db->select('bot_products', 'id', {name => $name})->hash;
+  # A name resolves either to a single codestream (bot_products.name) or to a curated product group (the
+  # bot_products.product annotation shared by several codestreams). Collect every matching product id so
+  # one query serves both cases; an unknown name yields an empty page
+  my $product_ids
+    = $db->query('SELECT id FROM bot_products WHERE name = ? OR product = ?', $name, $name)->arrays->flatten->to_array;
+  return paginate([], $options) unless @$product_ids;
 
   my $attention = '';
   if ($options->{attention} eq 'true') {
@@ -467,17 +602,19 @@ sub paginate_product_reviews ($self, $name, $options) {
     $eula = 'AND eula = true';
   }
 
+  my $notes = _annotated_filter($db, $options);
+
   my $results = $db->query(
     qq{
       SELECT bot_packages.name, bot_packages.id, EXTRACT(EPOCH FROM imported) as imported_epoch,
         EXTRACT(EPOCH FROM unpacked) as unpacked_epoch, EXTRACT(EPOCH FROM indexed) as indexed_epoch, state,
         checksum, unresolved_matches, COUNT(*) OVER() AS total
-      FROM bot_package_products JOIN bot_packages ON (bot_packages.id = bot_package_products.package)
-      WHERE bot_package_products.product = ? $search $attention $unresolved $patent $trademark $export_restricted
-        $cla $eula
+      FROM bot_packages
+      WHERE bot_packages.id IN (SELECT package FROM bot_package_products WHERE product = ANY(?))
+        $search $attention $unresolved $patent $trademark $export_restricted $cla $eula $notes
       ORDER BY bot_packages.id DESC
       LIMIT ? OFFSET ?
-    }, $product->{id}, $options->{limit}, $options->{offset}
+    }, $product_ids, $options->{limit}, $options->{offset}
   )->hashes->to_array;
 
   return paginate($results, $options);
@@ -486,9 +623,11 @@ sub paginate_product_reviews ($self, $name, $options) {
 sub paginate_recent_reviews ($self, $options) {
   my $db = $self->pg->db;
 
+  my ($quals, $text) = parse_list_filter($options->{search}, ['tag']);
+
   my $search = '';
-  if (length($options->{search}) > 0) {
-    my $quoted = $db->dbh->quote("\%$options->{search}\%");
+  if (length($text) > 0) {
+    my $quoted = $db->dbh->quote("\%$text\%");
     $search = "
       AND (
         p.checksum ILIKE $quoted
@@ -497,6 +636,12 @@ sub paginate_recent_reviews ($self, $options) {
         OR p.state::text ILIKE $quoted
         OR p.result ILIKE $quoted
       )";
+  }
+
+  my $tag = '';
+  if (defined(my $v = $quals->{tag})) {
+    my $quoted = $db->dbh->quote($v);
+    $tag = "AND EXISTS (SELECT 1 FROM unnest(p.tags) t WHERE t ILIKE $quoted)";
   }
 
   my $user = '';
@@ -519,11 +664,46 @@ sub paginate_recent_reviews ($self, $options) {
       SELECT p.id, p.name, u.login, p.result, p.ai_assisted, EXTRACT(EPOCH FROM p.created) AS created_epoch,
         EXTRACT(EPOCH FROM p.reviewed) AS reviewed_epoch, EXTRACT(EPOCH FROM p.imported) as imported_epoch,
         EXTRACT(EPOCH FROM p.unpacked) as unpacked_epoch, EXTRACT(EPOCH FROM p.indexed) as indexed_epoch,
-        external_link, priority, state, checksum, unresolved_matches, COUNT(*) OVER() AS total
+        external_link, priority, state, checksum, unresolved_matches, p.tags, COUNT(*) OVER() AS total
        FROM bot_packages p
          LEFT JOIN bot_users u ON p.reviewing_user = u.id
-       WHERE reviewed IS NOT NULL AND reviewed > NOW() - INTERVAL '90 DAYS' $search $user $ai_assisted $unresolved
+       WHERE reviewed IS NOT NULL AND reviewed > NOW() - INTERVAL '90 DAYS' AND p.ephemeral = FALSE
+         $search $tag $user $ai_assisted $unresolved
        ORDER BY reviewed DESC
+       LIMIT ? OFFSET ?
+    }, $options->{limit}, $options->{offset}
+  )->hashes->to_array;
+
+  return paginate($results, $options);
+}
+
+# Every currently-active ephemeral review, in any state (they run the full pipeline and auto-review, so the
+# set spans new/acceptable/acceptable_by_lawyer/unacceptable). login is the uploader, not a reviewer.
+sub paginate_ephemeral_reviews ($self, $options) {
+  my $db = $self->pg->db;
+
+  my $search = '';
+  if (length($options->{search}) > 0) {
+    my $quoted = $db->dbh->quote("\%$options->{search}\%");
+    $search = "
+      AND (
+        p.checksum ILIKE $quoted
+        OR p.external_link ILIKE $quoted
+        OR p.name ILIKE $quoted
+        OR p.state::text ILIKE $quoted
+      )";
+  }
+
+  my $results = $db->query(
+    qq{
+      SELECT p.id, p.name, u.login, EXTRACT(EPOCH FROM p.created) AS created_epoch,
+        EXTRACT(EPOCH FROM p.imported) as imported_epoch, EXTRACT(EPOCH FROM p.unpacked) as unpacked_epoch,
+        EXTRACT(EPOCH FROM p.indexed) as indexed_epoch, external_link, priority, state, checksum,
+        unresolved_matches, COUNT(*) OVER() AS total
+       FROM bot_packages p
+         LEFT JOIN bot_users u ON p.requesting_user = u.id
+       WHERE p.ephemeral = TRUE $search
+       ORDER BY p.created DESC
        LIMIT ? OFFSET ?
     }, $options->{limit}, $options->{offset}
   )->hashes->to_array;
@@ -586,7 +766,8 @@ sub paginate_review_search ($self, $name, $options) {
         EXTRACT(EPOCH FROM p.unpacked) AS unpacked_epoch, EXTRACT(EPOCH FROM p.indexed) AS indexed_epoch,
         u.login AS user,  unresolved_matches, COUNT(*) OVER() AS total
       FROM bot_packages p LEFT JOIN bot_users u ON p.reviewing_user = u.id
-      WHERE (name = \$1 OR \$1 IS NULL) AND (p.id = ANY (\$2) OR \$2 IS NULL) $search $obsolete $embargoed
+      WHERE (name = \$1 OR \$1 IS NULL) AND (p.id = ANY (\$2) OR \$2 IS NULL) AND p.ephemeral = FALSE
+        $search $obsolete $embargoed
       ORDER BY id DESC
       LIMIT \$3 OFFSET \$4
     }, $name || undef, $packages, $options->{limit}, $options->{offset}
@@ -640,7 +821,7 @@ sub export_components ($self, $cb) {
         JOIN bot_packages p                ON p.id = pc.package
         LEFT JOIN bot_package_products pp   ON pp.package = p.id
         LEFT JOIN bot_products prod         ON prod.id = pp.product
-       WHERE pc.generation = 0 AND p.embargoed = FALSE AND p.obsolete = FALSE
+       WHERE pc.generation = 0 AND p.embargoed = FALSE AND p.obsolete = FALSE AND p.ephemeral = FALSE
        ORDER BY p.id, pc.name, pc.version
   }
   );
@@ -665,6 +846,12 @@ sub need_cleanup ($self) {
     ->arrays->flatten->to_array;
 }
 
+sub need_ephemeral_cleanup ($self, $hours) {
+  return $self->pg->db->query(
+    "SELECT id FROM bot_packages WHERE ephemeral IS TRUE AND created < NOW() - (INTERVAL '1 hour' * ?) ORDER BY id",
+    $hours)->arrays->flatten->to_array;
+}
+
 # Every package that is not in a clean, settled state as far as reindexing goes: one with rows from a
 # report build that is not the live report, one still claimed by a job or stuck at a rebuild stage (a
 # failed unpack leaves that behind), or one with a reindex request waiting to be picked up. Driven by
@@ -674,6 +861,7 @@ sub unsettled_builds ($self) {
     'SELECT DISTINCT package FROM matched_files      WHERE generation <> 0
       UNION SELECT DISTINCT package FROM urls               WHERE generation <> 0
       UNION SELECT DISTINCT package FROM emails             WHERE generation <> 0
+      UNION SELECT DISTINCT package FROM copyrights         WHERE generation <> 0
       UNION SELECT DISTINCT package FROM package_components WHERE generation <> 0
       UNION SELECT id FROM bot_packages
               WHERE processing_job IS NOT NULL OR index_stage IS NOT NULL OR reindex_requested IS NOT NULL'
@@ -697,8 +885,13 @@ sub discard_builds ($self, $id, $owner) {
 
   # matched_files last: pattern_matches and file_snippets cascade from it
   my $deleted = 0;
-  $deleted += $db->query("DELETE FROM $_ WHERE package = ? AND generation <> 0", $id)->rows
-    for qw(package_components urls emails matched_files);
+  for my $table (qw(package_components urls emails copyrights matched_files)) {
+
+    # A statement that matched nothing answers -1 here, not 0, so a table with no rows of this build
+    # would subtract one from the count of the tables that did have some
+    my $rows = $db->query("DELETE FROM $table WHERE package = ? AND generation <> 0", $id)->rows;
+    $deleted += $rows if $rows > 0;
+  }
   $tx->commit;
 
   return $deleted;
@@ -765,7 +958,7 @@ sub obsolete_duplicate_new ($self) {
   $db->query(
     q{
       UPDATE bot_packages
-      SET obsolete = true, state = 'obsolete'
+      SET obsolete = true
       WHERE id IN (
         SELECT a.id FROM (
           SELECT id, ROW_NUMBER() OVER (PARTITION BY external_link, name ORDER BY id DESC) row_no
@@ -778,16 +971,18 @@ sub obsolete_duplicate_new ($self) {
   );
 }
 
-sub obsolete_if_not_in_product ($self, $id) {
-  my $db = $self->pg->db;
-  return undef if $db->query('select 1 from bot_package_products where package = ? limit 1', $id)->array;
+sub obsolete_if_unused ($self, $id) {
 
   # Only set the obsolete flag, never overwrite the state. The state is the audit
   # trail of the last real review decision (e.g. a lawyer's "unacceptable"); the
   # boolean flag is what everything else uses to tell that a record is retired.
-  $db->query(q{update bot_packages set obsolete = true where id = ? and state in ('new', 'unacceptable')}, $id);
-
-  return 1;
+  # A package shared by requests from several bots stays live until the last one is gone.
+  $self->pg->db->query(
+    q{UPDATE bot_packages SET obsolete = true
+      WHERE id = ? AND state IN ('new', 'unacceptable')
+        AND NOT EXISTS (SELECT 1 FROM bot_package_products WHERE package = bot_packages.id)
+        AND NOT EXISTS (SELECT 1 FROM bot_requests WHERE package = bot_packages.id)}, $id
+  );
 }
 
 sub obsolete_old_packages ($self, $days_to_keep_orphaned, $days_to_keep_orphaned_duplicates) {
@@ -914,43 +1109,63 @@ sub reindex_package_ids ($self, $ids, $priority = PRIORITY_UPKEEP) {
   $minion->enqueue('index_later', [$_], {priority => $priority - 1}) for @$ids;
 }
 
-sub remove_spdx_report ($self, $id) {
+sub remove_documents ($self, $id) {
   my $dir = $self->pkg_checkout_dir($id);
+  $dir->child($_->{file})->remove for @{DOCUMENTS()};
 
-  # Remove the current report and its processed variant, plus legacy reports left behind by older Cavil
-  # versions (uncompressed JSON, and pre-3.0.1 non-JSON tag-value)
+  # Legacy reports left behind by older Cavil versions (a processed variant, uncompressed JSON, and
+  # pre-3.0.1 non-JSON tag-value)
   $dir->child($_)->remove for qw(
-    .report.spdx.json.gz .report.processed.spdx.json.gz
-    .report.spdx.json    .report.processed.spdx.json
-    .report.spdx         .report.processed.spdx
+    .report.processed.spdx.json.gz
+    .report.spdx.json .report.processed.spdx.json
+    .report.spdx      .report.processed.spdx
   );
 }
 
+# Autocomplete suggestions for the tag editor. Machine-added CVE-... tags are excluded (near-unique, they
+# would swamp the list and nobody types them by hand) and the result is capped, so this stays small no
+# matter how many CVEs accumulate.
+sub all_tags ($self) {
+  return $self->pg->db->query(
+    q{SELECT tag, COUNT(*)::int AS count FROM (SELECT unnest(tags) AS tag FROM bot_packages) t
+      WHERE tag !~* '^CVE(-|$)' GROUP BY tag ORDER BY count DESC, tag LIMIT 100}
+  )->hashes->to_array;
+}
+
+sub resolve_targets ($self, $id) {
+  my $minion = $self->minion;
+
+  # Deduplicate on its own note, not "pkg_$id": this light lookup must not count among a package's active
+  # build jobs (the listing spinner) or block anything.
+  return undef if $minion->jobs({tasks => ['resolve_targets'], states => ['inactive'], notes => ["target_$id"]})->next;
+  return $minion->enqueue('resolve_targets' => [$id] => {priority => PRIORITY_UPKEEP, notes => {"target_$id" => 1}});
+}
+
+sub add_tags ($self, $id, $tags) {
+  return unless @$tags;
+  my $db       = $self->pg->db;
+  my $existing = $db->select('bot_packages', ['tags'], {id => $id})->hash->{tags} // [];
+  my %seen;
+  my @merged = grep { !$seen{$_}++ } @$existing, @$tags;
+  $db->query('UPDATE bot_packages SET tags = ? WHERE id = ?', \@merged, $id);
+}
+
+sub set_tags ($self, $id, $tags) {
+  $self->pg->db->query('UPDATE bot_packages SET tags = ? WHERE id = ?', $tags, $id);
+}
+
 sub requests_for ($self, $id) {
-  return $self->pg->db->query('SELECT external_link FROM bot_requests WHERE package = ? ORDER BY id DESC', $id)
-    ->arrays->flatten->to_array;
+  return $self->pg->db->query('SELECT external_link, target FROM bot_requests WHERE package = ? ORDER BY id DESC', $id)
+    ->hashes->to_array;
 }
 
-sub spdx_report_path ($self, $id) {
-  return $self->pkg_checkout_dir($id)->child('.report.spdx.json.gz');
-}
-
-# Size of the file a download of the report actually produces, which is the uncompressed one - the report
-# is stored gzipped and handed to the browser that way, but what lands on disk is the JSON. Gzip records
-# that in the last four bytes of the file, so it costs a seek rather than a decompression.
-sub spdx_report_size ($self, $id) {
-  my $path = $self->spdx_report_path($id);
-  return undef unless my $compressed = -s $path;
-
-  # ISIZE is the uncompressed size modulo 2^32, so it is only the answer while the report cannot have been
-  # bigger than that. JSON gzips by roughly ten to one, leaving this bound with room to spare; above it we
-  # would rather say nothing than name a size that has silently wrapped
-  return undef if $compressed > 256 * 1024 * 1024;
-
-  open my $fh, '<:raw', $path or return undef;
-  seek $fh, -4, 2 or return undef;
-  read($fh, my $isize, 4) == 4 or return undef;
-  return unpack 'V', $isize;
+# An acceptance under limitations only covers the requests it was made for, a new one needs a human decision again
+sub rereview_limited ($self, $id) {
+  $self->_enqueue('analyzed', $id) if $self->pg->db->query(
+    q{UPDATE bot_packages p SET state = 'new'
+      WHERE id = ? AND state IN ('acceptable', 'acceptable_by_lawyer')
+        AND EXISTS (SELECT 1 FROM package_notes WHERE package_name = p.name AND limitation)}, $id
+  )->rows;
 }
 
 sub states ($self, $name) {
@@ -965,11 +1180,11 @@ sub stats {
 
   my $stats = $self->pg->db->query(
     "SELECT
-       (SELECT COUNT(*) FROM bot_packages WHERE obsolete = false) AS active_packages,
-       (SELECT COUNT(*) FROM bot_packages WHERE obsolete = false AND embargoed = true) AS embargoed_packages,
-       (SELECT COUNT(*) FROM bot_packages WHERE obsolete = false AND state = 'unacceptable') AS rejected_packages,
-       (SELECT COUNT(*) FROM bot_packages WHERE obsolete = false AND state = 'new') AS open_reviews,
-      (SELECT COALESCE(SUM(unresolved_matches), 0) FROM bot_packages WHERE obsolete = false) AS unresolved_matches,
+       (SELECT COUNT(*) FROM bot_packages WHERE obsolete = false AND ephemeral = false) AS active_packages,
+       (SELECT COUNT(*) FROM bot_packages WHERE obsolete = false AND ephemeral = false AND embargoed = true) AS embargoed_packages,
+       (SELECT COUNT(*) FROM bot_packages WHERE obsolete = false AND ephemeral = false AND state = 'unacceptable') AS rejected_packages,
+       (SELECT COUNT(*) FROM bot_packages WHERE obsolete = false AND ephemeral = false AND state = 'new') AS open_reviews,
+      (SELECT COALESCE(SUM(unresolved_matches), 0) FROM bot_packages WHERE obsolete = false AND ephemeral = false) AS unresolved_matches,
        overall_reviews.performed AS performed_reviews,
        overall_reviews.manual AS manual_reviews,
        overall_reviews.automated AS automated_reviews,
@@ -1039,7 +1254,7 @@ sub unpacked ($self, $id) {
 sub update ($self, $pkg) {
   my %updates = map { exists $pkg->{$_} ? ($_ => $pkg->{$_}) : () } (
     qw(created checksum priority state obsolete result notice diff_report reviewed reviewing_user external_link),
-    qw(embargoed ai_assisted)
+    qw(embargoed target ai_assisted)
   );
   $updates{reviewed} = \'now()' if $pkg->{review_timestamp};
   return $self->pg->db->update('bot_packages', \%updates, {id => $pkg->{id}});

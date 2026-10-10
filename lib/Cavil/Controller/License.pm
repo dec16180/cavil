@@ -1,23 +1,12 @@
-# Copyright (C) 2018 SUSE Linux GmbH
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 package Cavil::Controller::License;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
 
-use Cavil::Licenses qw(lic);
-use Cavil::Util     qw(spdx_link);
+use Cavil::Licenses   qw(lic);
+use Cavil::ReportUtil qw(license_classification);
+use Cavil::Util       qw(license_text spdx_link @PATTERN_FLAGS);
 
 sub create_pattern ($self) {
   my $validation = $self->validation;
@@ -25,34 +14,34 @@ sub create_pattern ($self) {
   $validation->optional('license');
   $validation->optional('packname');
   $validation->optional('risk')->num;
-  $validation->optional('patent');
-  $validation->optional('trademark');
-  $validation->optional('export_restricted');
-  $validation->optional('cla');
-  $validation->optional('eula');
+  $validation->optional($_) for @PATTERN_FLAGS;
   return $self->reply->json_validation_error if $validation->has_error;
 
   my $pattern = $validation->param('pattern');
 
   my $patterns = $self->patterns;
   my $match    = $patterns->create(
-    license           => $validation->param('license'),
-    packname          => $validation->param('packname'),
-    pattern           => $pattern,
-    risk              => $validation->param('risk'),
-    patent            => $validation->param('patent'),
-    trademark         => $validation->param('trademark'),
-    export_restricted => $validation->param('export_restricted'),
-    cla               => $validation->param('cla'),
-    eula              => $validation->param('eula')
+    license  => $validation->param('license'),
+    packname => $validation->param('packname'),
+    pattern  => $pattern,
+    risk     => $validation->param('risk'),
+    (map { $_ => $validation->param($_) } @PATTERN_FLAGS)
   );
 
+  if (my $error = $match->{error}) {
+    $self->flash(danger => $error);
+    return $self->redirect_to('new_pattern');
+  }
   if ($match->{conflict}) {
     $self->flash(danger => 'Conflicting license pattern already exists.');
     return $self->redirect_to('new_pattern');
   }
   $self->flash(success => 'Pattern has been created.');
   $self->redirect_to('edit_pattern', id => $match->{id});
+}
+
+sub autocomplete ($self) {
+  $self->render(json => $self->patterns->autocomplete);
 }
 
 sub edit_pattern ($self) {
@@ -109,17 +98,7 @@ sub new_pattern ($self) {
   my $lname = $validation->param('license-name');
   $self->render(
     template => 'license/edit_pattern',
-    match    => {
-      license           => $lname,
-      pattern           => '',
-      risk              => 0,
-      patent            => 0,
-      trademark         => 0,
-      export_restricted => 0,
-      cla               => 0,
-      eula              => 0,
-      packname          => ''
-    }
+    match    => {license => $lname, pattern => '', risk => 0, packname => '', (map { $_ => 0 } @PATTERN_FLAGS)}
   );
 }
 
@@ -133,7 +112,7 @@ sub proposal_stats ($self) {
 
 sub proposed_meta ($self) {
   my $v = $self->validation;
-  $v->optional('action')->in('missing_license', 'create_pattern', 'create_ignore', 'create_glob');
+  $v->optional('action')->in('missing_license', 'new_license', 'create_pattern', 'create_ignore', 'create_glob');
   $v->optional('before')->num;
   $v->optional('filter');
   return $self->reply->json_validation_error if $v->has_error;
@@ -142,6 +121,11 @@ sub proposed_meta ($self) {
   my $search  = $v->param('filter') // '';
 
   my $changes = $self->patterns->proposed_changes({actions => $actions, before => $before, search => $search});
+
+  for my $change (@{$changes->{changes}}) {
+    (my $reason = $change->{data}{reason} // '') =~ s/^AI Assistant:\s*//;
+    $change->{reason_html} = $self->markdown_to_safe_html($reason);
+  }
 
   $self->render(json => {changes => $changes->{changes}, total => $changes->{total}});
 }
@@ -170,8 +154,6 @@ sub recent_meta ($self) {
 sub remove_pattern ($self) {
   my $id = $self->stash('id');
 
-  # Delete the pattern first (this captures the affected packages and expires the caches
-  # atomically), then reindex those packages once the pattern can no longer be matched
   my $packages = $self->patterns->remove($id);
   $self->packages->reindex_package_ids($packages);
 
@@ -186,8 +168,29 @@ sub remove_proposal ($self) {
   my $is_owner   = $patterns->is_proposal_owner($checksum, $self->current_user);
   return $self->render('permissions', status => 403) unless $is_owner || $can_curate;
 
-  my $removed = $patterns->remove_proposal($checksum);
-  $self->render(json => {removed => $removed ? 1 : 0});
+  my $proposal = $patterns->proposal_by_checksum($checksum);
+  my $removed  = $patterns->remove_proposal($checksum);
+
+  my $fallback;
+  if ($removed && $proposal && $proposal->{action} eq 'new_license') {
+    $fallback = $patterns->report_for_snippet($proposal->{data}{snippet});
+  }
+
+  $self->render(json => {removed => $removed ? 1 : 0, fallback => $fallback});
+}
+
+# A query parameter, not a path segment: one production license is called "SLED/SLES EULA"
+sub text_meta ($self) {
+  my $license = $self->param('license') // '';
+  return $self->reply->not_found unless length $license;
+
+  # Same order every document resolves in, so the viewer cannot show terms a NOTICE would not reproduce
+  my $text = license_text($license) // $self->patterns->full_license_texts([$license])->{$license};
+  return $self->reply->not_found unless defined $text;
+
+  # An exception id, and any license without one, classifies as neither and renders without chips
+  my $about = license_classification($license)->[0] // {};
+  $self->render(json => {license => $license, text => $text, about => $about});
 }
 
 sub show ($self) {
@@ -202,11 +205,7 @@ sub update_pattern ($self) {
   $validation->optional('license');
   $validation->optional('packname');
   $validation->optional('risk')->num;
-  $validation->optional('patent');
-  $validation->optional('trademark');
-  $validation->optional('export_restricted');
-  $validation->optional('cla');
-  $validation->optional('eula');
+  $validation->optional($_) for @PATTERN_FLAGS;
   return $self->reply->json_validation_error if $validation->has_error;
 
   my $id       = $self->stash('id');
@@ -217,17 +216,17 @@ sub update_pattern ($self) {
   # expire old license pattern
   my $result = $patterns->update(
     $id,
-    packname          => $validation->param('packname'),
-    pattern           => $pattern,
-    license           => $validation->param('license'),
-    patent            => $validation->param('patent'),
-    trademark         => $validation->param('trademark'),
-    export_restricted => $validation->param('export_restricted'),
-    cla               => $validation->param('cla'),
-    eula              => $validation->param('eula'),
-    risk              => $validation->param('risk'),
-    owner             => $owner_id
+    packname => $validation->param('packname'),
+    pattern  => $pattern,
+    license  => $validation->param('license'),
+    (map { $_ => $validation->param($_) } @PATTERN_FLAGS),
+    risk  => $validation->param('risk'),
+    owner => $owner_id
   );
+  if (my $error = $result->{error}) {
+    $self->flash(danger => $error);
+    return $self->redirect_to('edit_pattern', id => $id);
+  }
   if ($result->{conflict}) {
     $self->flash(danger => 'Conflicting license pattern already exists.');
     return $self->redirect_to('edit_pattern', id => $id);
@@ -244,11 +243,7 @@ sub update_pattern_json ($self) {
   $validation->optional('license');
   $validation->optional('packname');
   $validation->optional('risk')->num;
-  $validation->optional('patent');
-  $validation->optional('trademark');
-  $validation->optional('export_restricted');
-  $validation->optional('cla');
-  $validation->optional('eula');
+  $validation->optional($_) for @PATTERN_FLAGS;
   return $self->reply->json_validation_error if $validation->has_error;
 
   my $id       = $self->stash('id');
@@ -258,17 +253,14 @@ sub update_pattern_json ($self) {
 
   my $result = $patterns->update(
     $id,
-    packname          => $validation->param('packname'),
-    pattern           => $pattern,
-    license           => $validation->param('license'),
-    patent            => $validation->param('patent'),
-    trademark         => $validation->param('trademark'),
-    export_restricted => $validation->param('export_restricted'),
-    cla               => $validation->param('cla'),
-    eula              => $validation->param('eula'),
-    risk              => $validation->param('risk'),
-    owner             => $owner_id
+    packname => $validation->param('packname'),
+    pattern  => $pattern,
+    license  => $validation->param('license'),
+    (map { $_ => $validation->param($_) } @PATTERN_FLAGS),
+    risk  => $validation->param('risk'),
+    owner => $owner_id
   );
+  return $self->render(json => {error => $result->{error}}, status => 400) if $result->{error};
   return $self->render(json => {error => 'Conflicting license pattern already exists.'}, status => 409)
     if $result->{conflict};
 
@@ -304,12 +296,20 @@ sub update_patterns ($self) {
 sub update_patterns_json ($self) {
   my $validation = $self->validation;
   $validation->required('license');
+  $validation->optional('new_license');
+  $validation->optional('risk')->num(0, 9);
   $validation->optional('spdx');
   return $self->reply->json_validation_error if $validation->has_error;
 
   my $license = $validation->param('license');
-  my $spdx    = $validation->param('spdx') // '';
-  my $l       = lic($spdx);
+
+  # The empty-license bucket is keyword/no-license patterns that seed unresolved snippets; a bulk rename
+  # would silently turn those markers into real license assertions, so it is never allowed here.
+  return $self->render(json => {error => 'Cannot bulk-edit patterns without a license.'}, status => 400)
+    if $license eq '';
+
+  my $spdx = $validation->param('spdx') // '';
+  my $l    = lic($spdx);
   return $self->render(
     json => {
       error =>
@@ -317,10 +317,40 @@ sub update_patterns_json ($self) {
     },
     status => 400
   ) unless $l->is_valid;
-
   my $canon = $l->to_string;
-  my $rows  = $self->pg->db->query('UPDATE license_patterns SET spdx = ? WHERE license = ?', $canon, $license)->rows;
-  $self->render(json => {updated => $rows, spdx => $canon, spdx_html => spdx_link($canon)});
+
+  # new_license absent (or empty) means "keep the name"; risk absent (or empty) means "keep each pattern's
+  # own risk", so a rename or an spdx change need not flatten mixed risks.
+  my $new_license = $validation->param('new_license');
+  $new_license = $license unless defined $new_license && length $new_license;
+  my $risk = $validation->param('risk');
+  $risk = undef unless defined $risk && length $risk;
+
+  my $patterns = $self->patterns;
+  my $result   = $patterns->update_license_meta($license, license => $new_license, risk => $risk, spdx => $canon);
+
+  # Rebuild the cached reports of every package matched by the destination license (renamed rows plus any
+  # pre-existing rows merged into it, whose spdx may have changed) so the new risk/name/spdx take effect.
+  # Every generation, not just the live one, mirroring reindex_matched_packages: a package whose in-flight
+  # build matched needs the reindex too.
+  my $packages = [
+    map { $_->{package} } $self->pg->db->query(
+      'SELECT DISTINCT pm.package FROM pattern_matches pm JOIN license_patterns lp ON lp.id = pm.pattern
+       WHERE lp.license = ?', $new_license
+    )->hashes->each
+  ];
+  $self->packages->reindex_package_ids($packages);
+
+  $self->render(
+    json => {
+      updated   => $result->{updated},
+      license   => $new_license,
+      renamed   => ($new_license ne $license) ? \1 : \0,
+      risk      => $risk,
+      spdx      => $canon,
+      spdx_html => spdx_link($canon)
+    }
+  );
 }
 
 1;

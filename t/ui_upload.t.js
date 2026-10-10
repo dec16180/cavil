@@ -22,6 +22,12 @@ t.test('Cavil UI - tarball upload', skipUnlessOnline, async t => {
       t.equal(await page.innerText('title'), 'Upload archive');
       await page.waitForSelector('.upload-dropzone');
       t.equal(await page.locator('#upload-button').isDisabled(), true, 'upload disabled until a file is chosen');
+
+      // The ephemeral one-off option is present, off by default, and toggles.
+      t.equal(await page.locator('#upload-ephemeral').isChecked(), false, 'ephemeral is off by default');
+      await page.check('#upload-ephemeral');
+      t.equal(await page.locator('#upload-ephemeral').isChecked(), true, 'ephemeral can be toggled on');
+      await page.uncheck('#upload-ephemeral');
     });
 
     await t.test('Selecting an archive prefills the name from the filename', async t => {
@@ -60,6 +66,51 @@ t.test('Cavil UI - tarball upload', skipUnlessOnline, async t => {
 
       // No declared license metadata, so the package needs manual review
       t.match(await page.innerText('body'), /Manual review is required/, 'manual review notice is shown');
+
+      // A normal (non-ephemeral) upload shows no ephemeral hint
+      t.equal(await page.locator('#pkg-ephemeral').count(), 0, 'no ephemeral hint on a normal report');
+    });
+
+    await t.test('Ephemeral reviews page is reachable from the account menu', async t => {
+      await page.goto(`${url}/reviews/ephemeral`);
+      t.equal(await page.innerText('title'), 'Ephemeral reviews', 'ephemeral reviews page renders');
+      await page.waitForSelector('#ephemeral-reviews');
+
+      // Only a normal package was uploaded, so the list shows its empty state
+      await page.waitForSelector('text=No active ephemeral reviews');
+      t.pass('empty state shown when no ephemeral reviews are active');
+
+      // The account dropdown links here
+      t.equal(
+        await page.locator('a.dropdown-item[href="/reviews/ephemeral"]').count(),
+        1,
+        'account menu links to the ephemeral reviews page'
+      );
+    });
+
+    await t.test('Uploader role can only make ephemeral uploads', async t => {
+      await page.goto(`${url}/login_as_uploader`);
+      t.equal(await page.locator('a.dropdown-item[href="/upload"]').count(), 1, 'account menu links to the upload');
+      t.equal(await page.locator('a.dropdown-item[href="/minion"]').count(), 0, 'no administration links');
+
+      await page.goto(`${url}/upload`);
+      await page.waitForSelector('.upload-dropzone');
+      t.equal(await page.locator('#upload-ephemeral').isChecked(), true, 'ephemeral is on');
+      t.equal(await page.locator('#upload-ephemeral').isDisabled(), true, 'ephemeral cannot be turned off');
+      t.match(await page.innerText('.upload-page'), /can only create ephemeral reviews/, 'the lock is explained');
+
+      await page.setInputFiles('#archive-upload input[name="tarball"]', ARCHIVE);
+      await page.fill('#upload-name', 'Mojolicious-oneoff');
+      await Promise.all([page.waitForURL(/\/reviews\/details\/\d+$/), page.locator('#upload-button').click()]);
+      const reportUrl = page.url();
+
+      const drainPage = await context.newPage();
+      await drainPage.goto(performJobs, {timeout: 120000});
+      await drainPage.close();
+
+      await page.goto(reportUrl);
+      await page.waitForSelector('#pkg-ephemeral');
+      t.pass('report carries the ephemeral hint');
     });
 
     t.test('Console errors', t => {

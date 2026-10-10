@@ -47,10 +47,10 @@ t.test('Cavil UI - snippet triage filters and search', skipUnlessOnline, async t
       await setResolution('fold');
       await waitForRow('fold marker');
       const href = await page.locator('.snippet-file a').first().getAttribute('href');
-      t.equal(
+      t.match(
         href,
-        '/reviews/file_view/1/sub%20dir/ui%20triage%231.txt',
-        'each path segment is encoded (spaces and # do not break the link)'
+        /^\/reviews\/file_view\/1\/sub%20dir\/ui%20triage%231\.txt#L\d+$/,
+        'each path segment is encoded (spaces and # do not break the link) and the snippet line is the anchor'
       );
     });
 
@@ -106,8 +106,10 @@ t.test('Cavil UI - snippet triage filters and search', skipUnlessOnline, async t
       await open();
       await page.waitForSelector('.cavil-snippet-order');
       t.same(
-        await page.locator('.cavil-snippet-resolution option').evaluateAll(options => options.map(option => option.value)),
-        ['any', 'unresolved', 'fold', 'clear', 'overlap', 'covered'],
+        await page
+          .locator('.cavil-snippet-resolution option')
+          .evaluateAll(options => options.map(option => option.value)),
+        ['any', 'unresolved', 'reported', 'fold', 'clear', 'overlap', 'covered'],
         'the resolution menu includes the stored snippet resolution values'
       );
       t.same(

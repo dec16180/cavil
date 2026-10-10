@@ -5,17 +5,17 @@ package Cavil::Plugin::Helpers;
 use Mojo::Base 'Mojolicious::Plugin', -signatures;
 
 use Cavil::Licenses   qw(lic);
-use Cavil::ReportUtil qw(license_classification);
+use Cavil::ReportUtil qw(license_classification peripheral_scope report_risk);
 use Cavil::Role       qw(roles_with_capability);
-use Cavil::Util       qw(external_link_data spdx_link);
+use Cavil::Util       qw(external_link_data license_link spdx_link);
 use CommonMark        ();
 use Mojo::File        qw(path);
 use Mojo::JSON        qw(false from_json true);
 use Mojo::Util        qw(decode humanize_bytes xml_escape);
-use List::Util        qw(first uniq);
 
 sub register ($self, $app, $config) {
   $app->helper('chart_data'                    => \&_chart_data);
+  $app->helper('legal_documents'               => \&_legal_documents);
   $app->helper('current_user'                  => \&_current_user);
   $app->helper('current_user_roles'            => \&_current_user_roles);
   $app->helper('current_user_has_role'         => \&_current_user_has_role);
@@ -30,9 +30,16 @@ sub register ($self, $app, $config) {
   $app->helper('reindex_state'                 => \&_reindex_state);
   $app->helper('report_details'                => \&_report_details);
   $app->helper('reply.json_validation_error'   => \&_json_validation_error);
-  $app->helper('spdx_state'                    => \&_spdx_state);
+  $app->helper('documents_state'               => \&_documents_state);
   $app->helper('format_file'                   => \&_format_file);
   $app->helper('markdown_to_safe_html'         => \&_markdown_to_safe_html);
+  $app->helper('theme'                         => \&_theme);
+}
+
+# Rendered into the html tag so the correct theme is in the first byte of markup and
+# there is no flash of light mode. Anything but "dark" is light, including no cookie.
+sub _theme ($c) {
+  return ($c->cookie('cavil_theme') // '') eq 'dark' ? 'dark' : 'light';
 }
 
 sub _markdown_to_safe_html ($c, $text) {
@@ -73,12 +80,11 @@ sub _chart_data ($c, $hash) {
   return {licenses => \@licenses, licenses_html => \@licenses_html, 'num-files' => \@num_files, colours => \@colours};
 }
 
-# The stages a rebuild passes through, in the order the compact progress bar shows them. A reindex that
-# needs no fresh sources skips straight past "Unpacking", which simply advances the bar by two.
+# Progress-bar order allows rebuilds without fresh sources to skip Unpacking.
 my %REBUILD_STAGES = (unpacking => 2, indexing => 3, analyzing => 4);
 
 # The queued jobs that lead to a new report. Deliberately not every job tagged for the package: generating
-# an SPDX report leaves the report itself alone, and locking the page for it would be a lie. "analyzed"
+# a document leaves the report itself alone, and locking the page for it would be a lie. "analyzed"
 # is left out for the same reason and because it runs *after* the promote - counting it would make the
 # progress bar drop back to "Queued" for one tick just as the new report goes live. Should it decide a
 # follow-up build is needed, that shows up as "reindex_requested" below before it clears it.
@@ -97,7 +103,7 @@ sub _reindex_state ($c, $pkg) {
   # The queue is the common signal, but a package can also be mid-build with its job already gone (a worker
   # that died), which is what the stage still shows, or carry a coalesced request that has not been turned
   # into a job yet. Any of them means the report is not settled, so none of them may look idle. Owning the
-  # package deliberately does not count: an spdx report claims it too and leaves the report alone.
+  # package deliberately does not count: a document build claims it too and leaves the report alone.
   my $reindexing
     = $stage
     || defined $pkg->{reindex_requested}
@@ -109,29 +115,35 @@ sub _reindex_state ($c, $pkg) {
     checksum      => $pkg->{checksum},
     reindexing    => $reindexing ? true          : false,
     rebuild_stage => $reindexing ? ($stage // 1) : undef,
-    spdx          => $c->spdx_state($pkg)
+    documents     => $c->documents_state($pkg)
   };
 }
 
-# Where the package stands with its SPDX report, for the download button on the report page. Reports are
-# generated on demand, so the button has to be able to say "there is one", "one is on its way", "the last
-# attempt failed" and "ask for one" - and it polls, so this has to stay cheap: a stat, and a queue lookup
-# only in the uncommon case that there is no report to hand out.
+# Where the package stands with its derived documents, for the download control on the report page. They
+# are generated on demand, so the control has to be able to say "they are here", "they are on their way",
+# "the last attempt failed" and "ask for them" - and it polls, so this has to stay cheap: a stat per
+# document, and a queue lookup only in the uncommon case that there is nothing to hand out.
 #
 # Only the newest job for the package is consulted. Looking for a failed one instead would leave a single
 # bad attempt stuck to the row for as long as the job table keeps it, long after a later attempt succeeded
-# and the report was collected.
-sub _spdx_state ($c, $pkg) {
+# and the documents were collected.
+sub _documents_state ($c, $pkg) {
   my $id = $pkg->{id};
   return {state => 'unavailable'} if $pkg->{obsolete} || !$pkg->{indexed};
 
   my $pkgs = $c->packages;
-  if ($pkgs->has_spdx_report($id)) {
-    my $size = $pkgs->spdx_report_size($id);
-    return {state => 'ready', size => defined $size ? humanize_bytes($size) : undef};
+  if (my $documents = $pkgs->ready_documents($id)) {
+    return {
+      state     => 'ready',
+      documents => [
+        map {
+          { %$_, url => "/documents/$id/$_->{key}", size => defined $_->{size} ? humanize_bytes($_->{size}) : undef }
+        } @$documents
+      ]
+    };
   }
 
-  my $job = $c->minion->jobs({tasks => ['spdx_report'], notes => ["pkg_$id"]})->next;
+  my $job = $c->minion->jobs({tasks => ['documents'], notes => ["pkg_$id"]})->next;
   return {state => 'none'} unless $job;
   return {state => 'building'} if $job->{state} eq 'inactive' || $job->{state} eq 'active';
   return {state => 'failed'}   if $job->{state} eq 'failed';
@@ -139,39 +151,7 @@ sub _spdx_state ($c, $pkg) {
 }
 
 sub _report_details ($c, $pkg, $report) {
-  my $config       = $c->app->config;
-  my $max          = $config->{min_files_short_report};
-  my $expand_limit = $config->{max_expanded_files};
-
-  my %linked;
-  $linked{$_->{id}} = 1 for @{$report->{missed_files} // []};
-  for my $bucket (values %{$report->{risks} // {}}) {
-    for my $lic (values %$bucket) {
-      my $count = 0;
-      for my $file (@{$lic->{files} // []}) {
-        $linked{$file->[0]} = 1;
-        last if ++$count > $max;
-      }
-    }
-  }
-
-  my $num_expanded  = 0;
-  my $hidden_inline = 0;
-  my @files;
-  for my $file (@{$report->{files} // []}) {
-    next unless $linked{$file->{id}};
-    my $wants_expand = $file->{expand}                                ? 1 : 0;
-    my $expand       = $wants_expand && $num_expanded < $expand_limit ? 1 : 0;
-    $num_expanded++  if $expand;
-    $hidden_inline++ if $wants_expand && !$expand;
-    push @files,
-      {
-      id       => $file->{id},
-      path     => $file->{path},
-      expand   => $expand ? \1 : \0,
-      file_url => $c->url_for('file_view', id => $pkg->{id}, file => $file->{path})->to_string
-      };
-  }
+  my $max = $c->app->config->{min_files_short_report};
 
   # _chart_data() mutates its input hash, so pass a shallow copy
   my %chart_copy = %{$report->{chart} // {}};
@@ -191,25 +171,42 @@ sub _report_details ($c, $pkg, $report) {
   }
 
   my $risks = $report->{risks} // {};
+
+  # One lookup for the whole report. Only link a name with no identifier when there is a text behind it; a
+  # link that leads nowhere is worse than plain text.
+  my %curated = map { $_ => 1 } keys %{$c->patterns->full_license_texts([map { keys %$_ } values %$risks])};
+
   my %risk_buckets;
   for my $risk (keys %$risks) {
     my @licenses;
     my $bucket = $risks->{$risk};
-    for my $lic (sort keys %$bucket) {
+
+    # Identified licenses first, placeholders after, each group by name. Inside one risk they are equally
+    # urgent, but they are not equally useful: a reviewer wants the licenses Cavil could name before the
+    # markers that name nothing, and alphabetically an "Any ..." would often land at the top.
+    my @order
+      = sort { ($bucket->{$a}{catch_all} ? 1 : 0) <=> ($bucket->{$b}{catch_all} ? 1 : 0) || $a cmp $b } keys %$bucket;
+    for my $lic (@order) {
       my $matches = $bucket->{$lic};
       my $display = $matches->{spdx} || $matches->{name};
+      my $files   = [map { [0 + $_->[0], $_->[1]] } @{$matches->{files} // []}];
       push @licenses, {
         name      => $matches->{name},
         spdx      => $matches->{spdx},
-        name_html => spdx_link($display),
+        name_html => license_link($display, $curated{$display}),
+        catch_all => $matches->{catch_all} ? \1 : \0,
         flags     => $matches->{flags} // [],
-        files     => $matches->{files},
+        files     => $files,
 
         # What the external datasets (OSADL obligation checklists, SPDX classification flags) say about
         # each SPDX identifier named in this entry, verbatim and per constituent for expressions like
         # "MIT OR BSD-3-Clause". Empty when no source knows any of them, so the frontend simply omits
         # the panel. Derived per request from the bundled datasets, not persisted.
         classification => license_classification($display),
+
+        # Where this license lives, when not one file of it is in shipped code. Lets a reader skip a
+        # license that only ever turns up in a vendored tree or a test fixture without reading paths.
+        scope => peripheral_scope([map { $_->[1] } @$files]),
         ($new_license{$matches->{name}} ? (new => \1) : ())
       };
     }
@@ -224,8 +221,6 @@ sub _report_details ($c, $pkg, $report) {
     push @missed, \%copy;
   }
 
-  # Vendored components: render licenses as clickable SPDX links (like every other license in the
-  # report) and link the name to the component's metadata file in the file browser
   my @components;
   for my $comp (@{$report->{components} // []}) {
     push @components, {
@@ -250,18 +245,24 @@ sub _report_details ($c, $pkg, $report) {
   return {
     package               => {id => $pkg->{id}, name => $pkg->{name}, unresolved_matches => $pkg->{unresolved_matches}},
     chart                 => $chart,
-    license_compatibility => $report->{license_compatibility} // {licenses => [], matrix => {}},
+    license_compatibility => $report->{license_compatibility} // {licenses => [], matrix => {}, proximity => {}},
     missed_files          => \@missed,
     risks                 => \%risk_buckets,
     max_files_per_license => $max,
-    max_expanded_files    => $expand_limit,
-    hidden_inline_previews => $hidden_inline,
-    matching_globs         => $report->{matching_globs} // [],
-    files                  => \@files,
-    emails                 => $report->{emails} // [],
-    urls                   => $report->{urls}   // [],
-    components             => \@components
+    matching_globs        => $report->{matching_globs} // [],
+    components            => \@components
   };
+}
+
+# Pre-annotation reports omit this section.
+sub _legal_documents ($c, $id) {
+  return undef unless my $stored = ($c->reports->annotations($id) // {})->{legal_documents};
+
+  my @documents = map {
+    { %$_, url => $c->url_for('file_view', id => $id, file => $_->{path})->to_string }
+  } @{$stored->{documents} // []};
+
+  return {documents => \@documents, dropped => $stored->{dropped} // 0};
 }
 
 sub _current_user ($c) { $c->stash->{'cavil.api.user'} // $c->session('user') }
@@ -288,6 +289,12 @@ sub _current_user_roles ($c) {
   return $c->users->roles($user);
 }
 
+sub _link_with_target ($link, $target, $config) {
+  return undef unless my $data = external_link_data($link, $config->{external_link_sources});
+  $data->{target} = $target if defined $target;
+  return $data;
+}
+
 sub _json_validation_error ($c) {
   my $failed = join ', ', @{$c->validation->failed};
   $c->render(json => {error => "Invalid request parameters ($failed)"}, status => 400);
@@ -300,6 +307,7 @@ sub _mcp_report ($c, $id, $opts = {}) {
   # 0 = omit the section entirely; otherwise cap the (already occurrence-ordered) lists.
   my $url_limit   = $opts->{url_limit}   // 10;
   my $email_limit = $opts->{email_limit} // 10;
+  my $wanted      = $url_limit > $email_limit ? $url_limit : $email_limit;
 
   return $c->render_to_string(
     'mcp/report',
@@ -307,6 +315,7 @@ sub _mcp_report ($c, $id, $opts = {}) {
     report      => $report,
     summary     => $summary,
     unmatched   => _unmatched_rollup($c, $id),
+    artifacts   => $wanted ? $c->reports->artifacts($id, $wanted) : {},
     url_limit   => $url_limit,
     email_limit => $email_limit
   );
@@ -316,30 +325,21 @@ sub _package_summary ($c, $id) {
   my $pkgs = $c->packages;
   return undef unless my $pkg = $pkgs->find($id);
 
-  my $spec = $c->reports->specfile_report($id);
-  my $type = first { length $_ } map { $_->{type} } @{$spec->{sub} // []};
+  my $declarations = $c->reports->declarations($id);
+  my $primary      = $declarations->{declarations}[0] // {};
 
-  my $main               = $spec->{main};
-  my $main_license       = $main->{license};
-  my $normalized_license = lic($main_license)->to_string;
-  my $package_license    = $normalized_license || $main_license;
-
-  my $version = $main->{version};
-  my $summary = $main->{summary};
-  my $group   = $main->{group};
-  my $url     = $main->{url};
-
-  my $report = $pkg->{checksum} // '';
-  my ($risk, $shortname) = $report =~ /-(\d+):(\w+)$/;
-
-  $risk = 9 if ($pkg->{unresolved_matches} || 0) > 0;
+  my $report      = $pkg->{checksum} // '';
+  my ($shortname) = $report =~ /-\d+:(\w+)$/;
+  my $risk        = report_risk($report, $pkg->{unresolved_matches});
 
   my $requests = $pkgs->requests_for($id);
-  my $products = $c->products->for_package($id);
 
-  # Whether the Reindex button has anything to offer changes without the page being reloaded: a rebuild
-  # (this reviewer's or somebody else's) bumps the package past every pattern that made the button light
-  # up, and a pattern created while the page is open makes it light up again
+  # Collapse codestreams into deduplicated curated product names.
+  my %seen;
+  my $products
+    = [sort grep { !$seen{$_}++ } map { $_->{product} // $_->{name} } @{$c->products->for_package_products($id)}];
+
+  # Recompute package-wide state for concurrent pattern and rebuild changes.
   my $state = $c->reindex_state($pkg);
 
   my $config = $c->app->config;
@@ -356,70 +356,69 @@ sub _package_summary ($c, $id) {
     push @$actions, $entry;
   }
 
-  my (%docs, %lics, @package_files, @legal_review_notices);
-  for my $sub (@{$spec->{sub} // []}) {
-    my $entry = {
-      file     => $sub->{file},
-      group    => $sub->{group},
-      licenses => [uniq @{$sub->{licenses} // []}],
-      sources  => [uniq @{$sub->{sources}  // []}],
-      summary  => $sub->{summary},
-      url      => $sub->{url},
-      version  => $sub->{version}
-    };
-    push @package_files, $entry;
-    for my $line (@{$sub->{'%doc'}}) {
-      $docs{$_} = 1 for split(/ /, $line);
-    }
-    for my $line (@{$sub->{'%license'}}) {
-      $lics{$_} = 1 for split(/ /, $line);
-    }
-    push @legal_review_notices, @{$sub->{'legal_review_notices'} // []};
+  my (%docs, %lics, @declarations, @legal_review_notices);
+  for my $d (@{$declarations->{declarations}}) {
+    my $license = $d->{license};
+    push @declarations,
+      {
+      format       => $d->{format},
+      file         => $d->{file},
+      name         => $d->{name},
+      version      => $d->{version},
+      license      => $license,
+      license_html => defined $license            ? spdx_link($license) : undef,
+      spdx         => lic($license)->is_canonical ? true                : false
+      };
+    $docs{$_} = 1 for @{$d->{'%doc'}     // []};
+    $lics{$_} = 1 for @{$d->{'%license'} // []};
+    push @legal_review_notices, @{$d->{notices} // []};
   }
 
   return {
-    actions              => $actions,
-    copied_files         => {'%doc' => [sort keys %docs], '%license' => [sort keys %lics]},
-    created              => $pkg->{created_epoch},
-    embargoed            => \!!$pkg->{embargoed},
-    ai_assisted          => \!!$pkg->{ai_assisted},
-    errors               => $spec->{errors} // [],
+    actions          => $actions,
+    copied_files     => {'%doc' => [sort keys %docs], '%license' => [sort keys %lics]},
+    created          => $pkg->{created_epoch},
+    documents        => $state->{documents},
+    legal_documents  => _legal_documents($c, $id),
+    embargoed        => $pkg->{embargoed} ? true : false,
+    tags             => $pkg->{tags} // [],
+    can_edit_tags    => $c->current_user_can('curate') ? \1   : \0,
+    ephemeral        => $pkg->{ephemeral}              ? true : false,
+    ephemeral_delete => $pkg->{ephemeral}
+    ? $pkg->{created_epoch} + ($config->{hours_to_keep_ephemeral_packages} // 24) * 3600
+    : undef,
+    ai_assisted          => $pkg->{ai_assisted} ? true : false,
     external_link        => $pkg->{external_link},
-    external_link_data   => external_link_data($pkg->{external_link}, $config->{external_link_sources}),
+    external_link_data   => _link_with_target($pkg->{external_link}, $pkg->{target}, $config),
     id                   => $pkg->{id},
     legal_review_notices => \@legal_review_notices,
+    declarations         => \@declarations,
+    incomplete_checkout  => $declarations->{incomplete_checkout},
     notice               => $pkg->{notice},
     package_checksum     => $pkg->{checkout_dir},
-    package_files        => \@package_files,
-    package_group        => $group,
-    package_license      => {name => $package_license, spdx => \!!$normalized_license},
     package_name         => $pkg->{name},
     package_priority     => $pkg->{priority},
     package_risk         => $risk,
     package_shortname    => $shortname,
-    package_summary      => $summary,
-    package_type         => $type,
-    package_url          => $url,
-    package_version      => $version,
+    package_summary      => $primary->{summary},
+    package_type         => $primary->{format},
+    package_url          => $primary->{url},
+    package_version      => $primary->{version},
     products             => $products,
     reindexing           => $state->{reindexing},
-    requests             => $requests,
-    requests_data        => [map { external_link_data($_, $config->{external_link_sources}) } @$requests],
+    requests             => [map { $_->{external_link} } @$requests],
+    requests_data        => [map { _link_with_target($_->{external_link}, $_->{target}, $config) } @$requests],
     result               => $pkg->{result},
     reviewed             => $pkg->{reviewed_epoch},
     reviewing_user       => $pkg->{login},
-    should_reindex       => \!!$c->patterns->has_new_patterns($pkg->{name}, $pkg->{indexed}),
-    spdx                 => $state->{spdx},
+    should_reindex       => $c->patterns->has_new_patterns($pkg->{name}, $pkg->{indexed}) ? true : false,
     state                => $pkg->{state},
     unpacked_files       => $pkg->{unpacked_files},
-    unpacked_size        => humanize_bytes($pkg->{unpacked_size} // 0),
-    warnings             => $spec->{warnings} // []
+    unpacked_size        => humanize_bytes($pkg->{unpacked_size} // 0)
   };
 }
 
-# A compact, impact-ranked rollup of this package's unresolved snippets for the report: the full
-# per-snippet previews are enormous on large packages, so we surface only the top few (one pattern or
-# glob clears many identical occurrences) plus a total, and point at cavil_search_snippets for the rest.
+# Limit impact-ranked previews because large packages can have enormous unresolved sets.
 sub _unmatched_rollup ($c, $id, $top = 10) {
   my $result = $c->snippets->snippet_search(
     {resolution => 'unresolved', group => 'text', order => 'occurrences', package_id => $id, limit => $top});

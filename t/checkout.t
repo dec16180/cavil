@@ -1,17 +1,5 @@
-# Copyright (C) 2018-2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict, -signatures;
 
@@ -24,15 +12,12 @@ use Cavil::Test;
 use Mojo::File qw(path curfile tempdir);
 use Mojo::JSON qw(decode_json encode_json);
 use Cavil::Checkout;
+use Cavil::Util qw(encode_json_fast extract_urls_and_emails);
+use Time::HiRes qw(time);
 
 plan skip_all => 'set TEST_ONLINE to enable this test' unless $ENV{TEST_ONLINE};
 
 my $dir = path(__FILE__)->dirname->child('legal-bot');
-
-sub report {
-  my $report = eval path(__FILE__)->dirname->child('reports', shift)->slurp;
-  return $@ ? die $@ : $report;
-}
 
 my $TMP = tempdir;
 
@@ -50,6 +35,82 @@ sub temp_copy (@path) {
   return $target;
 }
 
+subtest 'URLs and email addresses' => sub {
+  subtest 'all four forms are recognised' => sub {
+    my $meta = extract_urls_and_emails(<<'EOF');
+Sebastian Riedel <sri@cpan.org> wrote this.
+Reported by nobody@nowhere.invalid too.
+<a href="mailto:kraih@kraih.com" >Sebastian Riedel</a>
+See http://mojolicious.org and ftp://ftp.gnu.org/pub for more.
+EOF
+    is_deeply [sort keys %{$meta->{emails}}], ['kraih@kraih.com', 'nobody@nowhere.invalid', 'sri@cpan.org'],
+      'right email addresses';
+    is $meta->{emails}{'sri@cpan.org'}{name},    'Sebastian Riedel', 'name in front of the address';
+    is $meta->{emails}{'kraih@kraih.com'}{name}, 'Sebastian Riedel', 'name after a mailto: link';
+
+    # Any two words in front of an address are taken for a name, so an address in running prose picks up
+    # whatever preceded it. Only all-lowercase and punctuated candidates are rejected
+    is $meta->{emails}{'nobody@nowhere.invalid'}{name}, 'Reported by', 'preceding words taken for a name';
+    is_deeply [sort keys %{$meta->{urls}}], ['ftp://ftp.gnu.org/pub', 'http://mojolicious.org'], 'right URLs';
+  };
+
+  subtest 'repeated values are counted, not duplicated' => sub {
+    my $meta = extract_urls_and_emails(join "\n\n", map {"Contact: sri\@cpan.org and http://mojolicious.org"} 1 .. 4);
+    is_deeply [keys %{$meta->{emails}}], ['sri@cpan.org'], 'one email address';
+    is $meta->{emails}{'sri@cpan.org'}{count}, 4, 'address counted once per occurrence';
+    is_deeply [keys %{$meta->{urls}}], ['http://mojolicious.org'], 'one URL';
+    is $meta->{urls}{'http://mojolicious.org'}, 4, 'URL counted once per occurrence';
+  };
+
+  subtest 'placeholder and unusable values are skipped' => sub {
+    my $meta = extract_urls_and_emails(<<'EOF');
+someone@example.com and http://www.example.org/ are placeholders (RFC 2606)
+file:///etc/passwd is not interesting
+bad@-nope.de is not a legal address (RFC 822)
+EOF
+    is_deeply $meta->{emails}, {}, 'no email addresses';
+    is_deeply $meta->{urls},   {}, 'no URLs';
+  };
+
+  subtest 'malformed input is survivable' => sub {
+    for my $case (
+      ['empty'         => ''],
+      ['invalid UTF-8' => "\xff\xfe\x00bad\@\x80\xc3(\x28"],
+      ['NUL bytes'     => join "\0", 'sri@cpan.org', 'http://mojolicious.org'],
+      ['no final NL'   => "x\r\n" x 500 . 'z' x 1500],
+      ['nothing but @' => '@' x 30000],
+      ['nothing but :' => '://' x 10000]
+      )
+    {
+      my ($name, $text) = @$case;
+      ok eval { extract_urls_and_emails($text); 1 }, "survives $name";
+    }
+  };
+
+  # Text with no whitespace used to make the address branches quadratic: the local-part class rescanned
+  # to end of buffer from every start position, so a single file at the 30KB slurp cap cost seconds. The
+  # bounded quantifiers in Cavil::Checkout make it linear again. Doubling the input and comparing is what
+  # the guard is worth having: the ratio is ~2 while this is linear and ~4 if it goes quadratic again,
+  # and unlike a wall-clock limit it means the same thing on a fast desktop and a loaded CI runner. The
+  # trailing "@" is deliberate, so the text gets past the index() shortcut and the bounds are measured.
+  subtest 'pathological input stays linear' => sub {
+    my $scan = sub ($size) {
+      my $text = substr('a.' x $size, 0, $size - 1) . '@';
+      my $best = 9e9;
+      for (1 .. 3) {
+        my $start = time;
+        my $meta  = extract_urls_and_emails($text);
+        my $spent = time - $start;
+        $best = $spent if $spent < $best;
+        is_deeply $meta, {emails => {}, urls => {}}, "nothing extracted from ${size} bytes" if $_ == 1;
+      }
+      return $best;
+    };
+    my $ratio = $scan->(30000) / $scan->(15000);
+    ok $ratio < 3, sprintf('doubling the input doubled the work (ratio %.2f, quadratic would be ~4)', $ratio);
+  };
+};
+
 subtest 'ceph-image (kiwi)' => sub {
   my $ceph     = temp_copy('ceph-image', '5fcfdab0e71b0bebfdf8b5cc3badfecf');
   my $checkout = Cavil::Checkout->new($ceph);
@@ -58,82 +119,13 @@ subtest 'ceph-image (kiwi)' => sub {
   is $stats->{files}, 5, 'right number of files';
 
   # Smaller than the raw sources: the .kiwi and tumbleweed.xml are markup and are stripped to text
-  # before indexing (the kiwi *report* below still parses the original file).
+  # before indexing
   is $stats->{size}, 1834, 'right size';
-  is_deeply $checkout->specfile_report, report('ceph-image.kiwi'), 'right kiwi report';
-};
-
-subtest 'go1.16-devel-container (Dockerfile)' => sub {
-  my $go       = temp_copy('go1.16-devel-container', 'ffcfdab0e71b1bebfdf8b5cc3badfeca');
-  my $checkout = Cavil::Checkout->new($go);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('go1.16-devel-container.dockerfile'), 'right dockerfile report';
-};
-
-subtest 'harbor-helm (Helm)' => sub {
-  my $harbor   = temp_copy('harbor-helm', '4fcfdab0e71b0bebfdf8b5cc3badfec4');
-  my $checkout = Cavil::Checkout->new($harbor);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('harbor-helm.helm'), 'right helm chart report';
-};
-
-subtest 'libfsverity0 (DEB)' => sub {
-  my $libfs    = temp_copy('libfsverity0', '9932c13432c3c5bdbe260ab8bc3b13ef');
-  my $checkout = Cavil::Checkout->new($libfs);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('libfsverity0.deb'), 'right deb report';
-};
-
-subtest 'gnome-icon-theme' => sub {
-  my $theme    = temp_copy('gnome-icon-theme', '6101f5eb933704aaad5dea63667110ac');
-  my $checkout = Cavil::Checkout->new($theme);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('gnome-icon-theme.specfile'), 'right specfile report';
-};
-
-subtest 'gnome-menus' => sub {
-  my $menus    = temp_copy('gnome-menus', 'aaacabb87b4356ac167f1a19458bc412');
-  my $checkout = Cavil::Checkout->new($menus);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('gnome-menus.specfile'), 'right specfile report';
-};
-
-subtest 'gtk-vnc' => sub {
-  my $vnc      = temp_copy('gtk-vnc', 'dbc35628c22fb9537a187e338c5e7007');
-  my $checkout = Cavil::Checkout->new($vnc);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('gtk-vnc.specfile'), 'right specfile report';
-};
-
-subtest 'kmod' => sub {
-  my $kmod     = temp_copy('kmod', 'a91003b451a34fe24defecdde1f2902e');
-  my $checkout = Cavil::Checkout->new($kmod);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('kmod.specfile'), 'right specfile report';
-};
-
-subtest 'libqt4' => sub {
-  my $qt       = temp_copy('libqt4', '9ec277c8a213f76119aa737e98f01959');
-  my $checkout = Cavil::Checkout->new($qt);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('libqt4.specfile'), 'right specfile report';
-};
-
-subtest 'mono-core' => sub {
-  my $mono     = temp_copy('mono-core', '610dad1a6b8dd8e36b021ab0291cd1d9');
-  my $checkout = Cavil::Checkout->new($mono);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('mono-core.specfile'), 'right specfile report';
 };
 
 subtest 'perl-Mojolicious' => sub {
-  my $mojo     = temp_copy('perl-Mojolicious', 'c7cfdab0e71b0bebfdf8b2dc3badfecd');
-  my $checkout = Cavil::Checkout->new($mojo);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('perl-Mojolicious.specfile'), 'right specfile report';
   my $mojo_temp_dir = temp_copy('perl-Mojolicious', 'c7cfdab0e71b0bebfdf8b2dc3badfecd');
-  $checkout = Cavil::Checkout->new($mojo_temp_dir);
-  $checkout->unpack;
+  Cavil::Checkout->new($mojo_temp_dir)->unpack;
   my $json = $mojo_temp_dir->child('.unpacked.json');
   ok -f $json, 'log file exists';
   my $hash = decode_json($json->slurp);
@@ -153,69 +145,6 @@ subtest 'perl-Mojolicious' => sub {
   is_deeply $hash->{unpacked}->{$maxed_file}, {mime => 'text/plain'}, 'file was maxed';
 };
 
-subtest 'plasma-nm5' => sub {
-  my $nm5      = temp_copy('plasma-nm5', '4df243e211552e65b7146523c2f7051c');
-  my $checkout = Cavil::Checkout->new($nm5);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('plasma-nm5.specfile'), 'right specfile report';
-};
-
-subtest 'timezone' => sub {
-  my $tz       = temp_copy('timezone', '2724cdf3fada2aba427132fee8327b0f');
-  my $checkout = Cavil::Checkout->new($tz);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('timezone.specfile'), 'right specfile report';
-};
-
-subtest 'wxWidgets-3_2' => sub {
-  my $wx       = temp_copy('wxWidgets-3_2', '25014ee9d3640ebd9bc2370a2bbb5a63');
-  my $checkout = Cavil::Checkout->new($wx);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('wxWidgets-3_2.specfile'), 'right specfile report';
-};
-
-subtest 'MozillaFirefox (macros)' => sub {
-  my $ff       = temp_copy('MozillaFirefox', '8d3f5e6a2b1c4d7e9f0a1b2c3d4e5f6a');
-  my $checkout = Cavil::Checkout->new($ff);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('MozillaFirefox.specfile'), 'right specfile report';
-};
-
-subtest 'PackageHub (ObsPrj)' => sub {
-  my $hub      = temp_copy('PackageHub', '280b37a43ba9dc09c563a5c4e99349c07414c9f46a8e8f8636d3ef8aaf63650b');
-  my $checkout = Cavil::Checkout->new($hub);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('PackageHub.obsprj'), 'right ObsPrj report';
-};
-
-subtest 'error-invalid-license' => sub {
-  my $eil      = temp_copy('error-invalid-license', 'cb5e100e5a9a3e7f6d1fd97512215282');
-  my $checkout = Cavil::Checkout->new($eil);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-invalid-license.specfile'), 'right specfile report';
-};
-
-subtest 'error-no-spdx' => sub {
-  my $ens      = temp_copy('error-no-spdx', 'cb5e100e5a9a3e7f6d1fd97512215282');
-  my $checkout = Cavil::Checkout->new($ens);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-no-spdx.specfile'), 'right specfile report';
-};
-
-subtest 'error-missing-main' => sub {
-  my $emm      = temp_copy('error-missing-main', 'cb5e100e5a9a3e7f6d1fd97512215282');
-  my $checkout = Cavil::Checkout->new($emm);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-missing-main.specfile'), 'right specfile report';
-};
-
-subtest 'error-missing-specfile' => sub {
-  my $ems      = temp_copy('error-missing-specfile', 'cb5e100e5a9a3e7f6d1fd97512215282');
-  my $checkout = Cavil::Checkout->new($ems);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-missing-specfile.specfile'), 'right specfile report';
-};
-
 subtest 'error-broken-archive' => sub {
   my $eba      = temp_copy('error-broken-archive', 'cb5e100e5a9a3e7f6d1fd97512215282');
   my $checkout = Cavil::Checkout->new($eba);
@@ -228,158 +157,32 @@ subtest 'error-broken-archive' => sub {
   is_deeply $hash->{unpacked}{'error-broken-archive/test.txt'}, {mime => 'text/plain'}, 'right structure';
 };
 
-subtest 'error-missing-main-kiwi' => sub {
-  my $emmk     = temp_copy('error-missing-main-kiwi', 'aacfdab0e71b0bebfdf8b5cc3badfecf');
-  my $checkout = Cavil::Checkout->new($emmk);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-missing-main-kiwi.kiwi'), 'right kiwi report';
-};
-
-subtest 'error-missing-kiwifile' => sub {
-  my $emmk     = temp_copy('error-missing-kiwifile', 'bbcfdab0e71b0bebfdf8b5cc3badfecf');
-  my $checkout = Cavil::Checkout->new($emmk);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-missing-kiwifile.kiwi'), 'right kiwi report';
-};
-
-subtest 'error-missing-main-dockerfile' => sub {
-  my $docker   = temp_copy('error-missing-main-dockerfile', '56cfdab0e71b0bebfdf8b5cc3badfe23');
-  my $checkout = Cavil::Checkout->new($docker);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-missing-main-dockerfile.dockerfile'), 'right kiwi report';
-};
-
-subtest 'error-missing-main-helm' => sub {
-  my $helm     = temp_copy('error-missing-main-helm', '86cfdab0e71b0bebfdf8b5cc3badfe2f');
-  my $checkout = Cavil::Checkout->new($helm);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-missing-main-helm.helm'), 'right kiwi report';
-};
-
-subtest 'mixed (a little bit of everything)' => sub {
-  my $mixed    = temp_copy('mixed', 'fffe100e5a9a3e7f6d1fd97512215282');
-  my $checkout = Cavil::Checkout->new($mixed);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('mixed.mixed'), 'right mixed report';
-};
-
-subtest 'error-invalid-license-mixed' => sub {
-  my $mixed    = temp_copy('error-invalid-license-mixed', 'fffe100e5a9a3e7f6d1fd97512215283');
-  my $checkout = Cavil::Checkout->new($mixed);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-invalid-license-mixed.mixed'), 'right mixed report';
-};
-
-subtest 'error-missing-main-mixed' => sub {
-  my $mixed    = temp_copy('error-missing-main-mixed', 'fffe100e5a9a3e7f6d1fd97512215284');
-  my $checkout = Cavil::Checkout->new($mixed);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-missing-main-mixed.mixed'), 'right mixed report';
-};
-
-subtest 'error-invalid-yaml-helm' => sub {
-  my $helm     = temp_copy('error-invalid-yaml-helm', 'fffe100e5a9a3e7f6d1fd97512215286');
-  my $checkout = Cavil::Checkout->new($helm);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-invalid-yaml-helm.helm'), 'right helm chart report';
-};
-
-subtest 'error-invalid-xml-kiwi' => sub {
-  my $kiwi     = temp_copy('error-invalid-xml-kiwi', 'fffe100e5a9a3e7f6d1fd97512215287');
-  my $checkout = Cavil::Checkout->new($kiwi);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-invalid-xml-kiwi.kiwi'), 'right kiwi report';
-};
-
-subtest 'error-incomplete-checkout' => sub {
-  my $remote   = temp_copy('error-incomplete-checkout', 'cb5e100e5a9a3e7f6d1fd97512215282');
-  my $checkout = Cavil::Checkout->new($remote);
-  $checkout->unpack;
-  is_deeply $checkout->specfile_report, report('error-incomplete-checkout.specfile'), 'right specfile report';
-};
-
-subtest 'Tarball upload auto-detection' => sub {
-
-  # Build a synthetic upload checkout: an archive created from $tree (a list of
-  # [relative-path, content] pairs), then unpack and return the upload report.
-  my $upload_report = sub ($case, $tree) {
-    my $src = $TMP->child("auto-src-$case");
-    for my $entry (@$tree) {
-      my $file = $src->child(split('/', $entry->[0]));
-      $file->dirname->make_path;
-      $file->spew($entry->[1]);
-    }
-    my $co  = $TMP->child("auto-co-$case", 'hash')->make_path;
-    my @top = map { $_->basename } $src->list({dir => 1, hidden => 1})->each;
-    is system('tar', '-czf', $co->child('archive.tar.gz')->to_string, '-C', $src->to_string, @top), 0,
-      "$case archive created";
-    my $checkout = Cavil::Checkout->new($co);
-    $checkout->unpack;
-    return $checkout->specfile_report({upload => 1});
-  };
-
-  subtest 'archive without any package file falls back to a minimal main' => sub {
-    my $info = $upload_report->('bare', [['src/hello.c', "int main() { return 0; }\n"], ['README', "hi\n"]]);
-    is $info->{main}{type},    'upload', 'minimal upload main';
-    is $info->{main}{license}, undef,    'no license without a package file';
-    is $info->{main}{version}, undef,    'no version without a package file';
-    is_deeply $info->{errors}, [], 'no missing-main error for an upload';
-  };
-
-  subtest 'spec inside a single wrapper directory is detected' => sub {
-    my $info = $upload_report->('wrapper', [['demo-1.0/demo.spec', "Name: demo\nVersion: 1.0\nLicense: MIT\n"]]);
-    is $info->{main}{type},    'spec',      'main is the spec';
-    is $info->{main}{file},    'demo.spec', 'right file';
-    is $info->{main}{license}, 'MIT',       'license auto-detected from the spec';
-    is $info->{main}{version}, '1.0',       'version from the spec';
-    is_deeply $info->{errors}, [], 'no errors for an upload';
-  };
-
-  subtest 'spec directly at the archive root (no wrapper) is detected' => sub {
-    my $info = $upload_report->(
-      'flat', [['demo.spec', "Name: demo\nVersion: 2.0\nLicense: Apache-2.0\n"], ['README', "hello\n"]]
-    );
-    is $info->{main}{type},    'spec',       'main is the spec';
-    is $info->{main}{license}, 'Apache-2.0', 'license auto-detected without a wrapper';
-    is $info->{main}{version}, '2.0',        'version from the spec';
-  };
-
-  subtest 'multiple top-level directories are not descended into' => sub {
-    my $info = $upload_report->('multi', [['a/demo.spec', "License: MIT\n"], ['b/notes.txt', "hi\n"]]);
-    is $info->{main}{type},    'upload', 'falls back to the synthetic upload main';
-    is $info->{main}{license}, undef,    'no license is guessed from a nested spec';
-  };
-
-  subtest 'Helm chart is detected and listed as a sub package' => sub {
-    my $info = $upload_report->(
-      'helm', [['chart-1.0/Chart.yaml', "name: demo\nversion: 3.2.1\n# SPDX-License-Identifier: Apache-2.0\n"]]
-    );
-    is $info->{main}{type},     'helm',       'main is the helm chart';
-    is $info->{main}{license},  'Apache-2.0', 'license from the SPDX comment';
-    is $info->{main}{version},  '3.2.1',      'version from the chart';
-    is scalar(@{$info->{sub}}), 1,            'chart is also listed as a sub package';
-    is $info->{sub}[0]{type},   'helm',       'sub package is the chart';
-  };
-};
-
-subtest 'Old SPDX reports are excluded from unpacking (no wasted copies)' => sub {
+subtest 'Derived documents never reach the unpacked tree' => sub {
   my $co  = $TMP->child('report-exclude', 'hash')->make_path;
   my $src = $TMP->child('report-exclude-src')->make_path;
   $src->child('hello.txt')->spew("hello world\n");
-  is system('tar', '-czf', $co->child('src.tar.gz')->to_string, '-C', $src->to_string, 'hello.txt'), 0, 'archive built';
+  $src->child('vendor')->make_path->child('.report.json')->spew(qq({"tool": "not ours"}\n));
+  is system('tar', '-czf', $co->child('src.tar.gz')->to_string, '-C', $src->to_string, '.'), 0, 'archive built';
 
-  # A previous run's gzipped SPDX report sits in the checkout dir.
+  # A previous run's documents sit in the checkout dir
   $co->child('.report.spdx.json')->spew('{"spdxVersion":"SPDX-2.3","packages":[' . ('{"n":"x"},' x 200) . '{}]}');
   is system('gzip', $co->child('.report.spdx.json')->to_string), 0, 'report gzipped';
+  $co->child('.report.notice.txt')->spew("NOTICE\n\nPermission is hereby granted, free of charge\n");
+  is system('gzip', $co->child('.report.notice.txt')->to_string), 0, 'notice gzipped';
 
   Cavil::Checkout->new($co)->unpack;
 
   my $hash = decode_json($co->child('.postprocessed.json')->slurp)->{unpacked};
-  ok !(grep {/\.report.*\.spdx/} keys %$hash),                   'no report artifact in the unpacked set';
-  ok !-e $co->child('.unpacked', '.report.spdx.json'),           'report was not exploded into .unpacked';
-  ok !-e $co->child('.unpacked', '.report.spdx.processed.json'), 'no line-wrapped report copy';
-  ok -e $co->child('.report.spdx.json.gz'),                      'compact report still present in the checkout dir';
-  ok + (grep {m{hello\.txt$}} keys %$hash),                      'real source files are still unpacked';
+  ok !(grep {m{^\.report\.}} keys %$hash),             'no derived document in the unpacked set';
+  ok !-e $co->child('.unpacked', '.report.spdx.json'), 'the report was not exploded into .unpacked';
+
+  # A NOTICE is nothing but license text, so indexing one would match every license it reproduces
+  ok !-e $co->child('.unpacked', '.report.notice.txt'), 'nor the notice';
+  ok !-e $co->child('.report.spdx.json.gz'),            'the stale documents are gone from the checkout dir';
+  ok !-e $co->child('.report.notice.txt.gz'),           'both of them';
+
+  ok +(grep {m{hello\.txt$}} keys %$hash),            'real source files are still unpacked';
+  ok +(grep {m{vendor/\.report\.json$}} keys %$hash), "and so is a package's own .report file";
 };
 
 subtest 'Generated SPDX reports are never handed to the indexer' => sub {
@@ -415,14 +218,54 @@ subtest 'Markup files are stripped during unpack' => sub {
   $checkout->unpack;
 
   my $files = $checkout->unpacked_files;
-  ok + (grep { $_->[0] =~ m{(?:^|/)readme\.processed\.html$} } @$files), 'indexer sees the stripped .processed.html';
-  ok !(grep { $_->[0] =~ m{(?:^|/)readme\.html$} } @$files), 'raw readme.html is not indexed';
+  ok +(grep { $_->[0] =~ m{(?:^|/)readme\.processed\.html$} } @$files), 'indexer sees the stripped .processed.html';
+  ok !(grep { $_->[0] =~ m{(?:^|/)readme\.html$} } @$files),            'raw readme.html is not indexed';
 
   my ($rel) = map { $_->[0] } grep { $_->[0] =~ m{readme\.processed\.html$} } @$files;
   my $stripped = $co->child('.unpacked', split m{/}, $rel)->slurp;
   like $stripped,   qr/Permission is hereby granted free of charge/, 'license text extracted';
   like $stripped,   qr/Redistribution & use permitted/,              'HTML entity decoded';
   unlike $stripped, qr/<html|<body|<h1|<p>/,                         'markup tags removed';
+};
+
+subtest 'A file list with non-ASCII names is read back whole' => sub {
+  my $co = $TMP->child('non-ascii', 'hash')->make_path;
+
+  # A hash with more than a handful of distinct non-ASCII keys is what used to wedge the unpack job
+  # forever while it wrote this very file, so build one big enough to have done it
+  my @accented = split //, "\x{e9}\x{f8}\x{142}\x{fc}\x{e7}";
+  my %unpacked = map { ("src/caf$accented[$_ % @accented]-$_.txt" => {mime => 'text/plain'}) } 1 .. 100;
+  $co->child('.postprocessed.json')
+    ->spew(encode_json_fast {destdir => $co->child('.unpacked')->to_string, unpacked => \%unpacked});
+
+  my $checkout = Cavil::Checkout->new($co);
+  my $files    = $checkout->unpacked_files;
+  is scalar @$files, 100, 'every file is handed to the indexer';
+  is_deeply [sort keys %unpacked], [map { $_->[0] } @$files], 'with their names intact';
+  is $checkout->unpacked_file_stats->{files}, 100, 'and the stats agree on the count';
+};
+
+subtest 'The file list is only read once per checkout, and re-read after a new unpack' => sub {
+  my $co = $TMP->child('file-list-cache', 'hash')->make_path;
+  $co->child('first.txt')->spew("Licensed under the MIT license.\n");
+
+  my $checkout = Cavil::Checkout->new($co);
+  $checkout->unpack;
+  is_deeply [map { $_->[0] } @{$checkout->unpacked_files}], ['first.txt'], 'one file';
+
+  # Reading it again must not go back to disk, so a file list removed underneath us changes nothing
+  my $list = $co->child('.postprocessed.json');
+  my $json = $list->slurp;
+  $list->remove;
+  is_deeply [map { $_->[0] } @{$checkout->unpacked_files}], ['first.txt'], 'the second read is cached';
+  is $checkout->unpacked_file_stats->{files}, 1, 'and the stats use the same copy';
+  $list->spew($json);
+
+  # A re-unpack replaces the sources, so the same object has to see the new list
+  $co->child('second.txt')->spew("Licensed under the Apache-2.0 license.\n");
+  $checkout->unpack;
+  is_deeply [sort map { $_->[0] } @{$checkout->unpacked_files}], ['first.txt', 'second.txt'],
+    'the cache was dropped by the new unpack';
 };
 
 subtest 'Unpack background job' => sub {

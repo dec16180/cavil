@@ -1,17 +1,5 @@
-# Copyright (C) 2020 SUSE LLC
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, see <http://www.gnu.org/licenses/>.
+# SPDX-FileCopyrightText: SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 use Mojo::Base -strict;
 
@@ -23,7 +11,7 @@ use Test::Mojo;
 use Cavil::Test;
 use Mojolicious::Lite;
 use Mojo::File qw(tempdir);
-use Mojo::JSON qw(decode_json);
+use Mojo::JSON qw(decode_json encode_json);
 
 plan skip_all => 'set TEST_ONLINE to enable this test' unless $ENV{TEST_ONLINE};
 
@@ -110,6 +98,34 @@ subtest 'catch_all round-trips through export/import' => sub {
   is $sync->load($tmp), 1, 'the catch_all pattern is re-imported';
   is $db->select('license_patterns', 'catch_all', {unique_id => $uuid})->hash->{catch_all}, 1,
     'catch_all survived the export/import round-trip';
+};
+
+subtest 'An import cannot smuggle in a flag the license name contradicts' => sub {
+  my $db = $t->app->pg->db;
+
+  my $lying = $tempdir->child('lying.jsonl');
+  $lying->spew(
+    encode_json(
+      {license => 'Any Permissive', pattern => 'an imported grab-bag claiming otherwise', catch_all => 0, risk => 5}
+      )
+      . "\n"
+      . encode_json(
+      {
+        license   => 'Apache-2.0',
+        pattern   => 'an imported concrete license claiming otherwise',
+        catch_all => 1,
+        risk      => 5
+      }
+      )
+      . "\n"
+  );
+
+  is $sync->load($lying), 2, 'both patterns are imported';
+  is $db->query('SELECT catch_all FROM license_patterns WHERE pattern = ?', 'an imported grab-bag claiming otherwise')
+    ->hash->{catch_all}, 1, 'the grab-bag is flagged from its name, not from the file';
+  is $db->query('SELECT catch_all FROM license_patterns WHERE pattern = ?',
+    'an imported concrete license claiming otherwise')->hash->{catch_all}, 0,
+    'and the concrete license is left unflagged';
 };
 
 done_testing;
