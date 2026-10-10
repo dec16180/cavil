@@ -1,5 +1,4 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: SUSE LLC
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Upload an artifact to Cavil for review via the bot API (POST /packages/upload).
