@@ -254,6 +254,26 @@ t.test('Cavil UI - review comment editor', skipUnlessOnline, async t => {
       t.equal(await comment.locator('b').count(), 0, 'no markup was injected');
     });
 
+    await t.test('The decision is in the audit log', async t => {
+      await openReport();
+      await page.click('.metadata-history-link');
+      await page.waitForSelector('#audit-log tbody > tr:nth-child(1) td:nth-child(4)');
+      t.equal(await page.inputValue('#audit-log-filter-input'), 'perl-Mojolicious', 'filtered to the package');
+      const row = page.locator('#audit-log tbody > tr').first();
+      t.match(await row.innerText(), /unacceptable \(decided again\)/, 'the second rejection');
+      t.match(await row.innerText(), /Rejected <b>because<\/b> of\nthe bundled font/, 'the comment as plain text');
+      t.match(await row.innerText(), /tester/, 'the reviewer');
+      t.equal(await row.locator('b').count(), 0, 'no markup was injected');
+
+      await page.click('#audit-log-by-user');
+      await page.waitForFunction(
+        () => document.querySelector('#audit-log-by-user').getAttribute('aria-pressed') === 'true'
+      );
+      await page.waitForSelector('#audit-log tbody > tr:nth-child(1) td:nth-child(4)');
+      t.match(await page.locator('#audit-log tbody > tr').first().innerText(), /tester/, 'manual events stay');
+      t.match(page.url(), /byUser=true/, 'the filter is kept in the URL');
+    });
+
     t.test('Console errors', t => {
       assertNoUnexpectedConsoleErrors(t, errorLogs);
       t.end();

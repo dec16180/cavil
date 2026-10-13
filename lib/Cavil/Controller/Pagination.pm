@@ -6,6 +6,23 @@ use Mojo::Base 'Mojolicious::Controller', -signatures;
 
 use Cavil::Util qw(external_link_data);
 
+sub audit_events ($self) {
+  my $v = $self->validation;
+  $v->optional('limit')->num;
+  $v->optional('offset')->num;
+  $v->optional('filter');
+  $v->optional('byUser');
+  return $self->reply->json_validation_error if $v->has_error;
+  my $limit   = $v->param('limit')  // 10;
+  my $offset  = $v->param('offset') // 0;
+  my $search  = $v->param('filter') // '';
+  my $by_user = ($v->param('byUser') // 'false') eq 'true';
+
+  my $page = $self->helpers->audit_log->paginate_events(
+    {limit => $limit, offset => $offset, search => $search, by_user => $by_user});
+  $self->render(json => $page);
+}
+
 sub comment_templates ($self) {
   my $v = $self->validation;
   $v->optional('limit')->num;
@@ -252,14 +269,18 @@ sub _mark_active_packages ($self, $page) {
   # One query for the whole page; the review search names the column "package" instead of "name"
   my $rows
     = [map { {id => $_->{id}, name => $_->{name} // $_->{package}, checksum => $_->{checksum}} } @{$page->{page}}];
-  my $notes = $self->notes->relevant_notes($rows, include_lawyer_only => $self->_can_see_lawyer_only);
+  my $notes    = $self->notes->relevant_notes($rows, include_lawyer_only => $self->_can_see_lawyer_only);
+  my $products = $self->products->annotations([map { $_->{external_link} } @{$page->{page}}]);
 
   for my $pkg (@{$page->{page}}) {
-    my $id = $pkg->{id};
-    $pkg->{external_link_data} = external_link_data($pkg->{external_link}, $config->{external_link_sources});
-    $pkg->{active_jobs}        = $minion->jobs({states => ['inactive', 'active'], notes => ["pkg_$id"]})->total;
-    $pkg->{failed_jobs}        = $minion->jobs({states => ['failed'], notes => ["pkg_$id"]})->total;
-    $pkg->{relevant_note}      = _note_state($notes->{$id});
+    my $id   = $pkg->{id};
+    my $link = $pkg->{external_link_data} = external_link_data($pkg->{external_link}, $config->{external_link_sources});
+    if (defined(my $product = $products->{$pkg->{external_link} // ''})) {
+      @$link{qw(text title)} = ($product, $pkg->{external_link});
+    }
+    $pkg->{active_jobs}   = $minion->jobs({states => ['inactive', 'active'], notes => ["pkg_$id"]})->total;
+    $pkg->{failed_jobs}   = $minion->jobs({states => ['failed'], notes => ["pkg_$id"]})->total;
+    $pkg->{relevant_note} = _note_state($notes->{$id});
   }
   return $page;
 }
